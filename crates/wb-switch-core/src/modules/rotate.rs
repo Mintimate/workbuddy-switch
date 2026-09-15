@@ -18,6 +18,7 @@ use crate::modules::config::{
     add_rotate_log, load_auto_rotate_config, load_rotate_logs, now_ms, RunFlagGuard,
 };
 use crate::modules::credits;
+use crate::modules::variant::WbVariant;
 
 static ROTATE_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_CHECK_AT: AtomicI64 = AtomicI64::new(0);
@@ -78,6 +79,18 @@ fn to_candidate(account: &Value, credit: &Value) -> Candidate {
 
 fn account_display_name_or(account: &Value) -> String {
     account::account_display_name(account)
+}
+
+/// 轮换候选只保留与轮换目标**同档位**的账号。
+///
+/// 为什么必须过滤：轮换会把目标账号写进 CodeBuddy CLI 的配置。若把国际版账号
+/// 推荐给国内版 CLI（或反之），CLI 会拿着另一档位的 token 去请求，直接登录失效。
+fn candidates_for_variant(accounts: &[Value], variant: WbVariant) -> Vec<Value> {
+    accounts
+        .iter()
+        .filter(|account| WbVariant::from_account(account) == variant)
+        .cloned()
+        .collect()
 }
 
 /// 决策结果。
@@ -240,8 +253,8 @@ pub async fn run_rotate_cycle() -> Value {
         .unwrap_or(0.0)
         .max(0.0);
 
-    // 拉取所有账号积分
-    let accounts = account::load_accounts();
+    // 拉取所有账号积分（只取国内版：轮换服务的是国内版 CodeBuddy CLI）
+    let accounts = candidates_for_variant(&account::load_accounts(), WbVariant::Cn);
     let mut candidates: Vec<Candidate> = Vec::with_capacity(accounts.len());
     for acc in &accounts {
         let credit = credits::get_credit_expiry(acc).await;
@@ -364,6 +377,27 @@ mod tests {
     /// 默认参数调用：无冷却、无活跃会话、无价值过滤。
     fn dt(candidates: &[Candidate], current: Option<&str>) -> Decision {
         decide_target(candidates, current, None, 0, GAP, URG, None, GUARD, 0.0)
+    }
+
+    /// 轮换候选必须同档位：国际版账号不得进入国内版 CLI 的候选集。
+    #[test]
+    fn rotation_candidates_are_restricted_to_one_variant() {
+        let accounts = vec![
+            json!({"id": "cn-1", "uid": "u-1"}),
+            json!({"id": "ai-1", "uid": "u-2", "variant": "ai"}),
+            json!({"id": "ai-2", "uid": "u-3", "domain": "www.workbuddy.ai"}),
+        ];
+
+        let cn = candidates_for_variant(&accounts, WbVariant::Cn);
+        assert_eq!(cn.len(), 1);
+        assert_eq!(cn[0]["id"], "cn-1");
+
+        let ai = candidates_for_variant(&accounts, WbVariant::Ai);
+        assert_eq!(ai.len(), 2);
+        assert!(ai
+            .iter()
+            .all(|a| a["variant"] == "ai" || a["domain"] == "www.workbuddy.ai"));
+        assert!(ai.iter().all(|a| a["id"] != "cn-1"));
     }
 
     #[test]

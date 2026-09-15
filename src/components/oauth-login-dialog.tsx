@@ -12,17 +12,21 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta } from "@/lib/types";
+import { DEFAULT_VARIANT, variantAppName, variantLabel } from "@/lib/variant";
+import type { AccountMeta, WbVariant } from "@/lib/types";
 import { useAccountsStore } from "@/stores/accounts";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** 登录目标档位；缺省国内版（零回归）。 */
+  variant?: WbVariant;
 }
 
 /** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
-export function OAuthLoginDialog({ open, onOpenChange }: Props) {
+export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT }: Props) {
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
+  const appName = variantAppName(variant);
 
   const [busy, setBusy] = useState(false);
   const [loginId, setLoginId] = useState<string | null>(null);
@@ -78,7 +82,7 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     setBusy(true);
     setError("");
     try {
-      const res = await api.oauthStart();
+      const res = await api.oauthStart(variant);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
       // 按当前宿主能力打开验证页
@@ -94,9 +98,9 @@ export function OAuthLoginDialog({ open, onOpenChange }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>OAuth 扫码登录</DialogTitle>
+          <DialogTitle>OAuth 扫码登录（{variantLabel(variant)}）</DialogTitle>
           <DialogDescription>
-            在浏览器中打开验证链接，扫码授权后将自动采集账号并入库。
+            在浏览器中打开验证链接，扫码授权后将自动采集 {appName} 账号并入库。
           </DialogDescription>
         </DialogHeader>
 

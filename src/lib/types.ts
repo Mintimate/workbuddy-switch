@@ -1,5 +1,11 @@
 // 与 Rust 后端命令返回结构对齐的类型定义（对照 server.py 各 API 响应）
 
+/**
+ * WorkBuddy 客户端档位：国内版（cn）/ 国际版（ai）。
+ * 后端以字符串返回，历史数据与旧响应可能缺省该字段，读取时统一按国内版处理。
+ */
+export type WbVariant = "cn" | "ai";
+
 export interface AccountMeta {
   id: string;
   uid: string | null;
@@ -12,6 +18,8 @@ export interface AccountMeta {
   createdAt: number | null;
   needsRelogin: boolean;
   needsReloginReason: string | null;
+  /** 账号所属档位；缺省（旧后端/历史账号）按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface AppStatus {
@@ -24,6 +32,8 @@ export interface AppStatus {
   } | null;
   appPath: string;
   version: string;
+  /** 上述字段所属档位；缺省按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface OAuthStartResult {
@@ -91,16 +101,23 @@ export interface CopyResult {
   backup: string;
 }
 
+/** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
+export interface SessionCopyReport {
+  sourceUid: string;
+  targetUid: string;
+  /** 错误分支不返回该字段：后端只给 `{ error }`。 */
+  copied?: CopyResult[];
+  errors?: { id: string; error: string }[];
+  error?: string;
+}
+
 export interface SwitchResult {
   ok: boolean;
   account: string;
+  /** 目标账号自身档位；缺省按国内版处理。 */
+  variant?: WbVariant;
   backup: string | null;
-  sessionCopy?: {
-    sourceUid: string;
-    targetUid: string;
-    copied: CopyResult[];
-    errors?: { id: string; error: string }[];
-  };
+  sessionCopy?: SessionCopyReport;
 }
 
 export interface CheckinConfig {
@@ -118,11 +135,15 @@ export interface CheckinLog {
   email: string;
   result: string;
   error?: string;
+  /** 该行所属档位；历史日志缺省按国内版处理。 */
+  variant?: WbVariant;
 }
 
 export interface CheckinResult {
   result: string;
   error?: string;
+  /** 国际版签到活动未开放时的业务判定；不写成功日志、不计入失败重试。 */
+  inactive?: boolean;
 }
 
 export interface TravelConfig {
@@ -329,7 +350,8 @@ export interface CreditStatistics {
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
-export interface TokenStatsSource { source: "workbuddy" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+/** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

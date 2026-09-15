@@ -53,7 +53,12 @@ const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
 const RANKING_LIMIT = 10;
 
 function isSourceKey(value: unknown): value is SourceKey {
-  return value === "workbuddy" || value === "codebuddy-cli" || value === "codebuddy-ide";
+  return (
+    value === "workbuddy" ||
+    value === "workbuddy-ai" ||
+    value === "codebuddy-cli" ||
+    value === "codebuddy-ide"
+  );
 }
 
 function readPreferredTokenSource(): SourceKey {
@@ -1084,6 +1089,12 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
             ? `已扫描 ${exact.format(source.filesScanned)} 个会话文件，但没有可用的 usage。`
             : "尚未发现该来源的本地会话日志。"}
         </div>
+        {source.source === "workbuddy-ai" && (
+          <div className="mt-2 text-xs leading-5">
+            国际版数据源为空：本机可能未安装 WorkBuddy AI，或尚未产生本地会话日志；
+            国际版数据与国内版分开统计，不参与国内版用量。
+          </div>
+        )}
         {source.parseErrors > 0 && (
           <div className="mt-2 text-xs text-amber-600">
             已跳过 {exact.format(source.parseErrors)} 条无法解析的本地记录。
@@ -1302,6 +1313,13 @@ export default function TokenStatsPage() {
                   disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy"))}
                 >
                   WorkBuddy
+                </TabsTrigger>
+                <TabsTrigger
+                  className="max-w-full whitespace-normal"
+                  value="workbuddy-ai"
+                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy-ai"))}
+                >
+                  WorkBuddy AI
                 </TabsTrigger>
                 <TabsTrigger
                   className="max-w-full whitespace-normal"

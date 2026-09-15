@@ -17,4 +17,5 @@ pub mod switch;
 pub mod token_stats;
 pub mod travel;
 pub mod update;
+pub mod variant;
 pub mod vscode_cn_inject;

@@ -7,12 +7,19 @@ use serde_json::{json, Value};
 use std::sync::atomic::AtomicBool;
 
 use crate::modules::account::{build_auth_headers, upsert_account};
-use crate::modules::config::{
-    http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard, WORKBUDDY_API_ENDPOINT,
-    WORKBUDDY_API_PREFIX,
-};
+use crate::modules::config::{http_request, load_checkin_config, norm_ts, now_ms, RunFlagGuard};
 
 static KEEPALIVE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 刷新接口 URL：域名与路径前缀都按账号自身档位选（缺档位字段 → 国内版，零回归）。
+fn refresh_url(account: &Value) -> String {
+    let variant = crate::modules::account::variant_of(account);
+    format!(
+        "{}{}/auth/token/refresh",
+        variant.api_endpoint(),
+        variant.api_prefix()
+    )
+}
 
 /// 刷新单账号 token（POST /v2/plugin/auth/token/refresh），成功则落盘并返回新账号。
 ///
@@ -36,7 +43,8 @@ pub async fn refresh_account_token(mut account: Value) -> Value {
 
     let mut headers = build_auth_headers(&account);
     headers.insert("X-Refresh-Token".to_string(), rt.clone());
-    let url = format!("{WORKBUDDY_API_ENDPOINT}{WORKBUDDY_API_PREFIX}/auth/token/refresh");
+    // 刷新必须走账号自身档位的域名：把国际版 token 打到国内网关等于登录失效。
+    let url = refresh_url(&account);
     let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
@@ -202,4 +210,37 @@ pub async fn run_keepalive_cycle() -> Value {
         }));
     }
     json!({"checked": total, "refreshed": results})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refresh_url_follows_account_variant() {
+        // 旧账号（无档位字段）→ 国内版，与改造前逐字一致。
+        assert_eq!(
+            refresh_url(&json!({"uid": "u-1"})),
+            format!(
+                "{}/v2/plugin/auth/token/refresh",
+                crate::modules::variant::WbVariant::Cn.api_endpoint()
+            )
+        );
+        assert_eq!(
+            refresh_url(&json!({"uid": "u-1", "access_token": "t"})),
+            "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
+        );
+        // 国际版账号 → 国际版域名。
+        assert_eq!(
+            refresh_url(&json!({"uid": "u-2", "variant": "ai"})),
+            format!(
+                "{}/v2/plugin/auth/token/refresh",
+                crate::modules::variant::WbVariant::Ai.api_endpoint()
+            )
+        );
+        assert_ne!(
+            refresh_url(&json!({"variant": "ai"})),
+            refresh_url(&json!({"variant": "cn"}))
+        );
+    }
 }

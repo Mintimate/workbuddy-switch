@@ -8,10 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::modules::variant::WbVariant;
+
 // ---------------------------------------------------------------------------
 // 常量
 // ---------------------------------------------------------------------------
 
+// 以下三个常量是「国内版」档位的取值来源（档位取值统一见 modules/variant.rs）；
+// 新增档位差异不要再新增同类常量。
 pub const WORKBUDDY_API_ENDPOINT: &str = "https://www.codebuddy.cn";
 pub const WORKBUDDY_API_PREFIX: &str = "/v2/plugin";
 pub const WORKBUDDY_PLATFORM: &str = "workbuddy";
@@ -95,6 +99,7 @@ pub fn workbuddy_exe_cache_file() -> PathBuf {
     store_dir().join("workbuddy_exe.json")
 }
 
+/// 旧格式（单 `exe` 字段）解析，CodeBuddy CN 应用缓存沿用该格式。
 fn parse_workbuddy_exe_cache_json(text: &str) -> Option<PathBuf> {
     let v: Value = serde_json::from_str(text).ok()?;
     let exe = v.get("exe")?.as_str()?.trim();
@@ -105,26 +110,86 @@ fn parse_workbuddy_exe_cache_json(text: &str) -> Option<PathBuf> {
     }
 }
 
-/// 读取上次成功解析到的 WorkBuddy.exe；损坏或空文件视为无缓存。
-pub fn load_workbuddy_exe_cache() -> Option<PathBuf> {
+/// 按档位读缓存：新格式按档位分键，旧格式单键仅国内版认。
+fn parse_workbuddy_exe_cache_json_for(text: &str, variant: WbVariant) -> Option<PathBuf> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let keyed = v.get(variant.exe_cache_key());
+    let legacy = if variant == WbVariant::Cn {
+        v.get("exe")
+    } else {
+        None
+    };
+    let exe = keyed.or(legacy)?.as_str()?.trim();
+    if exe.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(exe))
+    }
+}
+
+/// 读取上次成功解析到的 WorkBuddy 应用路径（按档位分键）；损坏或空文件视为无缓存。
+pub fn load_workbuddy_exe_cache(variant: WbVariant) -> Option<PathBuf> {
     let f = workbuddy_exe_cache_file();
     if !f.exists() {
         return None;
     }
     let text = std::fs::read_to_string(&f).ok()?;
-    parse_workbuddy_exe_cache_json(&text)
+    parse_workbuddy_exe_cache_json_for(&text, variant)
 }
 
-/// 记住已存在的 WorkBuddy.exe，供下次未运行时启动。
-pub fn save_workbuddy_exe_cache(exe: &Path) -> std::io::Result<()> {
+/// 把某档位的路径并入缓存内容（旧格式单键按国内版迁移，写回新格式）。
+fn upsert_workbuddy_exe_cache_json(text: &str, variant: WbVariant, exe: &Path) -> String {
+    let mut root = serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = root.as_object_mut() {
+        if let Some(Value::String(legacy)) = obj.remove("exe") {
+            if !legacy.trim().is_empty() {
+                obj.entry(WbVariant::Cn.exe_cache_key().to_string())
+                    .or_insert(Value::String(legacy));
+            }
+        }
+        obj.insert(
+            variant.exe_cache_key().to_string(),
+            json!(exe.to_string_lossy()),
+        );
+    }
+    serde_json::to_string_pretty(&root).unwrap_or_default()
+}
+
+/// 记住已存在的 WorkBuddy 应用路径（按档位分键；旧格式单键在写回时升级）。
+pub fn save_workbuddy_exe_cache(variant: WbVariant, exe: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
-    let content =
-        serde_json::to_string_pretty(&json!({ "exe": exe.to_string_lossy() })).unwrap_or_default();
-    atomic_write(&workbuddy_exe_cache_file(), &content)
+    let file = workbuddy_exe_cache_file();
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    atomic_write(&file, &upsert_workbuddy_exe_cache_json(&text, variant, exe))
 }
 
-pub fn clear_workbuddy_exe_cache() {
-    let _ = std::fs::remove_file(workbuddy_exe_cache_file());
+/// 清除某档位的缓存项；无其它档位残留则删除文件。
+pub fn clear_workbuddy_exe_cache(variant: WbVariant) {
+    let file = workbuddy_exe_cache_file();
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return;
+    };
+    let Ok(mut root) = serde_json::from_str::<Value>(&text) else {
+        let _ = std::fs::remove_file(&file);
+        return;
+    };
+    let Some(obj) = root.as_object_mut() else {
+        let _ = std::fs::remove_file(&file);
+        return;
+    };
+    obj.remove(variant.exe_cache_key());
+    if variant == WbVariant::Cn {
+        obj.remove("exe");
+    }
+    if obj.is_empty() {
+        let _ = std::fs::remove_file(&file);
+        return;
+    }
+    let content = serde_json::to_string_pretty(&root).unwrap_or_default();
+    let _ = atomic_write(&file, &content);
 }
 
 pub fn codebuddy_cn_app_cache_file() -> PathBuf {
@@ -600,6 +665,24 @@ pub fn norm_ts(v: Option<&Value>) -> Option<i64> {
 // HTTP 客户端（对照 Python http_request）
 // ---------------------------------------------------------------------------
 
+/// 响应是否为「该路径不存在」（HTTP 404）。
+///
+/// billing 路径候选回落**只允许由 404 触发**：401/403 是鉴权问题、10085 是网关
+/// 客户端指纹拦截、`code=-1` 是传输错误，把它们误当成路径问题会掩盖真实原因，
+/// 也会白白重试一遍并把错误码盖成 404（见 design D4）。
+pub fn is_route_missing(response: &Value) -> bool {
+    fn parse_code(value: &Value) -> Option<i64> {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    }
+    response
+        .get("code")
+        .and_then(parse_code)
+        .or_else(|| response.get("data")?.get("code").and_then(parse_code))
+        == Some(404)
+}
+
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn http_client_builder() -> reqwest::ClientBuilder {
@@ -970,11 +1053,91 @@ mod tests {
     }
 
     #[test]
+    fn workbuddy_exe_cache_reads_new_format_per_variant() {
+        let text = r#"{
+  "cn": "C:\\Programs\\WorkBuddy\\WorkBuddy.exe",
+  "ai": "C:\\Programs\\WorkBuddyAI\\WorkBuddyAI.exe"
+}"#;
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(text, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            r"C:\Programs\WorkBuddy\WorkBuddy.exe"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(text, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            r"C:\Programs\WorkBuddyAI\WorkBuddyAI.exe"
+        );
+    }
+
+    #[test]
+    fn workbuddy_exe_cache_reads_legacy_single_key_as_cn_only() {
+        let text = r#"{ "exe": "C:\\Programs\\WorkBuddy\\WorkBuddy.exe" }"#;
+        assert!(parse_workbuddy_exe_cache_json_for(text, WbVariant::Cn).is_some());
+        assert!(parse_workbuddy_exe_cache_json_for(text, WbVariant::Ai).is_none());
+        assert!(parse_workbuddy_exe_cache_json_for(r#"{ "exe": "  " }"#, WbVariant::Cn).is_none());
+        assert!(parse_workbuddy_exe_cache_json_for("not-json", WbVariant::Cn).is_none());
+    }
+
+    #[test]
+    fn workbuddy_exe_cache_write_upgrades_legacy_and_keeps_both_keys() {
+        // 旧格式写入国际版 → 升级为新格式，且国内版旧值迁到 cn 键
+        let migrated = upsert_workbuddy_exe_cache_json(
+            r#"{ "exe": "/Applications/WorkBuddy.app" }"#,
+            WbVariant::Ai,
+            Path::new("/Applications/WorkBuddy AI.app"),
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&migrated, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy.app"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&migrated, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy AI.app"
+        );
+        assert!(!migrated.contains("\"exe\""), "写回新格式: {migrated}");
+
+        // 再写国内版：两档位互不覆盖
+        let both = upsert_workbuddy_exe_cache_json(
+            &migrated,
+            WbVariant::Cn,
+            Path::new("/Applications/CodeBuddy.app"),
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&both, WbVariant::Cn)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/CodeBuddy.app"
+        );
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&both, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/Applications/WorkBuddy AI.app"
+        );
+
+        // 损坏内容不从零继承，直接重建
+        let recovered =
+            upsert_workbuddy_exe_cache_json("not-json", WbVariant::Ai, Path::new("/x/a"));
+        assert_eq!(
+            parse_workbuddy_exe_cache_json_for(&recovered, WbVariant::Ai)
+                .unwrap()
+                .to_string_lossy(),
+            "/x/a"
+        );
+    }
+
+    #[test]
     fn parse_codebuddy_cn_app_cache_json_reads_exe() {
-        let path = parse_codebuddy_cn_app_cache_json(
-            r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#,
-        )
-        .expect("valid cache");
+        let path =
+            parse_codebuddy_cn_app_cache_json(r#"{ "exe": "/Applications/CodeBuddy CN.app" }"#)
+                .expect("valid cache");
         assert_eq!(path.to_string_lossy(), "/Applications/CodeBuddy CN.app");
     }
 
@@ -987,10 +1150,7 @@ mod tests {
 
     #[test]
     fn codebuddy_cn_app_cache_file_is_not_workbuddy_exe_cache() {
-        assert_ne!(
-            codebuddy_cn_app_cache_file(),
-            workbuddy_exe_cache_file()
-        );
+        assert_ne!(codebuddy_cn_app_cache_file(), workbuddy_exe_cache_file());
         assert!(codebuddy_cn_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_cn_app.json"));
@@ -1003,5 +1163,27 @@ mod tests {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
         );
         let _ = http_client_builder();
+    }
+
+    #[test]
+    fn route_missing_is_404_only() {
+        assert!(is_route_missing(
+            &json!({"code": 404, "message": "not found"})
+        ));
+        assert!(is_route_missing(&json!({"code": "404"})));
+        assert!(is_route_missing(&json!({"data": {"code": 404}})));
+        // 非 404 一律不得当作路径问题回落。
+        assert!(!is_route_missing(
+            &json!({"code": 401, "message": "unauthorized"})
+        ));
+        assert!(!is_route_missing(&json!({"code": 403})));
+        assert!(!is_route_missing(
+            &json!({"code": 10085, "msg": "请求不合法"})
+        ));
+        assert!(!is_route_missing(
+            &json!({"code": -1, "message": "error sending request"})
+        ));
+        assert!(!is_route_missing(&json!({"code": 0, "data": {}})));
+        assert!(!is_route_missing(&Value::Null));
     }
 }

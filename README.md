@@ -1,13 +1,13 @@
 # workbuddy-switch
 
-WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
+WorkBuddy（含国际版 WorkBuddy AI）/ CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
 
 同时提供 npm / webui 版本，方便在浏览器中使用同一套账号管理能力。
 
 - **桌面 App**：从 GitHub Releases 下载 macOS、Windows 或 Linux 安装包（Tauri，推荐日常使用）
 - **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
 
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
+多账号共享登录态（国内版 `workbuddy-desktop.info`、国际版 `workbuddy-desktop-ai.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。两档位在账号页切换，账号与操作互不影响。
 
 <p align="center">
   <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
@@ -58,7 +58,7 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 
 | 模块 | 说明 |
 | --- | --- |
-| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
+| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号；国内版与国际版（WorkBuddy AI）分别管理，账号页顶部切换档位 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
 | 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
 | 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；一键全部签到；30 天签到日志 |
@@ -71,6 +71,18 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；当前会话保持原账号，重新加载会话或重启 CLI 后使用新的账号 |
 | 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
+
+## 国际版（WorkBuddy AI）
+
+账号页顶部可切换 **国内版 / 国际版**，两个档位的账号、状态、扫码登录与本机导入相互独立：
+
+- **登录态文件**：国际版为 `CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info`（与国内版同目录、不同文件）。
+- **客户端**：macOS `WorkBuddy AI.app`、Windows `%LOCALAPPDATA%\Programs\WorkBuddyAI\WorkBuddyAI.exe`；切换只关闭/启动对应档位的客户端。
+- **接口**：国际版走 `www.workbuddy.ai`（国内版为 `www.codebuddy.cn` / `copilot.tencent.com`），请求头 Origin / X-Domain 跟随账号所属域。
+- **当前限制**：成长中心（派猫猫旅行）仅国内版；国际版暂不支持会话复制；Token 统计在国际版数据目录缺失 `projects/` 时显示为空；自动轮换仅覆盖国内版。
+- 国际版账号签到由官方开放状态决定，未开放时标记为「未开放签到」，不计为失败。
+
+> 说明：国际版链路基于接口与客户端布局实现，尚未在真实国际版客户端上做端到端切换验证；遇到问题请附上版本与日志反馈。
 
 ## 使用
 

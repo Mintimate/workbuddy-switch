@@ -31,6 +31,7 @@ fn spawn_background_loops() {
     });
 
     // 派猫猫旅行：启动即派发，之后周期性补派（并重试 no-buddy / 瞬时错误）。
+    // 档位过滤在 core（`travel_capable_accounts`）：不支持成长中心的档位不会发请求。
     tauri::async_runtime::spawn(async move {
         let _ = modules::travel::run_travel_cycle().await;
         loop {

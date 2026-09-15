@@ -30,6 +30,29 @@ export function WorkBuddyMark({ size = 32, className }: MarkProps) {
   );
 }
 
+/**
+ * WorkBuddy AI（国际版）标记：复用官方图标 + 角标区分档位，
+ * 不新画图形，保持与既有 WorkBuddy / CodeBuddy 标记同一套圆角与配色。
+ */
+export function WorkBuddyAiMark({ size = 32, className }: MarkProps) {
+  const badge = Math.max(11, Math.round(size * 0.46));
+  return (
+    <span
+      aria-hidden
+      className={cn("relative inline-flex shrink-0", className)}
+      style={{ width: size, height: size }}
+    >
+      <WorkBuddyMark size={size} />
+      <span
+        className="absolute -bottom-0.5 -right-0.5 inline-flex items-center justify-center rounded-full border border-card bg-foreground font-semibold leading-none text-background"
+        style={{ minWidth: badge, height: badge, fontSize: Math.max(7, Math.round(badge * 0.56)) }}
+      >
+        AI
+      </span>
+    </span>
+  );
+}
+
 /** 应用自身的透明角色图标；桌面安装图标仍使用 public/icon.png。 */
 export function AppIconMark({ size = 32, className }: MarkProps) {
   return (

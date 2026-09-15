@@ -5,6 +5,7 @@ import type {
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
+import { normalizeVariant } from "./variant";
 
 export const screenshotDemoEnabled = demoModeEnabled;
 
@@ -21,10 +22,11 @@ interface AccountUsageSeed {
   models: ModelSeed[];
 }
 
+// 演示数据只覆盖国内版；切换国际版时展示的是空状态（不构造国际版演示账号）。
 const accounts: AccountMeta[] = [
-  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
-  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null },
+  { id: "demo-account-a", uid: "demo-user-001", email: "test-a@example.com", nickname: "测试 A", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-b", uid: "demo-user-002", email: "test-b@example.com", nickname: "测试 B", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
+  { id: "demo-account-c", uid: "demo-user-003", email: "test-c@example.com", nickname: "测试 C", enterpriseName: "Demo Workspace", expiresAt: 0, refreshExpiresAt: 0, refreshedAt: 0, createdAt: 0, needsRelogin: false, needsReloginReason: null, variant: "cn" },
 ];
 
 /** 演示模式中的临时 CLI 当前账号，仅存在于本次页面会话。 */
@@ -398,8 +400,23 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
   return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
 }
 
+/** 国际版数据源：演示环境不构造数据，保持真实的「空集」形态（页面显示空状态）。 */
+function emptyTokenSource(source: TokenStatsSource["source"]): TokenStatsSource {
+  return {
+    source,
+    summary: demoTokenTotals(0, 0, 0, 0, 0),
+    models: [],
+    projects: [],
+    sessions: [],
+    daily: [],
+    hours: [],
+    filesScanned: 0,
+    parseErrors: 0,
+  };
+}
+
 function demoTokenStatistics(days?: number): TokenStatistics {
-  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
+  return { generatedAt: Date.now(), rangeDays: days ?? null, sources: [demoTokenSource("workbuddy", 1), emptyTokenSource("workbuddy-ai"), demoTokenSource("codebuddy-cli", 0.58), demoTokenSource("codebuddy-ide", 0.36)] };
 }
 
 /** Read-only demo response provider. It never reads or mutates real user data. */
@@ -413,7 +430,20 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
   const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
   switch (command) {
-    case "get_status": return appStatus;
+    // 档位随请求回显：演示数据本身只有国内版账号，国际版展示空状态。
+    case "get_status": {
+      const variant = normalizeVariant(args?.variant);
+      return variant === "ai"
+        ? {
+            ...appStatus,
+            running: false,
+            current: null,
+            authFile: "/demo/workbuddy-ai/auth.json",
+            appPath: "/demo/WorkBuddy AI.app",
+            variant,
+          }
+        : { ...appStatus, variant };
+    }
     case "get_accounts": return { accounts: demoAccounts };
     case "get_codebuddy_cli_status": return cliStatus;
     case "switch_codebuddy_cli_account": {

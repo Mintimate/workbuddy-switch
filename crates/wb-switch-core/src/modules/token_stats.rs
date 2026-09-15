@@ -1,4 +1,4 @@
-//! 本地 WorkBuddy / CodeBuddy CLI / CodeBuddy IDE Token 统计。
+//! 本地 WorkBuddy / WorkBuddy 国际版 / CodeBuddy CLI / CodeBuddy IDE Token 统计。
 //!
 //! 这个模块是统计数据的唯一归属：日志只在这里解码、去重和按时间聚合，
 //! Tauri 与 HTTP 层只负责转发结果。响应只包含聚合数字和脱敏标识，不返回
@@ -6,12 +6,17 @@
 //!
 //! CodeBuddy IDE 不写 JSONL，用量在 `CodeBuddyExtension/Data/**/history/**/index.json`
 //! 的 `requests[].usage` 中；消息正文文件（`messages/`）不会被扫描。
+//!
+//! 国内版与国际版**分开统计**（`workbuddy` / `workbuddy-ai` 两个 source），
+//! 不合并：两档位是不同账号体系，混算会让用量无法归因。
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+use crate::modules::variant::WbVariant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
@@ -46,8 +51,8 @@ impl Totals {
     }
 
     fn value(&self) -> Value {
-        let cache_hit_rate = (self.usage.input > 0)
-            .then(|| self.usage.read as f64 / self.usage.input as f64);
+        let cache_hit_rate =
+            (self.usage.input > 0).then(|| self.usage.read as f64 / self.usage.input as f64);
         // `input` already includes cache reads; expose the same headline total
         // used by the dashboard without double-counting the cached portion.
         let total = self
@@ -73,21 +78,23 @@ fn number(value: &Value) -> Option<u64> {
     value
         .as_u64()
         .or_else(|| value.as_i64().and_then(|n| u64::try_from(n).ok()))
-        .or_else(|| value.as_f64().filter(|n| n.is_finite() && *n >= 0.0).map(|n| n as u64))
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .map(|n| n as u64)
+        })
         .or_else(|| value.as_str()?.trim().parse::<u64>().ok())
 }
 
 fn field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| object.get(*key).and_then(number))
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(number))
 }
 
 fn positive_field(object: &Map<String, Value>, keys: &[&str]) -> Option<u64> {
-    keys.iter().find_map(|key| {
-        object
-            .get(*key)
-            .and_then(number)
-            .filter(|value| *value > 0)
-    })
+    keys.iter()
+        .find_map(|key| object.get(*key).and_then(number).filter(|value| *value > 0))
 }
 
 fn cached_input_field(object: &Map<String, Value>) -> u64 {
@@ -160,7 +167,9 @@ fn usage_object(value: Option<&Value>) -> Option<&Map<String, Value>> {
 fn usage(value: &Value) -> Option<Usage> {
     let provider = value.get("providerData");
     let candidates = [
-        value.get("message").and_then(|message| message.get("usage")),
+        value
+            .get("message")
+            .and_then(|message| message.get("usage")),
         provider.and_then(|data| data.get("usage")),
         value.get("usage"),
     ];
@@ -210,7 +219,11 @@ fn hour(value: &Value) -> Option<String> {
     let timestamp = timestamp(value)?;
     chrono::DateTime::from_timestamp_millis(timestamp).map(|date| {
         let local = date.with_timezone(&Local);
-        format!("{}-{}", local.weekday().num_days_from_monday(), local.hour())
+        format!(
+            "{}-{}",
+            local.weekday().num_days_from_monday(),
+            local.hour()
+        )
     })
 }
 
@@ -254,9 +267,7 @@ fn project_name(root: &Path, file: &Path) -> String {
     match name {
         // Product directories commonly encode the complete absolute path.
         // Returning that would leak a user name and parent directories.
-        Some(name) if !name.starts_with("Users-") && !name.starts_with("home-") => {
-            name.to_string()
-        }
+        Some(name) if !name.starts_with("Users-") && !name.starts_with("home-") => name.to_string(),
         _ => "未知项目".to_string(),
     }
 }
@@ -291,9 +302,7 @@ fn groups(groups: HashMap<String, Totals>) -> Vec<Value> {
             value
         })
         .collect();
-    values.sort_by(|left, right| {
-        total_value(right).cmp(&total_value(left))
-    });
+    values.sort_by_key(|right| std::cmp::Reverse(total_value(right)));
     values
 }
 
@@ -309,9 +318,7 @@ fn session_groups(sessions: Vec<SessionTotals>) -> Vec<Value> {
             value
         })
         .collect();
-    values.sort_by(|left, right| {
-        total_value(right).cmp(&total_value(left))
-    });
+    values.sort_by_key(|right| std::cmp::Reverse(total_value(right)));
     values
 }
 
@@ -435,19 +442,31 @@ impl SourceCollector {
 }
 
 fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
-    let mut paths = Vec::new();
-    files(&root, &mut paths);
-    let mut collector = SourceCollector::default();
+    source_from_roots(std::slice::from_ref(&root), name, cutoff)
+}
 
+/// 多根合并统计：同一档位下的多个 jsonl 根合并成**一个** source。
+///
+/// 国际版数据根与国内版不同构（实测无 `projects/`、只有 `sessions/`），因此按
+/// 「存在的根」探测；一个都不存在时返回空集且不报错（前端显示空状态）。
+fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>) -> Value {
+    let mut paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for root in roots {
+        let mut found = Vec::new();
+        files(root, &mut found);
+        paths.extend(found.into_iter().map(|file| (root.clone(), file)));
+    }
+    let mut collector = SourceCollector::default();
     paths.sort();
-    for path in &paths {
+
+    for (root, path) in &paths {
         let session_id = path
             .file_stem()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
             .unwrap_or("未知会话")
             .to_string();
-        let fallback_project = project_name(&root, path);
+        let fallback_project = project_name(root, path);
         let Ok(file) = std::fs::File::open(path) else {
             collector.note_parse_error();
             continue;
@@ -504,6 +523,25 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
     collector.into_value(name, paths.len())
 }
 
+/// 某档位的候选 jsonl 根（顺序固定；纯函数，便于单测）。
+///
+/// 国内版保持既有单一 `projects/` 根；国际版两个根都探测（实测没有
+/// `projects/`，只有 `sessions/`）。
+fn jsonl_root_candidates(variant: WbVariant, root: &Path) -> Vec<PathBuf> {
+    match variant {
+        WbVariant::Cn => vec![root.join("projects")],
+        WbVariant::Ai => vec![root.join("projects"), root.join("sessions")],
+    }
+}
+
+/// 某档位下实际存在的 jsonl 扫描根；都不存在则返回空列表（空源，不报错）。
+fn variant_source_roots(variant: WbVariant) -> Vec<PathBuf> {
+    jsonl_root_candidates(variant, &variant.data_root())
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect()
+}
+
 fn codebuddy_extension_data_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -532,7 +570,10 @@ fn ide_index_files(root: &Path, output: &mut Vec<PathBuf>) {
             let name = path.file_name().and_then(|name| name.to_str());
             // Message bodies contain chat content and must not be scanned.
             // Checkpoints and the shared Public bucket are unrelated to usage.
-            if !matches!(name, Some("messages" | "check-point" | "backups" | "Public")) {
+            if !matches!(
+                name,
+                Some("messages" | "check-point" | "backups" | "Public")
+            ) {
                 ide_index_files(&path, output);
             }
         } else if is_ide_conversation_index(&path) {
@@ -756,7 +797,8 @@ fn ide_source(
     collector.into_value(name, paths.len())
 }
 
-/// Return independent WorkBuddy, CodeBuddy CLI, and CodeBuddy IDE aggregates.
+/// Return independent WorkBuddy (CN), WorkBuddy AI, CodeBuddy CLI, and
+/// CodeBuddy IDE aggregates.
 /// `days` is interpreted in Rust using the same millisecond clock for every source.
 pub fn get_statistics(days: Option<i64>) -> Value {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -773,7 +815,9 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
-            source(home.join(".workbuddy/projects"), "workbuddy", cutoff),
+            source_from_roots(&variant_source_roots(WbVariant::Cn), "workbuddy", cutoff),
+            // 国际版独立 source：不与国内版混算（不同账号体系）。
+            source_from_roots(&variant_source_roots(WbVariant::Ai), "workbuddy-ai", cutoff),
             source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff),
             ide_source(
                 codebuddy_extension_data_dir(),
@@ -803,7 +847,15 @@ mod tests {
                 "cache_read_input_tokens": 4
             }}
         });
-        assert_eq!(usage(&value), Some(Usage { input: 10, output: 3, read: 4, write: 2 }));
+        assert_eq!(
+            usage(&value),
+            Some(Usage {
+                input: 10,
+                output: 3,
+                read: 4,
+                write: 2
+            })
+        );
     }
 
     #[test]
@@ -895,7 +947,6 @@ mod tests {
                 write: 0,
             })
         );
-
     }
 
     #[test]
@@ -920,9 +971,13 @@ mod tests {
                 "cache_read_input_tokens": 4
             }}
         });
-        fs::write(project.join("session.jsonl"), format!("{}\nnot-json\n", record))
-            .expect("write fixture");
-        fs::write(ignored.join("agent.jsonl"), format!("{}\n", record)).expect("write ignored fixture");
+        fs::write(
+            project.join("session.jsonl"),
+            format!("{}\nnot-json\n", record),
+        )
+        .expect("write fixture");
+        fs::write(ignored.join("agent.jsonl"), format!("{}\n", record))
+            .expect("write ignored fixture");
 
         let result = source(root.clone(), "fixture", None);
         assert_eq!(result["filesScanned"], 1);
@@ -1173,13 +1228,52 @@ mod tests {
     }
 
     #[test]
-    fn get_statistics_returns_three_isolated_sources() {
+    fn get_statistics_returns_four_isolated_sources() {
         let value = get_statistics(None);
         let sources = value["sources"].as_array().expect("sources");
         let names: Vec<_> = sources
             .iter()
             .map(|source| source["source"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(names, ["workbuddy", "codebuddy-cli", "codebuddy-ide"]);
+        assert_eq!(
+            names,
+            [
+                "workbuddy",
+                "workbuddy-ai",
+                "codebuddy-cli",
+                "codebuddy-ide"
+            ]
+        );
+        // 国际版与国内版是两个独立 source，不合并。
+        assert_ne!(sources[0]["source"], sources[1]["source"]);
+    }
+
+    /// 国际版数据根缺少 jsonl 根时返回空集，不报错。
+    #[test]
+    fn ai_source_is_empty_and_error_free_when_roots_are_missing() {
+        let value = source_from_roots(&[], "workbuddy-ai", None);
+        assert_eq!(value["source"], "workbuddy-ai");
+        assert_eq!(value["filesScanned"], 0);
+        assert_eq!(value["summary"]["input"], 0);
+        assert_eq!(value["parseErrors"], 0);
+        assert_eq!(value["sessions"].as_array().map(Vec::len), Some(0));
+        assert_eq!(value["projects"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 候选根按档位不同：国内版单根，国际版双根（无 projects/ 时只扫 sessions/）。
+    #[test]
+    fn jsonl_root_candidates_differ_by_variant() {
+        let root = PathBuf::from("/tmp/wb-root");
+        assert_eq!(
+            jsonl_root_candidates(WbVariant::Cn, &root),
+            vec![PathBuf::from("/tmp/wb-root/projects")]
+        );
+        assert_eq!(
+            jsonl_root_candidates(WbVariant::Ai, &root),
+            vec![
+                PathBuf::from("/tmp/wb-root/projects"),
+                PathBuf::from("/tmp/wb-root/sessions")
+            ]
+        );
     }
 }

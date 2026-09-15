@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   Columns3,
@@ -14,12 +14,18 @@ import {
 
 import { AccountCard } from "@/components/account-card";
 import { DemoAction } from "@/components/demo-action";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import {
+  CodeBuddyCnIdeMark,
+  CodeBuddyMark,
+  WorkBuddyAiMark,
+  WorkBuddyMark,
+} from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   Dialog,
@@ -34,6 +40,15 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
+import {
+  DEFAULT_VARIANT,
+  accountVariant,
+  normalizeVariant,
+  variantAppName,
+  variantDownloadDomain,
+  variantLabel,
+  variantSupportsTravel,
+} from "@/lib/variant";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
@@ -120,6 +135,8 @@ async function fetchTravelMap(
 export default function AccountsPage() {
   const {
     accounts,
+    variant,
+    setVariant,
     status,
     loading,
     error,
@@ -157,6 +174,13 @@ export default function AccountsPage() {
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
+  /** 当前档位下的账号：列表、计数、签到、积分等一律只作用于当前档位。 */
+  const visibleAccounts = useMemo(
+    () => accounts.filter((account) => accountVariant(account) === variant),
+    [accounts, variant],
+  );
+  const appName = variantAppName(variant);
+  const travelAvailable = variantSupportsTravel(variant);
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -216,17 +240,21 @@ export default function AccountsPage() {
     };
   }, []);
 
-  /** 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默） */
+  /**
+   * 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默）。
+   * 仅限默认档位：切到国际版时不静默写入账号，改由空状态引导显式导入或扫码。
+   */
   const autoImportTried = useRef(false);
   useEffect(() => {
-    if (autoImportTried.current || loading || accounts.length > 0) return;
+    if (variant !== DEFAULT_VARIANT) return;
+    if (autoImportTried.current || loading || visibleAccounts.length > 0) return;
     autoImportTried.current = true;
     void importLocal()
       .then(() => void fetchAll())
       .catch(() => {
         /* 本机无 WorkBuddy 登录态时静默，不打扰用户 */
       });
-  }, [accounts.length, loading, importLocal, fetchAll]);
+  }, [variant, visibleAccounts.length, loading, importLocal, fetchAll]);
 
   async function refreshCodebuddyCliStatus() {
     try {
@@ -262,12 +290,12 @@ export default function AccountsPage() {
     };
   }, [accounts.length]);
 
-  // 账号列表变化后并行查询各账号今日签到状态
+  // 当前档位账号列表变化后并行查询各账号今日签到状态
   useEffect(() => {
-    if (!accounts.length) return;
+    if (!visibleAccounts.length) return;
     let cancelled = false;
     void fetchTodayCheckinMap(
-      accounts.map((account) => account.id),
+      visibleAccounts.map((account) => account.id),
       () => cancelled,
     ).then((next) => {
       if (!cancelled && Object.keys(next).length > 0) {
@@ -277,7 +305,7 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [accounts]);
+  }, [visibleAccounts]);
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
@@ -286,11 +314,12 @@ export default function AccountsPage() {
     }
   }
 
-  // 账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 当前档位账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 成长中心仅国内版开放，国际版不发请求也不展示标签。
   useEffect(() => {
-    if (!accounts.length) return;
+    if (!travelAvailable || !visibleAccounts.length) return;
     let cancelled = false;
-    const ids = accounts.map((account) => account.id);
+    const ids = visibleAccounts.map((account) => account.id);
     void loadTravelMap(ids, () => cancelled);
     const timer = window.setInterval(() => {
       void loadTravelMap(ids, () => cancelled);
@@ -299,13 +328,13 @@ export default function AccountsPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [accounts]);
+  }, [travelAvailable, visibleAccounts]);
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
-    if (!accounts.length) return;
-    void ensureCredits(accounts.map((account) => account.id));
-  }, [accounts, ensureCredits]);
+    if (!visibleAccounts.length) return;
+    void ensureCredits(visibleAccounts.map((account) => account.id));
+  }, [visibleAccounts, ensureCredits]);
 
   async function onImport() {
     setImporting(true);
@@ -346,7 +375,7 @@ export default function AccountsPage() {
       if (enabled) {
         toast.success("自动旅行已开启", { description: "正在按官方状态派发或领取" });
         window.setTimeout(() => {
-          void loadTravelMap(accounts.map((account) => account.id));
+          void loadTravelMap(visibleAccounts.map((account) => account.id));
         }, 2500);
       }
     } catch (e) {
@@ -430,37 +459,57 @@ export default function AccountsPage() {
     }
   }
 
-  /** 刷新按钮：先跑一轮批量签到并重查今日签到状态，再强制刷新全部积分。 */
+  /**
+   * 批量签到：逐个调用单账号签到（后端按账号自身档位取基址与路径），
+   * 只覆盖传入的账号，即当前档位的账号集合。
+   */
+  /**
+   * 当前档位的批量签到：后端一次调用完成（保留并发保护），国际版账号返回
+   * `inactive`（官方未开放签到活动）时不计成功也不计失败。
+   */
+  async function runBatchCheckin() {
+    const res = await api.checkinAll(variant);
+    return res.accounts ?? [];
+  }
+
+  /** 刷新按钮：先跑一轮当前档位的批量签到并重查今日签到状态，再强制刷新全部积分。 */
   async function onRefreshCredits() {
-    if (!accounts.length || refreshingCredits || checkinAllRunning) return;
+    if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
     setCheckinAllRunning(true);
+    const ids = visibleAccounts.map((account) => account.id);
     try {
       try {
-        const res = await api.checkinAll();
-        const entries = res.accounts ?? [];
+        const entries = await runBatchCheckin();
         const success = entries.filter((e) => e.result === "success").length;
         const already = entries.filter((e) => e.result === "already").length;
         const failed = entries.filter((e) => e.result === "error").length;
+        const inactive = entries.filter((e) => e.inactive === true || e.result === "inactive").length;
         const parts: string[] = [];
         if (success > 0) parts.push(`${success} 个签到成功`);
         if (already > 0) parts.push(`${already} 个已签到`);
+        if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
         if (failed > 0) parts.push(`${failed} 个失败`);
         const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
-        if (entries.length > 0 && failed === entries.length) {
+        const counted = success + already + failed;
+        if (failed > 0 && counted === failed) {
           toast.error("签到失败", { description: summary });
+        } else if (counted === 0 && inactive > 0) {
+          // 全部是 inactive（官方未开放签到活动）：既不算成功也不算失败，
+          // 不得呈现为绿色成功（design D8）。
+          toast.info("签到未开放", { description: summary });
         } else {
           toast.success("签到完成", { description: summary });
         }
-        // 批量签到后重查全部账号的今日签到状态，无需切换页面即反映最新结果
-        const next = await fetchTodayCheckinMap(accounts.map((account) => account.id));
+        // 批量签到后重查当前档位账号的今日签到状态，无需切换页面即反映最新结果
+        const next = await fetchTodayCheckinMap(ids);
         if (Object.keys(next).length > 0) {
           setCheckinMap((prev) => ({ ...prev, ...next }));
         }
       } catch (e) {
         toast.error("批量签到失败", { description: api.asError(e) });
       }
-      await refreshCredits(accounts.map((account) => account.id));
-      await loadTravelMap(accounts.map((account) => account.id));
+      await refreshCredits(ids);
+      if (travelAvailable) await loadTravelMap(ids);
       toast.success("积分到期情况已刷新");
     } finally {
       setCheckinAllRunning(false);
@@ -534,10 +583,10 @@ export default function AccountsPage() {
 
   const current = status?.current;
   const creditOrderingReady =
-    accounts.length > 0 &&
-    accounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
+    visibleAccounts.length > 0 &&
+    visibleAccounts.every((account) => Boolean(creditMap[account.id]) && !creditLoadingMap[account.id]);
   const orderedAccounts = creditOrderingReady
-    ? accounts
+    ? visibleAccounts
         .map((account, index) => ({ account, index }))
         .sort((left, right) => {
           const leftCredit = creditMap[left.account.id];
@@ -554,7 +603,7 @@ export default function AccountsPage() {
           return left.index - right.index;
         })
         .map(({ account }) => account)
-    : accounts;
+    : visibleAccounts;
   const priorityAccountId =
     creditOrderingReady
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
@@ -580,6 +629,16 @@ export default function AccountsPage() {
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
               统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
             </p>
+            <Tabs
+              className="mt-4 gap-0"
+              value={variant}
+              onValueChange={(value) => setVariant(normalizeVariant(value))}
+            >
+              <TabsList aria-label="WorkBuddy 档位">
+                <TabsTrigger value="cn">国内版</TabsTrigger>
+                <TabsTrigger value="ai">国际版</TabsTrigger>
+              </TabsList>
+            </Tabs>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
             <div className="flex items-center gap-2.5">
@@ -591,10 +650,10 @@ export default function AccountsPage() {
                       : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
                   }
                 >
-                  <WorkBuddyMark size={28} />
+                  {variant === "ai" ? <WorkBuddyAiMark size={28} /> : <WorkBuddyMark size={28} />}
                 </span>
                 <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  WorkBuddy：{status?.running ? "运行中" : "未运行"} · 当前账号：{workbuddyCurrentName}
+                  {appName}：{status?.running ? "运行中" : "未运行"} · 当前账号：{workbuddyCurrentName}
                 </span>
               </span>
               <span className="group relative inline-flex cursor-default">
@@ -637,7 +696,11 @@ export default function AccountsPage() {
         <div className="relative flex flex-wrap items-center gap-x-5 gap-y-4">
           <div className="min-w-[190px] flex-1">
             <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
-            <p className="mt-1 text-xs leading-5 text-muted-foreground">快速接入新账号，或从已有环境恢复</p>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              {variant === "ai"
+                ? `快速接入 ${appName} 账号，或从已有环境恢复`
+                : "快速接入新账号，或从已有环境恢复"}
+            </p>
           </div>
           <div className="flex flex-wrap items-center gap-2.5">
             <DemoAction>
@@ -650,7 +713,8 @@ export default function AccountsPage() {
             </DemoAction>
             <DemoAction>
               <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
-                {importing ? <Loader2 className="animate-spin" /> : <Download />}导入本机账号
+                {importing ? <Loader2 className="animate-spin" /> : <Download />}
+                {variant === "ai" ? `导入本机 ${appName} 账号` : "导入本机账号"}
               </Button>
             </DemoAction>
           </div>
@@ -661,7 +725,7 @@ export default function AccountsPage() {
               </Button>
             </DemoAction>
             <DemoAction>
-              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={accounts.length === 0} title="导出账号备份">
+              <Button variant="ghost" size="sm" className="h-9 px-2.5" onClick={() => setExportOpen(true)} disabled={visibleAccounts.length === 0} title="导出账号备份">
                 <FileDown />导出
               </Button>
             </DemoAction>
@@ -724,9 +788,9 @@ export default function AccountsPage() {
             <Badge
               variant="secondary"
               className="h-6 min-w-6 rounded-full border-0 px-1.5 text-[11px] tabular-nums text-muted-foreground shadow-none"
-              aria-label={`${accounts.length} 个账号`}
+              aria-label={`${visibleAccounts.length} 个${variantLabel(variant)}账号`}
             >
-              {accounts.length}
+              {visibleAccounts.length}
             </Badge>
           </div>
           <TooltipProvider delayDuration={400}>
@@ -746,21 +810,24 @@ export default function AccountsPage() {
                 </DemoAction>
                 {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
               </div>
-              <div className="mr-1 flex items-center gap-2.5">
-                <label htmlFor="accounts-auto-travel" className="cursor-pointer text-xs font-medium text-muted-foreground">
-                  自动旅行
-                </label>
-                <DemoAction>
-                  <Switch
-                    id="accounts-auto-travel"
-                    checked={autoTravelConfig?.enabled ?? false}
-                    disabled={!autoTravelConfig || autoTravelSaving}
-                    onCheckedChange={(enabled) => void onAutoTravelChange(enabled)}
-                    aria-label="自动旅行"
-                  />
-                </DemoAction>
-                {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
-              </div>
+              {/* 成长中心（派猫猫旅行）仅国内版开放，国际版隐藏入口 */}
+              {travelAvailable && (
+                <div className="mr-1 flex items-center gap-2.5">
+                  <label htmlFor="accounts-auto-travel" className="cursor-pointer text-xs font-medium text-muted-foreground">
+                    自动旅行
+                  </label>
+                  <DemoAction>
+                    <Switch
+                      id="accounts-auto-travel"
+                      checked={autoTravelConfig?.enabled ?? false}
+                      disabled={!autoTravelConfig || autoTravelSaving}
+                      onCheckedChange={(enabled) => void onAutoTravelChange(enabled)}
+                      aria-label="自动旅行"
+                    />
+                  </DemoAction>
+                  {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
+                </div>
+              )}
               <Separator orientation="vertical" className="mx-2 h-5" />
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -784,7 +851,7 @@ export default function AccountsPage() {
                         variant="ghost"
                         size="icon"
                         className="size-9 rounded-lg"
-                        disabled={refreshingCredits || checkinAllRunning || accounts.length === 0}
+                        disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
                         onClick={() => void onRefreshCredits()}
                         aria-label="签到并刷新全部账号积分"
                       >
@@ -798,14 +865,24 @@ export default function AccountsPage() {
             </div>
           </TooltipProvider>
         </div>
-        {loading && accounts.length === 0 ? (
+        {loading && visibleAccounts.length === 0 ? (
           <div className="flex items-center gap-2 py-16 text-sm text-muted-foreground">
             <Loader2 className="animate-spin" />
             加载账号…
           </div>
-        ) : accounts.length === 0 ? (
+        ) : visibleAccounts.length === 0 ? (
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
-            暂无账号。点击上方按钮导入本机账号或扫码登录。
+            {variant === "ai" ? (
+              <>
+                <p>暂无{appName}（国际版）账号。</p>
+                <p className="mt-2 text-xs leading-5">
+                  请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）并登录，
+                  再点击上方「导入本机 {appName} 账号」；也可以直接「OAuth 扫码添加」登录国际版账号。
+                </p>
+              </>
+            ) : (
+              "暂无账号。点击上方按钮导入本机账号或扫码登录。"
+            )}
           </div>
         ) : (
           <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
@@ -842,17 +919,18 @@ export default function AccountsPage() {
         )}
       </section>
 
-      <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} />
+      <OAuthLoginDialog open={oauthOpen} onOpenChange={setOauthOpen} variant={variant} />
       <ExportAccountsDialog
         open={exportOpen}
         onOpenChange={setExportOpen}
-        accounts={accounts}
+        accounts={visibleAccounts}
         onExported={onExported}
       />
       <ImportAccountsDialog
         open={importOpen}
         onOpenChange={setImportOpen}
         onImported={onImported}
+        variant={variant}
       />
       <SwitchAccountDialog
         open={switchAccount !== null}

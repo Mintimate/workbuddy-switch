@@ -560,9 +560,10 @@ function AutoRotateCard() {
   );
 }
 
-/** 权限检测卡片：确认本 App 是否有权写入 WorkBuddy 认证文件。 */
+/** 权限检测卡片：确认本 App 是否有权写入 WorkBuddy 认证文件（探针与展示路径同档位）。 */
 function PermissionCheckCard() {
   const authFile = useAuthFile();
+  const variant = useAccountsStore((s) => s.variant);
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<null | { ok: boolean; text: string }>(null);
 
@@ -570,7 +571,7 @@ function PermissionCheckCard() {
     setChecking(true);
     setResult(null);
     try {
-      const res = await api.checkAuthPermission();
+      const res = await api.checkAuthPermission(variant);
       setResult({
         ok: res.ok,
         text: res.ok
