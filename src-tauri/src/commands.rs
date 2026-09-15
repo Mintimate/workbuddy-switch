@@ -497,15 +497,25 @@ pub fn relaunch_app(_app: tauri::AppHandle) -> Result<(), String> {
             true
         }
     });
-    // 先放弃单例身份（删除 socket）再交棒：否则新进程可能在旧 listener 消失前
-    // 连上它，把自己当第二实例退出，出现「旧进程已退、新进程也退出」而应用彻底消失。
+    // 先放弃单例身份（删除 socket，并在 macOS 上释放 flock）再交棒：否则新进程
+    // 可能在旧 listener / 锁消失前连上或抢锁失败，出现「旧进程已退、新进程也退出」
+    // 而应用彻底消失。
     #[cfg(desktop)]
     tauri_plugin_single_instance::destroy(&_app);
-    std::process::Command::new(executable)
-        .args(args)
-        .spawn()
-        .map_err(|e| format!("启动应用失败: {e}"))?;
-    std::process::exit(0);
+    #[cfg(target_os = "macos")]
+    crate::instance_lock::release(&_app);
+    match std::process::Command::new(executable).args(args).spawn() {
+        Ok(_) => std::process::exit(0),
+        Err(e) => {
+            // 已经放弃单例身份：要么把锁拿回来继续跑，要么退出。
+            // 不允许「无锁继续运行」（否则之后再启动就会双开）。
+            #[cfg(target_os = "macos")]
+            if !crate::instance_lock::reacquire(&_app) {
+                std::process::exit(0);
+            }
+            Err(format!("启动应用失败: {e}"))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

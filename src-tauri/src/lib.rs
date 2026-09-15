@@ -1,5 +1,7 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod commands;
+#[cfg(target_os = "macos")]
+mod instance_lock;
 #[cfg(desktop)]
 mod tray;
 
@@ -109,6 +111,12 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
+                // 插件已在 initialize_plugins 阶段决定 notify-or-exit；此处只兜底
+                // 插件漏掉的 macOS 竞态。必须在 tray::setup 之前：拿不到锁的第二
+                // 实例不能先建出托盘图标。不得放到 run() 开头，否则会抢在插件
+                // notify 之前拦下正常第二实例，丢掉「再点开 → 既有窗口弹出」。
+                #[cfg(target_os = "macos")]
+                instance_lock::acquire_or_exit(app.handle());
                 tray::setup(app)?;
                 // 主窗口由配置创建为不可见；在事件循环呈现前决定本次启动是否静默。
                 // 仅系统自启（精确 `--hidden` 参数）进入静默托盘，普通启动立即显示主窗口。
