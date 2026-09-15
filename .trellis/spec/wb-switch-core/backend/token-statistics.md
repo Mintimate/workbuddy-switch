@@ -134,6 +134,19 @@
   counted once using usage precedence `message.usage`, then
   `providerData.usage`, then top-level `usage`; `providerData.rawUsage` only
   supplements cache-write fields absent from the selected usage object.
+- Copied/forked sessions replay the parent history, including usage records with
+  their original timestamps, into their own JSONL file. The decoder therefore
+  processes files oldest-first (by file mtime) and skips any record whose
+  fingerprint was already seen in an earlier file. The fingerprint is
+  `(timestamp, input, output, cacheRead, cacheWrite, model)`. A record without a
+  timestamp cannot be fingerprinted and is counted as before. Usage stays
+  attributed to the original session; a fork only contributes records it
+  produced itself.
+- The fingerprint set is scoped to one `source_from_roots` call, not to a
+  directory. All scan roots of the same variant therefore share one set: a
+  record replayed across `~/.workbuddy-ai/projects` and
+  `~/.workbuddy-ai/sessions` counts once. Two different sources never share a
+  set, so one source can never absorb another's records.
 
 ### 4. Validation & Error Matrix
 
@@ -160,6 +173,10 @@
 | Equal titles in different files | Return separate session groups with stable unique keys. |
 | Older response without `dailyByModel` | Keep the aggregate daily trend and do not expose model-specific options. |
 | Selected model has no dated usage | Return an empty model trend; never fall back to the aggregate series under that model label. |
+| Copied/forked session replays the same usage record in another file | Count it once, attributed to the earliest-mtime file; skip later copies of the same fingerprint. |
+| Same fingerprint appears in two scan roots of one variant | Count it once; the two WorkBuddy AI roots share one fingerprint set. |
+| Record has no timestamp | Count it as before; it cannot be fingerprinted and must not be dropped. |
+| File mtimes tie at millisecond resolution | Ordering falls back to directory iteration; the contract still requires oldest-first by mtime, so fixtures must pin mtimes instead of relying on write order. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -208,6 +225,10 @@
   WorkBuddy variant scans its own roots, that a missing AI root yields an empty
   `workbuddy-ai` source, and that domestic and international WorkBuddy totals
   are never combined (including the empty-state distinction).
+- Dedup fixture tests assert a copied/forked session's replayed record counts
+  once while the fork's own new records still count, and that two roots of the
+  same variant share one fingerprint set (a record replayed across roots counts
+  once, and the second root is still scanned).
 
 ### 7. Wrong vs Correct
 
@@ -258,5 +279,30 @@ sessions.entry(event["aiTitle"].to_string()).or_default();
 collect_title_metadata(&event);
 if usage_is_in_range(&event, cutoff) {
     session_totals.add(normalize_usage(&event)?);
+}
+```
+
+#### Wrong
+
+```rust
+// Scoping the fingerprint set to a root silently re-counts a record that a
+// copied session replayed into another root of the same variant.
+for root in roots {
+    let mut seen = HashSet::new();
+    for path in files(root) {
+        aggregate(path, &mut seen);
+    }
+}
+```
+
+#### Correct
+
+```rust
+// One fingerprint set per source: shared by every root of the variant, never
+// shared between sources. Files are processed oldest-first by mtime.
+let mut seen = HashSet::new();
+paths.sort_by_key(|(_, path)| mtime(path));
+for (root, path) in &paths {
+    aggregate(root, path, &mut seen);
 }
 ```
