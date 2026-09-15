@@ -69,6 +69,34 @@ pub fn is_silent_startup(args: impl IntoIterator<Item = impl AsRef<str>>) -> boo
         .any(|arg| arg.as_ref() == SILENT_STARTUP_ARG)
 }
 
+/// 第二次启动是否需要把既有实例唤醒到前台。
+///
+/// 静默启动（精确 `--hidden`，自启重复触发）不打扰用户：不显示窗口、不改 Dock 状态。
+pub fn should_activate_on_second_launch(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    !is_silent_startup(args)
+}
+
+/// 单实例插件回调：已有实例时后启动进程已退出，这里处理既有实例的反应。
+///
+/// 参数由插件回传，**含 argv[0]**；精确 `--hidden` 判定与自启路径一致。
+/// 回调运行在 tokio worker 线程，而 `show_main_window` 会经 `apply_dock_visible`
+/// 直接操作 AppKit（`MainThreadMarker::new_unchecked`），必须跳回主线程执行。
+pub fn on_second_instance<R: Runtime>(app: &AppHandle<R>, args: Vec<String>) {
+    if !should_activate_on_second_launch(&args) {
+        return;
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || show_main_window(&handle));
+}
+
+/// macOS `RunEvent::Reopen`（点击 Dock / Finder 激活已运行应用）时显示主窗口。
+///
+/// 该事件在主线程派发，可直接走 `show_main_window`；窗口策略仍集中在 tray 模块。
+#[cfg(target_os = "macos")]
+pub(crate) fn show_main_window_on_reopen<R: Runtime>(app: &AppHandle<R>) {
+    show_main_window(app);
+}
+
 /// 在事件循环呈现应用前决定首次启动的主窗口可见性。
 ///
 /// `main` 窗口由 `tauri.conf.json` 配置创建为不可见，此处做出第一次
@@ -473,7 +501,10 @@ fn format_checkin_tooltip(value: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_keep_tray_alive};
+    use super::{
+        format_checkin_tooltip, is_silent_startup, menu_bar_icon, should_activate_on_second_launch,
+        should_keep_tray_alive,
+    };
     use serde_json::json;
 
     #[test]
@@ -509,6 +540,33 @@ mod tests {
         assert!(!is_silent_startup(["wb-switch-rust", "-hidden"]));
         assert!(!is_silent_startup(["wb-switch-rust", "--hidden-x"]));
         assert!(!is_silent_startup(["wb-switch-rust", "x--hidden"]));
+    }
+
+    #[test]
+    fn second_launch_with_exact_hidden_arg_does_not_activate() {
+        // 插件回传的 args 含 argv[0]，静默判定必须整参相等。
+        assert!(!should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--hidden"
+        ]));
+    }
+
+    #[test]
+    fn second_launch_activates_unless_exact_hidden_arg() {
+        assert!(should_activate_on_second_launch(Vec::<&str>::new()));
+        assert!(should_activate_on_second_launch(["wb-switch-rust"]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--debug"
+        ]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "--hidden-x"
+        ]));
+        assert!(should_activate_on_second_launch([
+            "wb-switch-rust",
+            "x--hidden"
+        ]));
     }
 
     #[test]

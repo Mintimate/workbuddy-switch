@@ -484,7 +484,7 @@ pub async fn check_update(proxy: Option<String>, force: Option<bool>) -> Value {
 
 /// 启动当前应用的新进程并退出旧进程，用于更新安装完成后的立即重启。
 #[tauri::command]
-pub fn relaunch_app() -> Result<(), String> {
+pub fn relaunch_app(_app: tauri::AppHandle) -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|e| format!("无法定位应用程序: {e}"))?;
     // 更新重启是普通启动路径；不要把系统自启专用参数带给新进程。
     let args = std::env::args_os().skip(1).filter(|arg| {
@@ -497,6 +497,10 @@ pub fn relaunch_app() -> Result<(), String> {
             true
         }
     });
+    // 先放弃单例身份（删除 socket）再交棒：否则新进程可能在旧 listener 消失前
+    // 连上它，把自己当第二实例退出，出现「旧进程已退、新进程也退出」而应用彻底消失。
+    #[cfg(desktop)]
+    tauri_plugin_single_instance::destroy(&_app);
     std::process::Command::new(executable)
         .args(args)
         .spawn()

@@ -78,7 +78,19 @@ fn spawn_background_loops() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // 单实例互斥必须最先注册：`Builder::build()` 按注册顺序 initialize_plugins，
+    // 插件 setup 命中已有实例会直接 `std::process::exit(0)`，因此第二个进程在
+    // 建主窗口 / 建托盘图标 / 起后台循环之前就已退出，不会产生账号侧副作用。
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            tray::on_second_instance(app, args);
+        }));
+    }
+
+    builder = builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
@@ -164,6 +176,18 @@ pub fn run() {
 
     app.run(|_app_handle, event| {
         #[cfg(desktop)]
-        tray::on_run_event(event);
+        {
+            // 点击 Dock / Finder 再次激活已运行实例：窗口已隐藏到托盘时显示主窗口。
+            // `Reopen` 在主线程派发，可直接调用窗口路径。
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = &event
+            {
+                tray::show_main_window_on_reopen(_app_handle);
+            }
+            tray::on_run_event(event);
+        }
     });
 }
