@@ -12,7 +12,7 @@
 
 use chrono::{Datelike, Local, Timelike};
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -457,7 +457,21 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>) -> Valu
         paths.extend(found.into_iter().map(|file| (root.clone(), file)));
     }
     let mut collector = SourceCollector::default();
-    paths.sort();
+
+    // Copied/forked sessions replay the parent history (including usage
+    // records with their original timestamps) into their own JSONL, so the
+    // same request would otherwise be counted once per copy. Process files
+    // oldest first and skip fingerprints already seen in an earlier file so
+    // usage stays attributed to the original session.
+    paths.sort_by_key(|(_, path)| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(u64::MAX)
+    });
+    let mut seen: HashSet<(i64, u64, u64, u64, u64, String)> = HashSet::new();
 
     for (root, path) in &paths {
         let session_id = path
@@ -504,6 +518,21 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>) -> Valu
             let Some(usage) = usage(&value) else {
                 continue;
             };
+            // Fingerprint = (timestamp, full usage, model). Records without a
+            // timestamp cannot be fingerprinted and are counted as before.
+            let duplicate = timestamp(&value).is_some_and(|ts| {
+                !seen.insert((
+                    ts,
+                    usage.input,
+                    usage.output,
+                    usage.read,
+                    usage.write,
+                    model(&value),
+                ))
+            });
+            if duplicate {
+                continue;
+            }
             let project = record_project(&value, &fallback_project);
             if session_project.is_none() {
                 session_project = Some(project.clone());
@@ -994,6 +1023,63 @@ mod tests {
     }
 
     #[test]
+    fn source_deduplicates_copied_session_history() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-fork-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = json!({
+            "timestamp": now,
+            "cwd": "/fixture/example-project",
+            "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+        });
+        // The copied session replays the same usage record under a new file.
+        fs::write(
+            project.join("session-original.jsonl"),
+            format!("{}\n", record),
+        )
+        .expect("write original fixture");
+        fs::write(
+            project.join("session-forked.jsonl"),
+            format!("{}\n{}\n", record, json!({
+                "timestamp": now + 1_000,
+                "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
+            })),
+        )
+        .expect("write forked fixture");
+        // Back-to-back writes can land in the same millisecond, and the
+        // millisecond mtime key leaves ordering to the filesystem's directory
+        // iteration, which is not sorted. The copy would then be processed
+        // first, own the replayed record, and leave the original with zero
+        // records. Pin the mtimes so the original always precedes its copy.
+        std::fs::File::open(project.join("session-original.jsonl"))
+            .expect("open original fixture")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("pin original mtime");
+        std::fs::File::open(project.join("session-forked.jsonl"))
+            .expect("open forked fixture")
+            .set_modified(std::time::SystemTime::now())
+            .expect("pin forked mtime");
+
+        let result = source(root.clone(), "fixture", None);
+        // The replayed record counts once; the fork's new record still counts.
+        assert_eq!(result["summary"]["records"], 2);
+        assert_eq!(result["summary"]["input"], 17);
+        assert_eq!(result["summary"]["output"], 5);
+        let sessions = result["sessions"].as_array().expect("session groups");
+        assert_eq!(sessions.len(), 2);
+        let forked = sessions
+            .iter()
+            .find(|session| session["sessionId"] == "session-forked")
+            .expect("forked session kept its new record");
+        assert_eq!(forked["input"], 7);
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
     fn bounded_source_excludes_records_before_cutoff() {
         let now = crate::modules::config::now_ms();
         let root = std::env::temp_dir().join(format!(
@@ -1258,6 +1344,63 @@ mod tests {
         assert_eq!(value["parseErrors"], 0);
         assert_eq!(value["sessions"].as_array().map(Vec::len), Some(0));
         assert_eq!(value["projects"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// 多根共享同一个指纹集：国际版两个根之间重放的同一请求只计一次，
+    /// 同时第二个根自身的新记录仍要计入（证明第二个根确实被扫了）。
+    #[test]
+    fn multi_root_source_deduplicates_across_roots() {
+        let now = crate::modules::config::now_ms();
+        let base = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-multiroot-{}-{now}",
+            std::process::id()
+        ));
+        let projects = base.join("projects");
+        let sessions = base.join("sessions");
+        fs::create_dir_all(&projects).expect("create projects root");
+        fs::create_dir_all(&sessions).expect("create sessions root");
+        let replayed = json!({
+            "timestamp": now,
+            "cwd": "/fixture/example-project",
+            "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+        });
+        fs::write(
+            projects.join("session-original.jsonl"),
+            format!("{}\n", replayed),
+        )
+        .expect("write original fixture");
+        // 第二个根里的会话重放了同一个请求，并另有一条自己的新请求。
+        fs::write(
+            sessions.join("session-root-two.jsonl"),
+            format!(
+                "{}\n{}\n",
+                replayed,
+                json!({
+                    "timestamp": now + 1_000,
+                    "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
+                })
+            ),
+        )
+        .expect("write second-root fixture");
+        // 与 source_deduplicates_copied_session_history 同理：毫秒级 mtime 并列时
+        // 顺序退化为 readdir，重放记录可能先被第二个根认领。pin 住 mtime 让
+        // 原始会话先处理，断言才稳定。
+        std::fs::File::open(projects.join("session-original.jsonl"))
+            .expect("open original fixture")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("pin original mtime");
+        std::fs::File::open(sessions.join("session-root-two.jsonl"))
+            .expect("open second-root fixture")
+            .set_modified(std::time::SystemTime::now())
+            .expect("pin second-root mtime");
+
+        let result = source_from_roots(&[projects.clone(), sessions.clone()], "workbuddy-ai", None);
+        // 两个根都被扫到；重放记录计一次，第二个根的新记录另计一次。
+        assert_eq!(result["filesScanned"], 2);
+        assert_eq!(result["summary"]["records"], 2);
+        assert_eq!(result["summary"]["input"], 17);
+        assert_eq!(result["summary"]["output"], 5);
+        fs::remove_dir_all(base).expect("remove fixture");
     }
 
     /// 候选根按档位不同：国内版单根，国际版双根（无 projects/ 时只扫 sessions/）。
