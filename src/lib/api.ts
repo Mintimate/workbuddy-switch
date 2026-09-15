@@ -246,32 +246,6 @@ export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
   return call("oauth_status", { loginId });
 }
 
-/**
- * 在应用内**隔离会话**窗口打开授权页（仅国际版使用）。
- *
- * 桌面端走 `open_oauth_window`（`incognito` 建窗，天然无既有 cookie）。WebUI 跑在普通浏览器里，
- * 没有 Tauri 能力，退化为 `window.open`；demo 模式没有真实登录链路，同样退化。
- * 该退化通道无法隔离会话——浏览器已登录 workbuddy.ai 时会直接跳「登录成功」而不做绑定，
- * 因此对话框内会提示用户改用无痕窗口。
- */
-export function openOauthWindow(url: string): Promise<void> {
-  if (demoModeEnabled || isWebui()) {
-    try {
-      window.open(url, "_blank", "noopener,noreferrer");
-    } catch {
-      // 自动弹窗被拦截不算授权失败；对话框里仍保留可点击的原生链接作为兜底。
-    }
-    return Promise.resolve();
-  }
-  return call("open_oauth_window", { url });
-}
-
-/** 关闭应用内授权窗口；窗口不存在（已手动关闭）或非桌面端时无操作。 */
-export function closeOauthWindow(): Promise<void> {
-  if (demoModeEnabled || isWebui()) return Promise.resolve();
-  return call("close_oauth_window");
-}
-
 /** 导入本机当前登录态；`variant` 缺省为国内版（对应各自的登录态文件）。 */
 export function importLocal(variant?: WbVariant): Promise<{ ok: boolean; account: AccountMeta }> {
   return call("import_local", variantArgs(variant));

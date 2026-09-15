@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { ExternalLink } from "lucide-react";
+import { Check, CircleAlert, Copy, ExternalLink } from "lucide-react";
+import { toast } from "sonner";
 
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -52,6 +53,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
   const [uri, setUri] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState<AccountMeta | null>(null);
+  const [copied, setCopied] = useState(false);
 
   // 打开时重置
   useEffect(() => {
@@ -61,14 +63,9 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       setUri("");
       setError("");
       setResult(null);
+      setCopied(false);
     }
   }, [open]);
-
-  // 关闭或卸载对话框时收起应用内授权窗口，避免留下孤儿窗口。
-  useEffect(() => {
-    if (!open || variant !== "ai") return;
-    return () => closeAuthWindow(variant);
-  }, [open, variant]);
 
   // 轮询采集结果
   useEffect(() => {
@@ -80,8 +77,6 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       try {
         const res = await api.oauthStatus(loginId);
         if (res.done) {
-          // 成功或失败都以轮询结果为准收起授权窗口，不猜服务端的跳转地址。
-          closeAuthWindow(variant);
           if (res.result) {
             await reconcileAccounts();
             if (!cancelled) setResult(res.result);
@@ -103,7 +98,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [loginId, reconcileAccounts, variant]);
+  }, [loginId, reconcileAccounts]);
 
   async function start() {
     setBusy(true);
@@ -112,12 +107,27 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       const res = await api.oauthStart(variant);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
-      // 按当前宿主能力与档位打开验证页
-      await openAuthPage(res.verificationUri, variant);
+      // 国内版沿用自动打开；国际版不自动跳浏览器，让用户自己复制链接到无痕窗口
+      if (variant !== "ai") {
+        await openInBrowser(res.verificationUri);
+      }
     } catch (e) {
       setError(api.asError(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /** 复制验证链接：无痕窗口需要这条链接；失败必须如实提示，不能静默当成成功。 */
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(uri);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("复制链接失败", {
+        description: "浏览器未授予剪贴板权限，请手动选中上方链接后复制。",
+      });
     }
   }
 
@@ -139,6 +149,16 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
 
         {loginId && !result && (
           <div className="space-y-3">
+            {variant === "ai" && (
+              <Alert variant="warning">
+                <CircleAlert className="size-4" />
+                <AlertTitle>请把链接复制到无痕窗口打开</AlertTitle>
+                <AlertDescription>
+                  若浏览器已登录 workbuddy.ai，授权页会直接跳到「登录成功」而不会绑定账号。
+                  请用下方按钮复制链接，粘贴到浏览器的无痕（隐私）窗口中打开并完成登录。
+                </AlertDescription>
+              </Alert>
+            )}
             <Alert>
               <ExternalLink className="size-4" />
               <AlertDescription className="break-all">
@@ -152,21 +172,22 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
                     // 也能通过用户点击打开验证页。
                     if (api.isWebui()) return;
                     e.preventDefault();
-                    void openAuthPage(uri, variant);
+                    void openInBrowser(uri);
                   }}
                 >
                   {uri}
                 </a>
               </AlertDescription>
             </Alert>
+            {variant === "ai" && (
+              <Button variant="outline" size="sm" onClick={copyLink} className="w-full">
+                {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+                {copied ? "已复制" : "复制链接"}
+              </Button>
+            )}
             <p className="text-sm text-muted-foreground">
               {copy.waiting}
             </p>
-            {api.isWebui() && variant === "ai" && (
-              <p className="text-sm text-muted-foreground">
-                WebUI 通道无法隔离浏览器会话；若浏览器已登录 workbuddy.ai，请改用无痕窗口打开上方链接再授权。
-              </p>
-            )}
           </div>
         )}
 
@@ -195,18 +216,6 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       </DialogContent>
     </Dialog>
   );
-}
-
-/** 按档位打开授权页：国际版用应用内隔离窗口，国内版继续走系统浏览器（零改动）。 */
-async function openAuthPage(url: string, variant: WbVariant): Promise<void> {
-  if (variant === "ai") return api.openOauthWindow(url);
-  return openInBrowser(url);
-}
-
-/** 收起应用内授权窗口；仅国际版会创建它，国内版无窗口可关，非桌面端为 no-op。 */
-function closeAuthWindow(variant: WbVariant): void {
-  if (variant !== "ai") return;
-  void api.closeOauthWindow();
 }
 
 /** WebUI 使用浏览器新标签页，Tauri 使用系统 opener。 */

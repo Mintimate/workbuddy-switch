@@ -144,8 +144,6 @@ pub fn run() {
             commands::delete_account,
             commands::oauth_start,
             commands::oauth_status,
-            commands::open_oauth_window,
-            commands::close_oauth_window,
             commands::import_local,
             commands::export_accounts,
             commands::export_accounts_to_path,
