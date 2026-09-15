@@ -995,6 +995,19 @@ mod tests {
             })),
         )
         .expect("write forked fixture");
+        // Back-to-back writes can land in the same millisecond, and the
+        // millisecond mtime key leaves ordering to the filesystem's directory
+        // iteration, which is not sorted. The copy would then be processed
+        // first, own the replayed record, and leave the original with zero
+        // records. Pin the mtimes so the original always precedes its copy.
+        std::fs::File::open(project.join("session-original.jsonl"))
+            .expect("open original fixture")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("pin original mtime");
+        std::fs::File::open(project.join("session-forked.jsonl"))
+            .expect("open forked fixture")
+            .set_modified(std::time::SystemTime::now())
+            .expect("pin forked mtime");
 
         let result = source(root.clone(), "fixture", None);
         // The replayed record counts once; the fork's new record still counts.
