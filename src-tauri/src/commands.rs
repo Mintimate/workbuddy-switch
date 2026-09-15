@@ -6,7 +6,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
     export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
@@ -169,6 +169,55 @@ pub async fn oauth_start(variant: Option<String>) -> Result<Value, String> {
 #[tauri::command]
 pub async fn oauth_status(login_id: String) -> Value {
     oauth::oauth_poll(&login_id).await
+}
+
+/// 应用内授权窗口的固定标签。标签必须唯一，同时只能存在一个授权窗口。
+const OAUTH_WINDOW_LABEL: &str = "oauth-login";
+
+/// 在应用内新开一个**隔离会话**的授权窗口（仅国际版使用）。
+///
+/// 建窗时开 `incognito(true)`：macOS 上映射到 `WKWebsiteDataStore::nonPersistentDataStore`
+/// （`wry` 的 `wkwebview/mod.rs`），从存储层保证没有既有 cookie。用户浏览器已登录
+/// workbuddy.ai 时，系统浏览器里的登录页会直接显示「登录成功」而不做绑定，
+/// 轮询永远拿不到 token；自带空会话窗口走的是已验证可用的分支。
+///
+/// 相比「给系统浏览器加 `--incognito`」：不依赖用户装了什么浏览器，也不写入用户浏览器登录态。
+/// 不使用 `data_directory` / `clear_all_browsing_data`：前者不是 macOS 保证的能力，
+/// 后者会波及与应用主窗口共享的存储。
+///
+/// **必须保持同步命令**：Tauri 的同步命令在被调用线程内联执行，异步命令会被
+/// `async_runtime::spawn` 丢到工作线程；而 macOS 上 tao 会直接 panic——
+/// `tao/src/platform_impl/macos/window.rs:521`「Windows can only be created on the
+/// main thread on macOS」。**不要**改成 `async fn`。
+#[tauri::command]
+pub fn open_oauth_window(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let parsed = tauri::Url::parse(&url).map_err(|error| format!("授权链接无效: {error}"))?;
+
+    // 标签唯一：残留窗口先关掉再建，否则 build 会因标签冲突直接失败。
+    if let Some(existing) = app.get_webview_window(OAUTH_WINDOW_LABEL) {
+        let _ = existing.close();
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        OAUTH_WINDOW_LABEL,
+        tauri::WebviewUrl::External(parsed),
+    )
+    .title("登录 WorkBuddy AI")
+    // 登录页是「表单 + 插画」两栏，表单列约 570px 宽；给到 640 免得首屏就被裁掉。
+    .inner_size(640.0, 780.0)
+    .incognito(true)
+    .build()
+    .map_err(|error| format!("打开授权窗口失败: {error}"))?;
+    Ok(())
+}
+
+/// 关闭应用内授权窗口；窗口不存在（用户已手动关闭）时静默返回。
+#[tauri::command]
+pub fn close_oauth_window(app: tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(OAUTH_WINDOW_LABEL) {
+        let _ = window.close();
+    }
 }
 
 /// POST /api/import-local —— 导入本机当前账号（`variant` 缺省国内版）。

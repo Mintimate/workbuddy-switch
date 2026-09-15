@@ -64,6 +64,12 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
     }
   }, [open]);
 
+  // 关闭或卸载对话框时收起应用内授权窗口，避免留下孤儿窗口。
+  useEffect(() => {
+    if (!open || variant !== "ai") return;
+    return () => closeAuthWindow(variant);
+  }, [open, variant]);
+
   // 轮询采集结果
   useEffect(() => {
     if (!loginId) return;
@@ -74,6 +80,8 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       try {
         const res = await api.oauthStatus(loginId);
         if (res.done) {
+          // 成功或失败都以轮询结果为准收起授权窗口，不猜服务端的跳转地址。
+          closeAuthWindow(variant);
           if (res.result) {
             await reconcileAccounts();
             if (!cancelled) setResult(res.result);
@@ -95,7 +103,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [loginId, reconcileAccounts]);
+  }, [loginId, reconcileAccounts, variant]);
 
   async function start() {
     setBusy(true);
@@ -104,8 +112,8 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       const res = await api.oauthStart(variant);
       setLoginId(res.loginId);
       setUri(res.verificationUri);
-      // 按当前宿主能力打开验证页
-      await openInBrowser(res.verificationUri);
+      // 按当前宿主能力与档位打开验证页
+      await openAuthPage(res.verificationUri, variant);
     } catch (e) {
       setError(api.asError(e));
     } finally {
@@ -144,7 +152,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
                     // 也能通过用户点击打开验证页。
                     if (api.isWebui()) return;
                     e.preventDefault();
-                    void openInBrowser(uri);
+                    void openAuthPage(uri, variant);
                   }}
                 >
                   {uri}
@@ -154,6 +162,11 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
             <p className="text-sm text-muted-foreground">
               {copy.waiting}
             </p>
+            {api.isWebui() && variant === "ai" && (
+              <p className="text-sm text-muted-foreground">
+                WebUI 通道无法隔离浏览器会话；若浏览器已登录 workbuddy.ai，请改用无痕窗口打开上方链接再授权。
+              </p>
+            )}
           </div>
         )}
 
@@ -182,6 +195,18 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       </DialogContent>
     </Dialog>
   );
+}
+
+/** 按档位打开授权页：国际版用应用内隔离窗口，国内版继续走系统浏览器（零改动）。 */
+async function openAuthPage(url: string, variant: WbVariant): Promise<void> {
+  if (variant === "ai") return api.openOauthWindow(url);
+  return openInBrowser(url);
+}
+
+/** 收起应用内授权窗口；仅国际版会创建它，国内版无窗口可关，非桌面端为 no-op。 */
+function closeAuthWindow(variant: WbVariant): void {
+  if (variant !== "ai") return;
+  void api.closeOauthWindow();
 }
 
 /** WebUI 使用浏览器新标签页，Tauri 使用系统 opener。 */
