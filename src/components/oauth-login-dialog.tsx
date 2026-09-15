@@ -23,10 +23,29 @@ interface Props {
   variant?: WbVariant;
 }
 
-/** OAuth 扫码登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
+/** 登录链路文案按档位区分：国内版是扫码授权，国际版只有浏览器 Web 登录授权（无二维码）。 */
+const LOGIN_COPY = {
+  cn: {
+    title: "OAuth 扫码登录",
+    description: (appName: string) =>
+      `在浏览器中打开验证链接，扫码授权后将自动采集 ${appName} 账号并入库。`,
+    start: "开始扫码登录",
+    waiting: "正在等待扫码授权，请在浏览器完成操作…",
+  },
+  ai: {
+    title: "OAuth Web 登录",
+    description: (appName: string) =>
+      `在浏览器中打开验证链接，完成 Web 登录授权后将自动采集 ${appName} 账号并入库。`,
+    start: "开始 Web 登录",
+    waiting: "请在浏览器中完成 Web 登录授权，正在等待授权结果…",
+  },
+} as const;
+
+/** OAuth 登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
 export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT }: Props) {
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
   const appName = variantAppName(variant);
+  const copy = LOGIN_COPY[variant];
 
   const [busy, setBusy] = useState(false);
   const [loginId, setLoginId] = useState<string | null>(null);
@@ -98,16 +117,14 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>OAuth 扫码登录（{variantLabel(variant)}）</DialogTitle>
-          <DialogDescription>
-            在浏览器中打开验证链接，扫码授权后将自动采集 {appName} 账号并入库。
-          </DialogDescription>
+          <DialogTitle>{copy.title}（{variantLabel(variant)}）</DialogTitle>
+          <DialogDescription>{copy.description(appName)}</DialogDescription>
         </DialogHeader>
 
         {!loginId && !result && (
           <div className="space-y-3">
             <Button onClick={start} disabled={busy} className="w-full">
-              {busy ? "正在发起登录…" : "开始扫码登录"}
+              {busy ? "正在发起登录…" : copy.start}
             </Button>
           </div>
         )}
@@ -135,7 +152,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
               </AlertDescription>
             </Alert>
             <p className="text-sm text-muted-foreground">
-              正在等待扫码授权，请在浏览器完成操作…
+              {copy.waiting}
             </p>
           </div>
         )}

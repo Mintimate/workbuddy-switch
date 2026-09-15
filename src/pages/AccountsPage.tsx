@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import {
   Columns3,
   Download,
+  ExternalLink,
   FileDown,
   FileUp,
   Loader2,
@@ -242,7 +243,7 @@ export default function AccountsPage() {
 
   /**
    * 首次启动自动导入本机账号（本会话只尝试一次，无本机账号时静默）。
-   * 仅限默认档位：切到国际版时不静默写入账号，改由空状态引导显式导入或扫码。
+   * 仅限默认档位：切到国际版时不静默写入账号，改由空状态引导显式导入或浏览器授权登录。
    */
   const autoImportTried = useRef(false);
   useEffect(() => {
@@ -708,7 +709,8 @@ export default function AccountsPage() {
                 className="h-10 bg-primary px-4 text-primary-foreground shadow-sm hover:bg-primary/90"
                 onClick={() => setOauthOpen(true)}
               >
-                <QrCode />OAuth 扫码添加
+                {variant === "ai" ? <ExternalLink /> : <QrCode />}
+                {variant === "ai" ? "OAuth 登录" : "OAuth 扫码添加"}
               </Button>
             </DemoAction>
             <DemoAction>
@@ -877,7 +879,7 @@ export default function AccountsPage() {
                 <p>暂无{appName}（国际版）账号。</p>
                 <p className="mt-2 text-xs leading-5">
                   请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）并登录，
-                  再点击上方「导入本机 {appName} 账号」；也可以直接「OAuth 扫码添加」登录国际版账号。
+                  再点击上方「导入本机 {appName} 账号」；也可以直接「OAuth 登录」添加国际版账号。
                 </p>
               </>
             ) : (
