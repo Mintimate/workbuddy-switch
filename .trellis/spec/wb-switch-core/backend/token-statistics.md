@@ -1,12 +1,19 @@
 # Local Token Statistics Contract
 
-## Scenario: WorkBuddy, CodeBuddy CLI, and CodeBuddy IDE token dashboard
+> Applies to: both variants (`cn`, `ai`); WorkBuddy is split into a domestic
+> (`workbuddy`) and an international (`workbuddy-ai`) source, reported
+> independently.
+
+## Scenario: WorkBuddy (CN/AI), CodeBuddy CLI, and CodeBuddy IDE token dashboard
 
 ### 1. Scope / Trigger
 
 - Trigger: the token dashboard adds a cross-layer local aggregation API.
-- Scope: decode usage records from the three local sources, aggregate safe numeric
+- Scope: decode usage records from the four local sources, aggregate safe numeric
   projections, and expose the same payload through Tauri and HTTP.
+- The domestic (`workbuddy`) and international (`workbuddy-ai`) WorkBuddy
+  sources are separate: their roots differ, they are never mixed, and each can
+  be empty independently.
 - The decoder in `crates/wb-switch-core/src/modules/token_stats.rs` is the sole
   owner of event parsing, source isolation, filtering, and aggregation.
 
@@ -25,7 +32,11 @@
 
 - `days` is an optional signed integer at the HTTP/Tauri boundary.
 - Sources are fixed local roots:
-  - WorkBuddy JSONL: `~/.workbuddy/projects`
+  - WorkBuddy (CN) JSONL: `~/.workbuddy/projects`
+  - WorkBuddy AI (international) JSONL: `~/.workbuddy-ai/projects` and
+    `~/.workbuddy-ai/sessions`; each root is scanned only when it exists
+    (`token_stats::jsonl_root_candidates` / `variant_source_roots`). The two
+    WorkBuddy roots are not assumed to have the same layout.
   - CodeBuddy CLI JSONL: `~/.codebuddy/projects`
   - CodeBuddy IDE conversation indexes:
     `{data_local_dir}/CodeBuddyExtension/Data/**/history/{workspace}/{conversation}/index.json`
@@ -84,8 +95,10 @@
 }
 ```
 
-- `source` is one of `workbuddy`, `codebuddy-cli`, or `codebuddy-ide`. The three
-  sources are returned independently and never mixed.
+- `source` is one of `workbuddy`, `workbuddy-ai`, `codebuddy-cli`, or
+  `codebuddy-ide`. The four sources are returned independently and never mixed;
+  domestic and international WorkBuddy usage must not be summed into a single
+  source.
 - `summary.input` includes the provider-reported input total, including cached
   input. `summary.uncachedInput = input - cacheRead` (saturating at zero).
 - `cacheWrite` accepts only explicit provider write aliases:
@@ -129,6 +142,7 @@
 | `days=7`, `30`, or `90` | Apply one shared millisecond cutoff to all sources. |
 | Missing/invalid `days` | Scan complete history and return `rangeDays: null`. |
 | Missing source directory | Return an empty source, not an API error. |
+| Missing `~/.workbuddy-ai` roots (international client not installed) | Return an empty `workbuddy-ai` source; the UI shows an identifiable empty state distinct from the domestic source. |
 | Invalid JSONL line | Skip the line and increment `parseErrors`. |
 | Missing timestamp or outside cutoff | Do not aggregate the record. |
 | Missing input usage field | Ignore the record as non-usage content. |
@@ -190,6 +204,10 @@
 - Fixture tests assert CodeBuddy IDE conversation indexes are aggregated, message
   body files are ignored, titles/models come from the workspace index, and the
   shared cutoff applies to `startedAt`.
+- Source tests assert the four sources are keyed independently, that each
+  WorkBuddy variant scans its own roots, that a missing AI root yields an empty
+  `workbuddy-ai` source, and that domestic and international WorkBuddy totals
+  are never combined (including the empty-state distinction).
 
 ### 7. Wrong vs Correct
 
