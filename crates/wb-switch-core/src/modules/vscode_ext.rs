@@ -509,6 +509,24 @@ pub fn detect_current_account() -> Result<Value, String> {
     }))
 }
 
+/// 当前登录 VS Code CodeBuddy 扩展的账号 uid（用于定位可复制的会话目录）。
+///
+/// 优先从扩展登录 secret 解析 uid；不可用时回退到本地状态文件记录的账号 id → 账号库 uid。
+/// 任一来源都拿不到时返回 `None`（调用方据此给出「未登录」空态）。
+pub fn active_ext_uid() -> Option<String> {
+    if let Ok(Some(secret)) = read_secret_for(&VSCODE_TARGET, None) {
+        if let Some((Some(uid), _token)) = parse_token_from_secret(&secret) {
+            let uid = uid.trim().to_string();
+            if !uid.is_empty() {
+                return Some(uid);
+            }
+        }
+    }
+    active_account_id_from_state()
+        .and_then(|id| account::find_account(&id))
+        .and_then(|acc| get_str(&acc, "uid"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

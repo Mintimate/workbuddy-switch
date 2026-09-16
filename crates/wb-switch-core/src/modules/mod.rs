@@ -19,3 +19,4 @@ pub mod travel;
 pub mod update;
 pub mod vscode_cn_inject;
 pub mod vscode_ext;
+pub mod vscode_session;

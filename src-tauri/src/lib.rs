@@ -143,6 +143,7 @@ pub fn run() {
             commands::get_vscode_ext_status,
             commands::switch_vscode_ext_account,
             commands::detect_vscode_ext_account,
+            commands::list_vscode_sessions,
             commands::delete_account,
             commands::oauth_start,
             commands::oauth_status,

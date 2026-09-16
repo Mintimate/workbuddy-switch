@@ -161,7 +161,7 @@ function travelChip(status: TravelStatus | undefined) {
 function vscodeExtTooltip(installed?: boolean, extensionInstalled?: boolean): string {
   if (!installed) return "未检测到 VS Code";
   if (!extensionInstalled) return "未检测到 CodeBuddy 扩展";
-  return "切换到 VS Code CodeBuddy 扩展（需先完全退出 VS Code）";
+  return "切换 VS Code 账号（可选复制会话；需先完全退出 VS Code）";
 }
 
 interface Props {
@@ -413,10 +413,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   </TooltipTrigger>
                   <TooltipContent side="top">VS Code CodeBuddy 当前账号</TooltipContent>
                 </Tooltip>
+              ) : demoModeEnabled ? (
+                <DemoAction>
+                  <Button variant="outline" size="icon" className="relative size-7 rounded-lg" aria-label="切换到 VS Code 扩展（可复制会话）">
+                    <VscodeExtMark size={15} />
+                  </Button>
+                </DemoAction>
               ) : (
                 <Tooltip>
                   <TooltipTrigger asChild>
-                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label={vscodeExtLoading ? "正在切换 VS Code 扩展" : "切换到 VS Code 扩展"} aria-busy={vscodeExtLoading}>
+                    <Button variant="outline" size="icon" className="relative size-7 rounded-lg" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code 扩展（可复制会话）" aria-busy={vscodeExtLoading}>
                       {vscodeExtLoading ? <Loader2 className="size-3.5 animate-spin" /> : <VscodeExtMark size={15} />}
                     </Button>
                   </TooltipTrigger>
@@ -541,10 +547,16 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               <TooltipContent side="top">{codebuddyCnIdeAvailable ? "切换到 CodeBuddy IDE（会重启 IDE）" : "未检测到 CodeBuddy IDE"}</TooltipContent>
             </Tooltip>
           )}
-          {vscodeExtActive ? <ProductCurrentState product="vscode-ext" compact /> : (
+          {vscodeExtActive ? <ProductCurrentState product="vscode-ext" compact /> : demoModeEnabled ? (
+            <DemoAction>
+              <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" aria-label="切换到 VS Code 扩展（可复制会话）">
+                <VscodeExtMark size={18} /><span>VS Code</span>
+              </Button>
+            </DemoAction>
+          ) : (
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label={vscodeExtLoading ? "正在切换 VS Code 扩展" : "切换到 VS Code 扩展"} aria-busy={vscodeExtLoading}>
+                <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 pr-3.5 text-xs" disabled={featuresDisabled || !vscodeExtAvailable || !onSwitchVscodeExt || vscodeExtBusy} onClick={() => onSwitchVscodeExt?.(account)} aria-label="切换到 VS Code 扩展（可复制会话）" aria-busy={vscodeExtLoading}>
                   {vscodeExtLoading ? <Loader2 className="size-4 animate-spin" /> : <VscodeExtMark size={18} />}<span>{vscodeExtLoading ? "切换中…" : "VS Code"}</span>
                 </Button>
               </TooltipTrigger>

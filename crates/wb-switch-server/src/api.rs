@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits, export_import,
-    oauth, process, refresh, rotate, session, switch, token_stats, travel, update, vscode_ext,
+    oauth, process, refresh, rotate, session, switch, token_stats, travel, update, vscode_ext, vscode_session,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -67,6 +67,7 @@ pub fn router() -> Router {
         .route("/api/codebuddy-cn-ide/switch", post(api_codebuddy_cn_ide_switch))
         .route("/api/codebuddy-cn-ide/detect", post(api_codebuddy_cn_ide_detect))
         .route("/api/vscode-ext/status", get(api_vscode_ext_status))
+        .route("/api/vscode-ext/sessions", get(api_vscode_ext_sessions))
         .route("/api/vscode-ext/switch", post(api_vscode_ext_switch))
         .route("/api/vscode-ext/detect", post(api_vscode_ext_detect))
         .route("/api/delete", post(api_delete))
@@ -205,6 +206,19 @@ async fn api_vscode_ext_status() -> Response {
     json_ok(vscode_ext::status())
 }
 
+/// GET /api/vscode-ext/sessions —— 当前 VS Code 扩展账号可复制的会话（未登录返回空列表）。
+async fn api_vscode_ext_sessions() -> Response {
+    let result = tokio::task::spawn_blocking(|| match vscode_ext::active_ext_uid() {
+        Some(uid) => vscode_session::list_vscode_sessions(&uid),
+        None => json!({ "sourceUid": null, "sessions": [], "skipped": 0 }),
+    })
+    .await;
+    match result {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
 async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
     let account_id = body
         .get("accountId")
@@ -213,7 +227,26 @@ async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
         .unwrap_or("");
     // 默认不重启：VS Code 运行中不得写入，切换仅在编辑器完全退出后可用。
     let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(false);
-    match vscode_ext::switch_account(account_id, restart) {
+    // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/* 命名风格一致）。
+    let copy_items: Vec<vscode_session::CopyItem> = body
+        .get("copySessions")
+        .and_then(|v| v.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<vscode_session::CopyItem>(item.clone()).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let result = if copy_items.is_empty() {
+        vscode_ext::switch_account(account_id, restart)
+    } else {
+        vscode_session::switch_vscode_ext_with_copy(account_id, restart, &copy_items)
+    };
+    match result {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

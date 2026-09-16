@@ -33,6 +33,7 @@ import { ExportAccountsDialog } from "@/components/export-accounts-dialog";
 import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
+import { VscodeSwitchAccountDialog } from "@/components/vscode-switch-account-dialog";
 import * as api from "@/lib/api";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus, VscodeExtStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -151,7 +152,8 @@ export default function AccountsPage() {
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
   const [codebuddyCnIdeSwitchingId, setCodebuddyCnIdeSwitchingId] = useState<string | null>(null);
   const [vscodeExt, setVscodeExt] = useState<VscodeExtStatus | null>(null);
-  const [vscodeExtSwitchingId, setVscodeExtSwitchingId] = useState<string | null>(null);
+  /** VS Code 扩展切换弹窗目标（null=关闭）；切换与可选会话复制在弹窗内完成。 */
+  const [vscodeSwitchAccount, setVscodeSwitchAccount] = useState<AccountMeta | null>(null);
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
@@ -531,29 +533,6 @@ export default function AccountsPage() {
     }
   }
 
-  async function onSwitchVscodeExt(account: AccountMeta) {
-    if (vscodeExtSwitchingId !== null) return;
-    setVscodeExtSwitchingId(account.id);
-    const toastId = toast.loading("正在切换 VS Code CodeBuddy 扩展…", {
-      description: "将写入凭证（VS Code 需先完全退出）",
-    });
-    try {
-      const result = await api.switchVscodeExtAccount(account.id);
-      await refreshVscodeExtStatus();
-      toast.success("VS Code CodeBuddy 扩展已切换", {
-        id: toastId,
-        description: result.message || result.account,
-      });
-    } catch (error) {
-      toast.error("VS Code CodeBuddy 扩展切换失败", {
-        id: toastId,
-        description: api.asError(error),
-      });
-    } finally {
-      setVscodeExtSwitchingId(null);
-    }
-  }
-
   async function onInstallCodebuddyCli() {
     // 桌面 App（Tauri WebView）不支持 window.confirm，改用 Dialog 确认
     setInstallConfirmOpen(true);
@@ -898,9 +877,8 @@ export default function AccountsPage() {
                 vscodeExtExtensionInstalled={Boolean(vscodeExt?.extensionInstalled)}
                 vscodeExtAvailable={Boolean(vscodeExt?.installed && vscodeExt?.extensionInstalled)}
                 vscodeExtActive={a.id === vscodeExtCurrentAccountId}
-                vscodeExtBusy={vscodeExtSwitchingId !== null}
-                vscodeExtLoading={vscodeExtSwitchingId === a.id}
-                onSwitchVscodeExt={onSwitchVscodeExt}
+                vscodeExtBusy={vscodeSwitchAccount !== null}
+                onSwitchVscodeExt={setVscodeSwitchAccount}
                 featuresDisabled={false}
               />
             ))}
@@ -930,6 +908,17 @@ export default function AccountsPage() {
           void fetchAll();
           void refreshCodebuddyCliStatus();
           void refreshCodebuddyCnIdeStatus();
+        }}
+      />
+      <VscodeSwitchAccountDialog
+        open={vscodeSwitchAccount !== null}
+        onOpenChange={(o) => {
+          if (!o) setVscodeSwitchAccount(null);
+        }}
+        account={vscodeSwitchAccount}
+        vscodeExtStatus={vscodeExt}
+        onDone={() => {
+          void refreshVscodeExtStatus();
         }}
       />
 
