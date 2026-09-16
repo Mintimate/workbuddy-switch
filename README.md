@@ -1,13 +1,13 @@
 # workbuddy-switch
 
-WorkBuddy / CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
+WorkBuddy（含国际版 WorkBuddy AI）/ CodeBuddy CLI / CodeBuddy CN IDE 账号切换桌面 App（Tauri），支持积分到期监控与自动签到。
 
 同时提供 npm / webui 版本，方便在浏览器中使用同一套账号管理能力。
 
 - **桌面 App**：从 GitHub Releases 下载 macOS、Windows 或 Linux 安装包（Tauri，推荐日常使用）
 - **npm / webui**：`npm i -g workbuddy-switch` 后运行 `workbuddy-switch`，浏览器打开操作界面
 
-多账号共享登录态（`workbuddy-desktop.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。
+多账号共享登录态（国内版 `workbuddy-desktop.info`、国际版 `workbuddy-desktop-ai.info`），一键切换 WorkBuddy 登录账号，并支持将当前账号的会话复制给目标账号（云端归属目标）。两档位在账号页切换，账号与操作互不影响。
 
 <p align="center">
   <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
@@ -58,7 +58,7 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 
 | 模块 | 说明 |
 | --- | --- |
-| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号 |
+| 账号管理 | OAuth 扫码登录、从本机导入、手动添加 token、删除账号；国内版与国际版（WorkBuddy AI）分别管理，账号页顶部切换档位 |
 | 账号切换 | 备份认证文件 → 关闭 WorkBuddy → 写入目标账号 → 重启，切换过程实时进度反馈 |
 | 会话复制 | 将当前账号勾选的会话以新 id 复制给目标账号（jsonl 正文 + `workbuddy.db` 索引 + edge-sync 注册） |
 | 自动签到 | 默认开启；启动时立即检查，运行期间每 30 分钟自动补签；一键全部签到；30 天签到日志 |
@@ -72,6 +72,20 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
 
+## 国际版（WorkBuddy AI）
+
+账号页顶部可切换 **国内版 / 国际版**，两个档位的账号、状态、扫码登录与本机导入相互独立：
+
+- **登录态文件**：国际版为 `CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info`（与国内版同目录、不同文件）。
+- **客户端**：macOS `WorkBuddy AI.app`、Windows `%LOCALAPPDATA%\Programs\WorkBuddyAI\WorkBuddyAI.exe`；切换只关闭/启动对应档位的客户端。
+- **接口**：国际版走 `www.workbuddy.ai`（国内版为 `www.codebuddy.cn` / `copilot.tencent.com`），请求头 Origin / X-Domain 跟随账号所属域。
+- **当前限制**：成长中心（派猫猫旅行）仅国内版；国际版暂不支持会话复制；Token 统计在国际版数据目录缺失 `projects/` 时显示为空。
+- **CodeBuddy 国际版 IDE**：国际 Tab 把 WorkBuddy AI 账号注入 `CodeBuddy.app`（`planning-genie.new.accessToken`）。token 域是 `workbuddy.ai`，与官方 `codebuddy.ai` 可能不一致；失败会报错。
+- **CodeBuddy CLI**：国内/国际是同一套 CLI。切国际账号时写入 `CODEBUDDY_INTERNET_ENVIRONMENT=public`（官网 IAM 国际版取值），`CODEBUDDY_BASE_URL=https://www.codebuddy.ai/v2`（OpenAI 兼容接口；写成门户根地址 `https://www.codebuddy.ai` 会 POST `/chat/completions` 到官网 nginx，返回 405），并覆盖 `~/.codebuddy/local_storage` 里 CLI 自己缓存的 `internal` / `copilot.tencent.com`（只改 settings 不够，CLI 启动会把这份缓存灌进进程环境）。切国内则写回 `internal` 并删除 `CODEBUDDY_BASE_URL`。账号页切 CLI 会二次确认；跨国内/国际时确认后自动关闭正在运行的 CLI（不含 IDE），请随后重新打开。自动轮换不关进程。
+- 国际版账号签到由官方开放状态决定，未开放时标记为「未开放签到」，不计为失败。
+
+> 说明：国际版链路基于接口与客户端布局实现，尚未在真实国际版客户端上做端到端切换验证；遇到问题请附上版本与日志反馈。
+
 ## 使用
 
 1. **添加账号**：账号页 →「扫码登录」（OAuth device flow）或「从本机导入」「手动添加」
@@ -81,7 +95,7 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 5. **查看积分统计**：侧栏进入「积分统计」，查看总览、近 30 天趋势、模型分类、账号消耗与请求明细；筛选账号或时间范围不会重复请求官方接口，点击「刷新统计」才会重新采集
 6. **查看 Token 统计**：侧栏进入「Token 统计」，选择 WorkBuddy、CodeBuddy CLI 或 CodeBuddy IDE，查看输入、输出、缓存读写和调用次数。图表使用 K/M/B 单位，趋势图将每日 Token 总量与构成、调用次数合并展示；项目、模型和会话排行默认显示 Top 10，不足 10 项时按实际数量展示。
 7. **CodeBuddy CN IDE**：账号卡片可一键切换国内版桌面客户端（www.codebuddy.cn）。切换会关闭并重启 CodeBuddy CN，把所选账号写入本机 `~/Library/Application Support/CodeBuddy CN` 的登录态；首次使用前请先手动打开并登录一次以生成 Keychain Safe Storage。与下方 CLI 切换相互独立。
-8. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy」只更新后续加载会话使用的默认账号，当前运行会话不会切换；请由 ACP 重新加载会话，或重启 CodeBuddy CLI 后生效。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
+8. **CodeBuddy CLI**：账号页可一键接入/更新认证。macOS/Linux 使用 `apiKeyHelper`，Windows 使用 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_AUTH_TOKEN`（保留其他配置，不依赖 `.cmd` 跳板）。「切换 CodeBuddy CLI」会先二次确认。同档位只更新后续会话的默认账号；跨国内/国际会在确认后关闭正在运行的 CLI（不含 IDE），请重新打开后再发会话。普通 CLI 在同一进程中执行 `/resume` 不保证重新读取认证配置。
 9. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）；正在运行的当前会话不会被自动切换。Windows 会同步最新 Token 到 settings，但仍需重新加载会话或重启 CLI。
 10. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
 

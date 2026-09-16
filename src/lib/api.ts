@@ -28,6 +28,7 @@ import type {
   TravelConfig,
   TravelStatus,
   UpdateInfo,
+  WbVariant,
 } from "./types";
 import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled } from "./demo-mode";
 import { screenshotDemoResponse } from "./screenshot-demo";
@@ -40,7 +41,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -83,6 +84,9 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
+  switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
+  detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
@@ -117,6 +121,14 @@ const ROUTES: Record<string, Route> = {
   check_update: { method: "GET", path: "/api/update/check" },
   switch_progress: { method: "GET", path: "/api/switch/progress" },
 };
+
+/**
+ * 档位参数只在国际版时下发：缺省（国内版）保持改造前的请求体逐字一致，
+ * Tauri 走 `invoke(cmd, undefined)`，HTTP 走无 query 的路径。
+ */
+function variantArgs(variant?: WbVariant): Record<string, unknown> | undefined {
+  return variant === "ai" ? { variant } : undefined;
+}
 
 function queryString(args?: Record<string, unknown>): string {
   if (!args) return "";
@@ -169,10 +181,12 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 // 状态 / 账号
 // ---------------------------------------------------------------------------
 
-export function getStatus(): Promise<AppStatus> {
-  return call("get_status");
+/** 运行状态 / 当前账号 / 应用路径；`variant` 缺省为国内版。 */
+export function getStatus(variant?: WbVariant): Promise<AppStatus> {
+  return call("get_status", variantArgs(variant));
 }
 
+/** 返回全部档位的账号，由调用方按 `variant` 过滤。 */
 export function getAccounts(): Promise<{ accounts: AccountMeta[] }> {
   return call("get_accounts");
 }
@@ -185,19 +199,27 @@ export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> 
   return call("install_codebuddy_cli_helper");
 }
 
-export function switchCodebuddyCliAccount(accountId: string): Promise<CodeBuddyCliSwitchResult> {
+export function switchCodebuddyCliAccount(
+  accountId: string,
+  closeRunningCli = false,
+): Promise<CodeBuddyCliSwitchResult> {
   if (demoModeEnabled) {
     return new Promise((resolve, reject) => {
       window.setTimeout(() => {
         try {
-          resolve(screenshotDemoResponse("switch_codebuddy_cli_account", { accountId }) as CodeBuddyCliSwitchResult);
+          resolve(
+            screenshotDemoResponse("switch_codebuddy_cli_account", {
+              accountId,
+              closeRunningCli,
+            }) as CodeBuddyCliSwitchResult,
+          );
         } catch (error) {
           reject(error);
         }
       }, 1200);
     });
   }
-  return call("switch_codebuddy_cli_account", { accountId });
+  return call("switch_codebuddy_cli_account", { accountId, closeRunningCli });
 }
 
 export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
@@ -221,21 +243,44 @@ export function detectCodebuddyCnIdeAccount(): Promise<{
   return call("detect_codebuddy_cn_ide_account");
 }
 
+export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
+  return call("get_codebuddy_ide_status");
+}
+
+export function switchCodebuddyIdeAccount(
+  accountId: string,
+  restart = true,
+): Promise<CodeBuddyCnIdeSwitchResult> {
+  return call("switch_codebuddy_ide_account", { accountId, restart });
+}
+
+export function detectCodebuddyIdeAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_codebuddy_ide_account");
+}
+
 
 export function deleteAccount(accountId: string): Promise<{ ok: boolean }> {
   return call("delete_account", { accountId });
 }
 
-export function oauthStart(): Promise<OAuthStartResult> {
-  return call("oauth_start");
+/** 发起登录：国内版为扫码授权，国际版为浏览器 Web 登录授权；`variant` 缺省为国内版（档位由后端记忆，轮询无需再传）。 */
+export function oauthStart(variant?: WbVariant): Promise<OAuthStartResult> {
+  return call("oauth_start", variantArgs(variant));
 }
 
 export function oauthStatus(loginId: string): Promise<OAuthPollResult> {
   return call("oauth_status", { loginId });
 }
 
-export function importLocal(): Promise<{ ok: boolean; account: AccountMeta }> {
-  return call("import_local");
+/** 导入本机当前登录态；`variant` 缺省为国内版（对应各自的登录态文件）。 */
+export function importLocal(variant?: WbVariant): Promise<{ ok: boolean; account: AccountMeta }> {
+  return call("import_local", variantArgs(variant));
 }
 
 export function exportAccounts(accountIds: string[]): Promise<{ ok: boolean; accounts: AccountRecord[] }> {
@@ -274,11 +319,12 @@ export function switchProgress(): Promise<{ running: boolean; progress: string |
   return call("switch_progress");
 }
 
-export function listSessions(): Promise<{
+/** 当前登录态的会话列表；`variant` 缺省为国内版。 */
+export function listSessions(variant?: WbVariant): Promise<{
   sessions: Session[];
   current: string | null;
 }> {
-  return call("list_sessions");
+  return call("list_sessions", variantArgs(variant));
 }
 
 export function copySessions(
@@ -297,8 +343,8 @@ export function openPermissionSettings(
   return call("open_permission_settings", { target: target ?? "app_management" });
 }
 
-/** 权限自检：桌面端写探针；webui 模式由服务进程权限决定。 */
-export function checkAuthPermission(): Promise<{
+/** 权限自检：桌面端写探针（按档位写在对应登录态文件旁）；webui 模式由服务进程权限决定。 */
+export function checkAuthPermission(variant?: WbVariant): Promise<{
   ok: boolean;
   message?: string;
   error?: string;
@@ -313,7 +359,7 @@ export function checkAuthPermission(): Promise<{
       hint: "",
     });
   }
-  return call("check_auth_permission");
+  return call("check_auth_permission", variantArgs(variant));
 }
 
 /** 在 Finder 中显示当前 App（桌面端专用；webui 无操作）。 */
@@ -332,6 +378,8 @@ export async function getCheckinStatus(accountId: string): Promise<{
   todayCheckedIn: boolean;
   error?: string;
   raw?: unknown;
+  /** 该行所属档位（档位取账号自身）；缺省按国内版处理。 */
+  variant?: WbVariant;
 }> {
   if (demoModeEnabled) {
     return screenshotDemoResponse("get_checkin_status", { accountId }) as {
@@ -351,11 +399,18 @@ export async function getCheckinStatus(accountId: string): Promise<{
         todayCheckedIn: boolean;
         error?: string;
         raw?: unknown;
+        variant?: WbVariant;
       }[];
     }>("get_checkin_status");
     const one = all.accounts.find((a) => a.accountId === accountId);
     return one
-      ? { ok: one.ok, todayCheckedIn: one.todayCheckedIn, error: one.error, raw: one.raw }
+      ? {
+          ok: one.ok,
+          todayCheckedIn: one.todayCheckedIn,
+          error: one.error,
+          raw: one.raw,
+          variant: one.variant,
+        }
       : { ok: false, todayCheckedIn: false, error: "未找到账号" };
   }
   return call("get_checkin_status", { accountId });
@@ -375,12 +430,19 @@ export function checkin(accountId: string): Promise<CheckinResult> {
   return call("checkin", { accountId });
 }
 
-export function checkinAll(): Promise<{
-  accounts: { accountId: string; email: string; result: string; error?: string }[];
+/**
+ * 批量签到：不传档位时覆盖全部档位；显式传入时只处理该档位。
+ *
+ * 这里**不能**用 `variantArgs`：`checkin_all` 的缺省语义是「全部档位」，国内版若
+ * 缺省不传参，账号页在国内版 Tab 触发的批量签到会打到国际版账号。显式下发 `cn`
+ * 与改造前等价（改造前账号库里只有国内版账号）。
+ */
+export function checkinAll(variant?: WbVariant): Promise<{
+  accounts: { accountId: string; email: string; result: string; error?: string; inactive?: boolean }[];
   status?: string;
   reason?: string;
 }> {
-  return call("checkin_all");
+  return call("checkin_all", variant ? { variant } : undefined);
 }
 
 export function getAutoCheckinConfig(): Promise<CheckinConfig> {

@@ -1,8 +1,9 @@
 //! CodeBuddy CLI 账号自动轮换（防积分过期浪费）。
 //!
 //! 后台周期检查所有账号的积分到期情况，把 CodeBuddy CLI 切到"最紧迫"的账号
-//! （最早到期且仍有剩余积分），防止积分过期浪费。只写 `~/.codebuddy-rotate/state.json`
-//! （复用 codebuddy_cli::set_active_account），不影响 WorkBuddy App。
+//! （最早到期且仍有剩余积分），防止积分过期浪费。国内/国际是同一套 CLI，
+//! 候选不按档位过滤；切号时由 `set_active_account` 同步区域环境变量。
+//! 只写 `~/.codebuddy-rotate/state.json`，不影响 WorkBuddy App。
 //!
 //! 防抖动约束（核心）：
 //! - 冷却期：切换后 cooldown_minutes 内不重复切；
@@ -18,6 +19,7 @@ use crate::modules::config::{
     add_rotate_log, load_auto_rotate_config, load_rotate_logs, now_ms, RunFlagGuard,
 };
 use crate::modules::credits;
+use crate::modules::variant::WbVariant;
 
 static ROTATE_RUNNING: AtomicBool = AtomicBool::new(false);
 static LAST_CHECK_AT: AtomicI64 = AtomicI64::new(0);
@@ -78,6 +80,16 @@ fn to_candidate(account: &Value, credit: &Value) -> Candidate {
 
 fn account_display_name_or(account: &Value) -> String {
     account::account_display_name(account)
+}
+
+/// 测试辅助：按档位切分账号。生产轮换不再过滤，因为同一套 CLI 跨档位共用。
+#[cfg(test)]
+fn candidates_for_variant(accounts: &[Value], variant: WbVariant) -> Vec<Value> {
+    accounts
+        .iter()
+        .filter(|account| WbVariant::from_account(account) == variant)
+        .cloned()
+        .collect()
 }
 
 /// 决策结果。
@@ -240,7 +252,7 @@ pub async fn run_rotate_cycle() -> Value {
         .unwrap_or(0.0)
         .max(0.0);
 
-    // 拉取所有账号积分
+    // 同一套 CLI：国内/国际账号一起参与轮换，切号时带上对应区域环境。
     let accounts = account::load_accounts();
     let mut candidates: Vec<Candidate> = Vec::with_capacity(accounts.len());
     for acc in &accounts {
@@ -300,7 +312,23 @@ pub async fn run_rotate_cycle() -> Value {
             json!({"status": "skipped", "reason": reason})
         }
         Decision::Switch(target_id) => {
-            log["to"] = json!({"id": target_id, "name": candidates.iter().find(|c| c.account_id == target_id).map(|c| c.display_name.clone()).unwrap_or_default()});
+            let target_name = candidates
+                .iter()
+                .find(|c| c.account_id == target_id)
+                .map(|c| c.display_name.clone())
+                .unwrap_or_default();
+            let target_variant = accounts
+                .iter()
+                .find(|account| {
+                    account.get("id").and_then(Value::as_str) == Some(target_id.as_str())
+                })
+                .map(WbVariant::from_account)
+                .unwrap_or(WbVariant::Cn);
+            log["to"] = json!({
+                "id": target_id,
+                "name": target_name,
+                "variant": target_variant.as_str(),
+            });
             match codebuddy_cli::set_active_account(&target_id) {
                 Ok(res) => {
                     LAST_SWITCH_AT.store(now, Ordering::SeqCst);
@@ -364,6 +392,28 @@ mod tests {
     /// 默认参数调用：无冷却、无活跃会话、无价值过滤。
     fn dt(candidates: &[Candidate], current: Option<&str>) -> Decision {
         decide_target(candidates, current, None, 0, GAP, URG, None, GUARD, 0.0)
+    }
+
+    /// 同一套 CLI：候选辅助仍可按档位切分，但轮换主路径不再只用国内账号。
+    #[test]
+    fn rotation_candidates_can_be_split_or_combined_by_variant() {
+        let accounts = vec![
+            json!({"id": "cn-1", "uid": "u-1"}),
+            json!({"id": "ai-1", "uid": "u-2", "variant": "ai"}),
+            json!({"id": "ai-2", "uid": "u-3", "domain": "www.workbuddy.ai"}),
+        ];
+
+        let cn = candidates_for_variant(&accounts, WbVariant::Cn);
+        assert_eq!(cn.len(), 1);
+        assert_eq!(cn[0]["id"], "cn-1");
+
+        let ai = candidates_for_variant(&accounts, WbVariant::Ai);
+        assert_eq!(ai.len(), 2);
+        assert_eq!(accounts.len(), 3);
+        assert!(ai
+            .iter()
+            .all(|a| a["variant"] == "ai" || a["domain"] == "www.workbuddy.ai"));
+        assert!(ai.iter().all(|a| a["id"] != "cn-1"));
     }
 
     #[test]

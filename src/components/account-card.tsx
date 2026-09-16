@@ -1,5 +1,5 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ArrowRight, CalendarCheck2, CalendarDays, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
+import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 
@@ -88,6 +89,33 @@ function accountIdentity(account: AccountMeta): string {
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
 
+/**
+ * 纯图标状态 chip：状态由图标 + 色调 + tooltip 共同表达，不再占文案宽度。
+ * 签到与旅行共用这一份实现（角标样式、`aria-label`、tooltip 位置统一）。
+ */
+function statusIconChip({
+  icon,
+  label,
+  tooltip,
+  variant,
+}: {
+  icon: ReactNode;
+  label: string;
+  tooltip: string;
+  variant: "secondary" | "success";
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
+          {icon}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top">{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function travelIconChip({
   label,
   tooltip,
@@ -97,16 +125,7 @@ function travelIconChip({
   tooltip: string;
   variant: "secondary" | "success";
 }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
-          <PlaneTakeoff className="size-3.5" />
-        </Badge>
-      </TooltipTrigger>
-      <TooltipContent side="top">{tooltip}</TooltipContent>
-    </Tooltip>
-  );
+  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant });
 }
 
 function formatTravelRemaining(arriveAt: number | null | undefined): string | null {
@@ -219,6 +238,51 @@ function ProductCurrentState({ product, compact = false }: { product: "workbuddy
   );
 }
 
+/** 单行积分。`resource` 缺省时渲染为**占位行**，把列表撑满固定槽位数（2 个）：
+ *  结构与真实行完全相同，因此与真实行等高，**不使用任何写死的高度值**。
+ *  - 传 `placeholderLabel`：图标 + 文案贴列表左缘（与真实行的徽标同起点），其余列不可见；
+ *  - 不传：整行纯占位（"一条积分都没有"时用它，避免与空态文案重复）。 */
+function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?: CreditResource; compact: boolean; placeholderLabel?: string }) {
+  const placeholder = !resource;
+
+  if (placeholder && placeholderLabel) {
+    return (
+      <div className="min-w-0">
+        <div className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3", compact ? "text-[11px]" : "text-xs")}>
+          {/* 放在第一列：与真实行的徽标同起点，即贴列表左缘 */}
+          <span className={cn("flex items-center gap-1.5 text-muted-foreground", compact ? "py-0.5" : "py-1")}>
+            <PackageOpen className="size-3.5 shrink-0" aria-hidden="true" />
+            {placeholderLabel}
+          </span>
+          <span className="invisible truncate">{"\u00a0"}</span>
+          <span className="invisible">{"\u00a0"}</span>
+        </div>
+        {/* 与真实行的进度条等高，但不画轨道 —— 占位不该看起来像"剩余为 0" */}
+        <div className={cn("h-1", compact ? "mt-1" : "mt-1.5")} aria-hidden="true" />
+      </div>
+    );
+  }
+
+  const name = resource ? creditResourceName(resource, "积分包") : "\u00a0";
+  const remainingText = resource ? `${formatCredits(resource.remaining)} 积分` : "\u00a0";
+  const expiryText = resource ? formatCreditExpiry(resource.expireAt) : "\u00a0";
+  const ratio = resource && resource.total > 0 ? Math.min(100, Math.max(0, (resource.remaining / resource.total) * 100)) : 0;
+  const barTone = resource && (resource.expiringSoon || resource.expired) ? "bg-orange-500" : "bg-primary";
+  const title = resource ? `${name} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${expiryText}` : undefined;
+  return (
+    <div className={cn("min-w-0", placeholder && "invisible")} aria-hidden={placeholder || undefined} title={title}>
+      <div className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3", compact ? "text-[11px]" : "text-xs")}>
+        <span className={cn("rounded-lg bg-muted/80 font-medium tabular-nums text-foreground", compact ? "px-1.5 py-0.5" : "px-2 py-1")}>{remainingText}</span>
+        <span className="truncate text-muted-foreground">{name}</span>
+        <span className={cn("whitespace-nowrap tabular-nums", resource && expiryClass(resource.expired, resource.expiringSoon))}>{expiryText}</span>
+      </div>
+      <div className={cn("h-1 overflow-hidden rounded-full bg-muted", compact ? "mt-1" : "mt-1.5")} aria-hidden="true">
+        <div className={cn("h-full rounded-full", barTone)} style={{ width: `${ratio}%` }} />
+      </div>
+    </div>
+  );
+}
+
 export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const name = account.nickname || account.uid || "未命名账号";
@@ -242,9 +306,17 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
   const statusChips = (
     <>
-      {todayCheckedIn !== undefined && (
-        <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
-      )}
+      {todayCheckedIn !== undefined &&
+        statusIconChip({
+          icon: todayCheckedIn ? (
+            <CalendarCheck2 className="size-3.5" />
+          ) : (
+            <CalendarDays className="size-3.5" />
+          ),
+          label: todayCheckedIn ? "今日已签到" : "今日未签到",
+          tooltip: todayCheckedIn ? "今日已签到" : "今日未签到",
+          variant: todayCheckedIn ? "success" : "secondary",
+        })}
       {travelChip(travelStatus)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
       {creditPriority && (
@@ -268,7 +340,11 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         className={cn(
           "relative flex items-center border-b border-border",
           compact ? "min-h-[52px] px-3.5 py-1.5" : "min-h-[104px] px-5 py-3",
-          workbuddyActive ? "bg-primary/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
+          /* 选中态染色，优先级：WorkBuddy（品牌绿）> CodeBuddy IDE（淡紫）> CodeBuddy CLI（中性灰）> 默认。
+             多个产品同时选中时取优先级最高者；具体哪几个产品在使用由 header 的标记+勾选角标表达。
+             CodeBuddy IDE 的紫是产品专属色：主题里没有对应语义 token，故用 Tailwind 的 violet-500
+             （本文件 AVATAR_TONES 已在用同一调色板），透明度与 WorkBuddy 的 /5、/15 保持同一强度。 */
+          workbuddyActive ? "bg-primary/5" : codebuddyCnIdeActive ? "bg-violet-500/5" : codebuddyCliActive ? "bg-muted/60" : "bg-muted/30",
         )}
       >
         <div className="pointer-events-none absolute inset-0 overflow-hidden">
@@ -276,7 +352,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
             className={cn(
               "absolute -right-10 -top-16 rounded-full blur-2xl",
               compact ? "size-20" : "size-24",
-              workbuddyActive ? "bg-primary/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
+              workbuddyActive ? "bg-primary/15" : codebuddyCnIdeActive ? "bg-violet-500/15" : codebuddyCliActive ? "bg-muted/50" : "bg-muted/30",
             )}
           />
           {workbuddyActive && (
@@ -287,6 +363,14 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           {codebuddyCliActive && (
             <div className={cn("absolute top-[63%] -translate-y-1/2 opacity-[0.065] saturate-50 grayscale-[18%]", workbuddyActive ? "right-1 -rotate-[8deg]" : "right-5 -rotate-[7deg]")}>
               <CodeBuddyMark size={compact ? 38 : 54} />
+            </div>
+          )}
+          {codebuddyCnIdeActive && (
+            /* 复用 WorkBuddy 的 SVG：两个产品的标记同形；CodeBuddyCnIdeMark 是位图 app 图标，
+               放大到水印尺寸会是一块模糊方块。位置与旋转与 WorkBuddy 水印相同 —— 两者同时选中时
+               完全重合，因此无需再引入第三套偏移规则。 */
+            <div className={cn("absolute top-[64%] -translate-y-1/2 opacity-[0.075] saturate-50 grayscale-[10%]", codebuddyCliActive ? "right-[68px] rotate-[8deg]" : "right-5 rotate-[7deg]")}>
+              <WorkBuddyMark size={compact ? 40 : 56} />
             </div>
           )}
         </div>
@@ -414,7 +498,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
         )}
       </header>
 
-      <section className={cn("flex min-w-0 flex-1 flex-col", compact ? "px-3.5 pb-3 pt-3" : "px-5 pb-4 pt-4")}>
+      {/* 下内边距比上内边距大一档（紧凑 16 vs 12、宽松 20 vs 16）：顶部那条是卡内部分隔线，
+          底部是卡片外缘 —— 同值留白在边缘处看起来更紧，需要补偿才与顶部视觉一致。 */}
+      <section className={cn("flex min-w-0 flex-1 flex-col", compact ? "px-3.5 pb-4 pt-3" : "px-5 pb-5 pt-4")}>
         {creditLoading ? (
           <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />积分查询中…</div>
         ) : !credit ? (
@@ -438,32 +524,38 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
               </div>
             </div>
 
-            <div className={cn("text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>近期到期</div>
-            <div className={cn(compact ? "mt-1.5 space-y-2" : "mt-2 space-y-2.5")}>
-              {visibleResources.length > 0 ? visibleResources.map((resource, index) => {
-                const resourceName = resource.packageName || resource.packageCode || "积分包";
-                const ratio = resource.total > 0 ? Math.min(100, Math.max(0, (resource.remaining / resource.total) * 100)) : 0;
-                return (
-                  <div key={`${resource.packageCode ?? "resource"}-${resource.expireAt ?? "none"}-${index}`} className="min-w-0" title={`${resourceName} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${formatCreditExpiry(resource.expireAt)}`}>
-                    <div className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3", compact ? "text-[11px]" : "text-xs")}>
-                      <span className={cn("rounded-lg bg-muted/80 font-medium tabular-nums text-foreground", compact ? "px-1.5 py-0.5" : "px-2 py-1")}>{formatCredits(resource.remaining)} 积分</span>
-                      <span className="truncate text-muted-foreground">{resourceName}</span>
-                      <span className={cn("whitespace-nowrap tabular-nums", expiryClass(resource.expired, resource.expiringSoon))}>{formatCreditExpiry(resource.expireAt)}</span>
-                    </div>
-                    <div className={cn("h-1 overflow-hidden rounded-full bg-muted", compact ? "mt-1" : "mt-1.5")} aria-hidden="true">
-                      <div className={cn("h-full rounded-full", resource.expiringSoon || resource.expired ? "bg-orange-500" : "bg-primary")} style={{ width: `${ratio}%` }} />
-                    </div>
-                  </div>
-                );
-              }) : <div className="py-1 text-[11px] text-muted-foreground">暂无可用积分</div>}
+            <div className={cn("flex items-center justify-between gap-2", compact ? "mt-3" : "mt-4")}>
+              <span className="text-[11px] font-medium text-muted-foreground">近期到期</span>
+              {resources.length > 2 && (
+                <button
+                  type="button"
+                  className="inline-flex shrink-0 items-center gap-1 text-[11px] font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                  onClick={() => setResourcesOpen(true)}
+                >
+                  查看全部积分包
+                  <ArrowRight className="size-3.5" />
+                </button>
+              )}
             </div>
-
-            {resources.length > 2 && (
-              <button type="button" className={cn("inline-flex w-fit items-center gap-1.5 font-medium text-primary transition-colors hover:text-primary/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30", compact ? "mt-2 text-[11px]" : "mt-3 text-xs")} onClick={() => setResourcesOpen(true)}>
-                查看全部积分包
-                <ArrowRight className="size-3.5" />
-              </button>
-            )}
+            {/* 上下间距统一：列表上方与内容区底部 padding 同值（紧凑 12px / 宽松 16px）。
+                否则「标签→首条」比「末条→卡片底」窄，垂直节奏不对称。 */}
+            <div className={cn(compact ? "mt-3 space-y-2" : "mt-4 space-y-2.5")}>
+              {[0, 1].map((index) => {
+                const resource = visibleResources[index];
+                // 一条积分都没有时，第一槽位显示空态提示，第二槽位仍是纯占位（不再重复"暂无其他积分包"）
+                if (!resource && index === 0 && visibleResources.length === 0) {
+                  return <div key="credit-empty" className="py-1 text-[11px] text-muted-foreground">暂无可用积分</div>;
+                }
+                return (
+                  <CreditResourceRow
+                    key={resource ? `${resource.packageCode ?? "resource"}-${resource.expireAt ?? "none"}-${index}` : `credit-slot-${index}`}
+                    resource={resource}
+                    compact={compact}
+                    placeholderLabel={visibleResources.length > 0 ? "暂无其他积分包" : undefined}
+                  />
+                );
+              })}
+            </div>
           </>
         )}
       </section>
@@ -526,9 +618,9 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   <div key={`${resource.packageCode || resource.packageName || "resource"}-${index}`} className="min-w-0 py-3 first:pt-0 last:pb-0">
                     <div className="flex min-w-0 items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-medium">{resource.packageName || resource.packageCode || "未命名资源包"}</div>
+                        <div className="truncate text-sm font-medium">{creditResourceName(resource, "未命名资源包")}</div>
                         <div className="mt-1 text-[11px] text-muted-foreground">
-                          {resource.expired ? "已到期" : resource.expiringSoon ? "7 天内到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
+                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
                         </div>
                       </div>
                       <div className="shrink-0 text-right text-xs">
