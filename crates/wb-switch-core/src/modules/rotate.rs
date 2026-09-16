@@ -319,7 +319,9 @@ pub async fn run_rotate_cycle() -> Value {
                 .unwrap_or_default();
             let target_variant = accounts
                 .iter()
-                .find(|account| account.get("id").and_then(Value::as_str) == Some(target_id.as_str()))
+                .find(|account| {
+                    account.get("id").and_then(Value::as_str) == Some(target_id.as_str())
+                })
                 .map(WbVariant::from_account)
                 .unwrap_or(WbVariant::Cn);
             log["to"] = json!({

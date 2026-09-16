@@ -102,8 +102,8 @@ fn ensure_region_env_compatible(variant: WbVariant) -> Result<(), String> {
     let Some(value) = process_internet_environment() else {
         return Ok(());
     };
-    let is_cn_env = value.eq_ignore_ascii_case(CN_INTERNET_ENVIRONMENT)
-        || value.eq_ignore_ascii_case("ioa");
+    let is_cn_env =
+        value.eq_ignore_ascii_case(CN_INTERNET_ENVIRONMENT) || value.eq_ignore_ascii_case("ioa");
     let is_ai_env = value.eq_ignore_ascii_case(AI_INTERNET_ENVIRONMENT)
         || value.eq_ignore_ascii_case("external");
     let conflict = match variant {
@@ -153,10 +153,7 @@ fn apply_cli_region_env(value: &mut Value, variant: WbVariant) -> Result<(), Str
 }
 
 fn cli_local_storage_dir_for_settings(settings: &Path) -> PathBuf {
-    settings
-        .parent()
-        .unwrap_or(settings)
-        .join("local_storage")
+    settings.parent().unwrap_or(settings).join("local_storage")
 }
 
 fn cli_cache_filename(key: &str) -> &'static str {
@@ -171,15 +168,16 @@ fn cli_cache_filename(key: &str) -> &'static str {
 fn write_cli_json_string_cache(path: &Path, value: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| {
-            auth_config_error("配置阶段", "无法创建 CodeBuddy CLI 缓存目录，请检查用户目录权限")
+            auth_config_error(
+                "配置阶段",
+                "无法创建 CodeBuddy CLI 缓存目录，请检查用户目录权限",
+            )
         })?;
     }
-    let content = serde_json::to_string(&json!(value)).map_err(|_| {
-        auth_config_error("配置阶段", "无法生成 CodeBuddy CLI 缓存")
-    })?;
-    atomic_write(path, &content).map_err(|_| {
-        auth_config_error("配置阶段", "无法写入 CodeBuddy CLI 缓存，请检查文件权限")
-    })
+    let content = serde_json::to_string(&json!(value))
+        .map_err(|_| auth_config_error("配置阶段", "无法生成 CodeBuddy CLI 缓存"))?;
+    atomic_write(path, &content)
+        .map_err(|_| auth_config_error("配置阶段", "无法写入 CodeBuddy CLI 缓存，请检查文件权限"))
 }
 
 fn sync_cli_runtime_cache_at(storage_dir: &Path, variant: WbVariant) -> Result<(), String> {
@@ -253,11 +251,11 @@ fn list_codebuddy_cli_pids() -> Vec<u32> {
             "cbc-prewarm".to_string(),
             "/bin/codebuddy".to_string(),
         ];
-        return process::macos_rows_by_patterns(&patterns)
+        process::macos_rows_by_patterns(&patterns)
             .into_iter()
             .filter(|(pid, args)| *pid != self_pid && is_codebuddy_cli_process_args(args))
             .map(|(pid, _)| pid)
-            .collect();
+            .collect()
     }
     #[cfg(target_os = "windows")]
     {
@@ -375,11 +373,7 @@ fn close_running_codebuddy_cli() -> (bool, usize) {
     (true, pids.len())
 }
 
-fn region_switch_message(
-    variant: WbVariant,
-    closed: bool,
-    closed_count: usize,
-) -> String {
+fn region_switch_message(variant: WbVariant, closed: bool, closed_count: usize) -> String {
     let region = if variant == WbVariant::Ai {
         "国际版"
     } else {
@@ -401,9 +395,8 @@ fn write_settings_env_token(value: &mut Value, token: &str) -> Result<(), String
 }
 
 fn persist_settings_at(settings: &Path, value: &Value) -> Result<(), String> {
-    let content = serde_json::to_string_pretty(value).map_err(|_| {
-        auth_config_error("配置阶段", "无法生成 CodeBuddy settings.json")
-    })?;
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|_| auth_config_error("配置阶段", "无法生成 CodeBuddy settings.json"))?;
     if let Some(parent) = settings.parent() {
         std::fs::create_dir_all(parent).map_err(|_| {
             auth_config_error(
@@ -412,7 +405,7 @@ fn persist_settings_at(settings: &Path, value: &Value) -> Result<(), String> {
             )
         })?;
     }
-    atomic_write(&settings, &content).map_err(|_| {
+    atomic_write(settings, &content).map_err(|_| {
         auth_config_error(
             "配置阶段",
             "无法写入 CodeBuddy settings.json，请检查文件权限",
@@ -462,9 +455,8 @@ fn persist_cli_region_env(variant: WbVariant) -> Result<(), String> {
         .map_err(|_| "CodeBuddy settings.json 不是有效 JSON")?
         .unwrap_or_else(|| json!({}));
     apply_cli_region_env(&mut value, variant)?;
-    persist_settings_at(&settings, &value).map_err(|error| {
+    persist_settings_at(&settings, &value).inspect_err(|_| {
         restore_file(&settings, previous.as_deref());
-        error
     })?;
     if let Err(error) = sync_cli_runtime_cache(&settings, variant) {
         restore_file(&settings, previous.as_deref());
@@ -546,15 +538,8 @@ fn helper_migration_required() -> bool {
 }
 
 fn is_legacy_helper_path(path: &Path, directory: &Path, windows: bool) -> bool {
-    same_path(
-        path,
-        &directory.join(LEGACY_WINDOWS_HELPER_FILE),
-        windows,
-    ) || same_path(
-        path,
-        &directory.join(LEGACY_HELPER_FILE),
-        windows,
-    )
+    same_path(path, &directory.join(LEGACY_WINDOWS_HELPER_FILE), windows)
+        || same_path(path, &directory.join(LEGACY_HELPER_FILE), windows)
 }
 
 fn helper_is_current() -> bool {
@@ -685,9 +670,7 @@ fn helper_validation_error(stage: &str, cause: &str) -> String {
     let hint = "请确认 Git Bash 和 Node.js 可用，然后重试；如仍失败，请查看 CodeBuddy CLI 日志";
     #[cfg(not(windows))]
     let hint = "请确认 Node.js 可用，然后重试；如仍失败，请查看 CodeBuddy CLI 日志";
-    format!(
-        "CodeBuddy CLI helper 验证失败（{stage}）：{cause}。{hint}"
-    )
+    format!("CodeBuddy CLI helper 验证失败（{stage}）：{cause}。{hint}")
 }
 
 fn auth_config_error(stage: &str, cause: &str) -> String {
@@ -720,10 +703,7 @@ fn validate_helper_result(
     }
     let stdout = String::from_utf8_lossy(stdout);
     if stdout.trim().is_empty() {
-        return Err(helper_validation_error(
-            "输出阶段",
-            "helper 未返回认证结果",
-        ));
+        return Err(helper_validation_error("输出阶段", "helper 未返回认证结果"));
     }
     if stdout.trim() != format!("Bearer {expected_token}") {
         return Err(helper_validation_error(
@@ -736,11 +716,14 @@ fn validate_helper_result(
 
 #[cfg(any(target_os = "macos", test))]
 fn node_path_from_shell_output(stdout: &[u8]) -> Option<PathBuf> {
-    String::from_utf8_lossy(stdout).lines().rev().find_map(|line| {
-        let path = PathBuf::from(line.trim());
-        (path.is_absolute() && path.file_name().is_some_and(|name| name == "node"))
-            .then_some(path)
-    })
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let path = PathBuf::from(line.trim());
+            (path.is_absolute() && path.file_name().is_some_and(|name| name == "node"))
+                .then_some(path)
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -826,7 +809,7 @@ fn run_helper_command(command: &str) -> Result<Output, String> {
         }
         Err(helper_validation_error(
             "启动阶段",
-        "未找到 Git Bash bash.exe",
+            "未找到 Git Bash bash.exe",
         ))
     }
     #[cfg(target_os = "macos")]
@@ -864,10 +847,12 @@ fn account_token(account: &Value) -> Result<&str, String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| auth_config_error(
-            "账号阶段",
-            "所选账号没有可用的认证信息，请先重新登录或刷新 Token",
-        ))
+        .ok_or_else(|| {
+            auth_config_error(
+                "账号阶段",
+                "所选账号没有可用的认证信息，请先重新登录或刷新 Token",
+            )
+        })
 }
 
 fn settings_account_token(account: &Value) -> Result<&str, String> {
@@ -1055,9 +1040,7 @@ fn install_env_auth() -> Result<Value, String> {
     let active = state_account_index(&state, &accounts)
         .and_then(|(index, _)| accounts.get(index))
         .or_else(|| accounts.first())
-        .ok_or_else(|| {
-            auth_config_error("账号阶段", "当前没有可供 CodeBuddy CLI 使用的账号")
-        })?;
+        .ok_or_else(|| auth_config_error("账号阶段", "当前没有可供 CodeBuddy CLI 使用的账号"))?;
     ensure_region_env_compatible(WbVariant::from_account(active))?;
     let token = settings_account_token(active)?;
     let (previous_settings, settings_value) =
@@ -1122,9 +1105,8 @@ pub fn install_helper() -> Result<Value, String> {
         helper_validation_error("安装阶段", "无法创建 helper 目录，请检查用户目录权限")
     })?;
     // 各平台都直接配置这份 helper.cjs。
-    atomic_write(&logic_target, STANDARD_HELPER).map_err(|_| {
-        helper_validation_error("安装阶段", "无法写入 helper.cjs，请检查文件权限")
-    })?;
+    atomic_write(&logic_target, STANDARD_HELPER)
+        .map_err(|_| helper_validation_error("安装阶段", "无法写入 helper.cjs，请检查文件权限"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1178,15 +1160,12 @@ pub fn install_helper() -> Result<Value, String> {
 
     let accounts = account::load_accounts();
     let state = load_state();
-    let active_account = state_account_index(&state, &accounts)
-        .and_then(|(index, _)| accounts.get(index));
+    let active_account =
+        state_account_index(&state, &accounts).and_then(|(index, _)| accounts.get(index));
     let variant = active_account.map(WbVariant::from_account);
     let validation = active_account
         .ok_or_else(|| {
-            helper_validation_error(
-                "账号阶段",
-                "当前没有可供 helper 验证的账号，请先添加账号",
-            )
+            helper_validation_error("账号阶段", "当前没有可供 helper 验证的账号，请先添加账号")
         })
         .and_then(|account| validate_helper_for_account(&configured_command, account));
     if let Err(error) = validation {
@@ -1229,18 +1208,12 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
 
 /// 账号页手动切 CLI。`close_running_cli` 为 true 且发生国内/国际跨站时，
 /// 关闭正在运行的 CLI 进程，避免旧进程把国内站缓存写回去。
-pub fn switch_active_account(
-    account_id: &str,
-    close_running_cli: bool,
-) -> Result<Value, String> {
+pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Result<Value, String> {
     if cfg!(windows) {
         ensure_no_process_env_override()?;
     }
     if !cfg!(windows) && helper_migration_required() {
-        return Err(
-            "检测到旧版 CodeBuddy CLI helper；请先在账号页升级 CLI helper"
-                .to_string(),
-        );
+        return Err("检测到旧版 CodeBuddy CLI helper；请先在账号页升级 CLI helper".to_string());
     }
     if !cfg!(windows) && !helper_is_configured() {
         return Err(
@@ -1301,9 +1274,8 @@ pub fn switch_active_account(
             return Err(error);
         }
     } else {
-        let command = helper_command().ok_or_else(|| {
-            helper_validation_error("配置阶段", "apiKeyHelper 配置为空")
-        })?;
+        let command = helper_command()
+            .ok_or_else(|| helper_validation_error("配置阶段", "apiKeyHelper 配置为空"))?;
         if let Err(error) = validate_helper_for_account(&command, &accounts[index]) {
             restore_file(&state_path(), previous_state.as_deref());
             return Err(error);
@@ -1351,7 +1323,10 @@ mod tests {
     use std::fs;
 
     fn helper_test_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("wb-switch-codebuddy-helper-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!(
+            "wb-switch-codebuddy-helper-{}",
+            uuid::Uuid::new_v4()
+        ))
     }
 
     #[test]
@@ -1446,7 +1421,10 @@ mod tests {
 
         let persisted = read_json_file(&settings).unwrap();
         assert_eq!(settings_env_token(&persisted), Some("RAW_SECRET"));
-        assert_eq!(persisted["apiKeyHelper"], "C:/Users/tester/bin/wb-helper.bat");
+        assert_eq!(
+            persisted["apiKeyHelper"],
+            "C:/Users/tester/bin/wb-helper.bat"
+        );
         assert_eq!(persisted["trustedDirectories"][0], "C:/Users/tester");
         assert_eq!(persisted["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
         assert_eq!(
@@ -1498,10 +1476,7 @@ mod tests {
             settings["env"][CODEBUDDY_INTERNET_ENVIRONMENT],
             AI_INTERNET_ENVIRONMENT
         );
-        assert_eq!(
-            settings["env"][CODEBUDDY_BASE_URL],
-            AI_CLI_OPENAI_BASE_URL
-        );
+        assert_eq!(settings["env"][CODEBUDDY_BASE_URL], AI_CLI_OPENAI_BASE_URL);
         assert_eq!(settings["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
         apply_cli_region_env(&mut settings, WbVariant::Cn).unwrap();
         assert_eq!(
@@ -1584,11 +1559,15 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
         fs::write(&settings, "not-json SECRET_ON_DISK").unwrap();
 
-        let error = prepare_settings_env_update(&settings, "NEW_SECRET", WbVariant::Cn).unwrap_err();
+        let error =
+            prepare_settings_env_update(&settings, "NEW_SECRET", WbVariant::Cn).unwrap_err();
         assert!(error.contains("不是有效 JSON"));
         assert!(!error.contains("NEW_SECRET"));
         assert!(!error.contains("SECRET_ON_DISK"));
-        assert_eq!(fs::read_to_string(&settings).unwrap(), "not-json SECRET_ON_DISK");
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            "not-json SECRET_ON_DISK"
+        );
         fs::remove_dir_all(test_dir).unwrap();
     }
 
@@ -1624,7 +1603,9 @@ mod tests {
         assert_eq!(
             select_windows_configured_path(
                 original,
-                Some(PathBuf::from(r"C:\Users\TESTUS~1\.codebuddy-rotate\helper.cjs")),
+                Some(PathBuf::from(
+                    r"C:\Users\TESTUS~1\.codebuddy-rotate\helper.cjs"
+                )),
             )
             .unwrap(),
             PathBuf::from(r"C:\Users\TESTUS~1\.codebuddy-rotate\helper.cjs")
@@ -1672,14 +1653,14 @@ mod tests {
     #[test]
     fn helper_validation_errors_never_include_stdout_or_token() {
         let secret = "SECRET_ACCESS_TOKEN";
-        let error = validate_helper_result(true, Some(0), b"Bearer OTHER_SECRET\n", secret)
-            .unwrap_err();
+        let error =
+            validate_helper_result(true, Some(0), b"Bearer OTHER_SECRET\n", secret).unwrap_err();
         assert!(error.contains("输出阶段"));
         assert!(!error.contains(secret));
         assert!(!error.contains("OTHER_SECRET"));
 
-        let error = validate_helper_result(false, Some(127), b"Bearer LEAKED\n", secret)
-            .unwrap_err();
+        let error =
+            validate_helper_result(false, Some(127), b"Bearer LEAKED\n", secret).unwrap_err();
         assert!(error.contains("退出码为 127"));
         assert!(!error.contains(secret));
         assert!(!error.contains("LEAKED"));
@@ -1690,9 +1671,7 @@ mod tests {
         let output = b"welcome to the shell\n/Users/test/.nvm/versions/node/v22/bin/node\n";
         assert_eq!(
             node_path_from_shell_output(output),
-            Some(PathBuf::from(
-                "/Users/test/.nvm/versions/node/v22/bin/node"
-            ))
+            Some(PathBuf::from("/Users/test/.nvm/versions/node/v22/bin/node"))
         );
         assert_eq!(node_path_from_shell_output(b"node\nwelcome\n"), None);
     }
@@ -1726,7 +1705,10 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "Bearer SECRET_TWO\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "Bearer SECRET_TWO\n"
+        );
 
         fs::write(
             &accounts_file,

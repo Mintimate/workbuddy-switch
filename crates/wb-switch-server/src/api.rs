@@ -17,9 +17,9 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config, credit_usage, credits,
-    export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
-    variant::WbVariant,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
+    credit_usage, credits, export_import, oauth, process, refresh, rotate, session, switch,
+    token_stats, travel, update, variant::WbVariant,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免

@@ -1182,7 +1182,10 @@ mod tests {
         assert!(codebuddy_cn_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_cn_app.json"));
-        assert_ne!(codebuddy_ide_app_cache_file(), codebuddy_cn_app_cache_file());
+        assert_ne!(
+            codebuddy_ide_app_cache_file(),
+            codebuddy_cn_app_cache_file()
+        );
         assert!(codebuddy_ide_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_ide_app.json"));

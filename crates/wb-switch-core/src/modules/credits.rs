@@ -1389,10 +1389,7 @@ mod tests {
     fn package_code_tables_include_intl_codes() {
         let paid: HashSet<&str> = PAID_PACKAGE_CODES.iter().copied().collect();
         let free: HashSet<&str> = FREE_PACKAGE_CODES.iter().copied().collect();
-        for code in [
-            "TCACA_code_003_FAnt7lcmRT",
-            "TCACA_code_036_lupO5WgNdG",
-        ] {
+        for code in ["TCACA_code_003_FAnt7lcmRT", "TCACA_code_036_lupO5WgNdG"] {
             assert!(paid.contains(code), "missing paid code {code}");
         }
         for code in [

@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::modules::account::{self, get_str};
+#[cfg(target_os = "macos")]
+use crate::modules::config::home_dir;
 use crate::modules::config::{
     atomic_write, clear_codebuddy_cn_app_cache, load_codebuddy_cn_app_cache, now_ms,
     save_codebuddy_cn_app_cache, store_dir,
 };
-#[cfg(target_os = "macos")]
-use crate::modules::config::home_dir;
 // 复用 process 模块带并发管道读取的正确实现；本地轮询版会在子进程输出
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
@@ -185,7 +185,10 @@ fn parse_token_from_secret(secret: &str) -> Option<(Option<String>, String)> {
 fn match_account_for_token(uid: Option<&str>, token: &str) -> Option<Value> {
     let accounts = account::load_accounts();
     if let Some(uid) = uid.filter(|s| !s.is_empty()) {
-        if let Some(acc) = accounts.iter().find(|a| get_str(a, "uid").as_deref() == Some(uid)) {
+        if let Some(acc) = accounts
+            .iter()
+            .find(|a| get_str(a, "uid").as_deref() == Some(uid))
+        {
             return Some(acc.clone());
         }
     }
@@ -694,7 +697,11 @@ fn close_codebuddy_cn_macos(timeout_secs: i64) -> Result<(), String> {
     let resolved = macos_cn_app_path_resolved();
     let main_patterns = macos_cn_main_patterns(resolved.as_deref());
     let bundle_patterns = macos_cn_bundle_patterns(resolved.as_deref());
-    let remaining = || timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
+    let remaining = || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(100))
+    };
 
     let quit_script = format!("quit app id \"{MACOS_BUNDLE_ID}\"");
     let quit = run_cmd("osascript", &["-e", quit_script.as_str()], 10);
@@ -788,8 +795,16 @@ fn close_codebuddy_cn_linux(timeout_secs: i64) -> Result<(), String> {
     }
     Err(format!(
         "CodeBuddy CN 进程无法关闭（残留进程: {}）。请手动执行: kill -9 {}",
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     ))
 }
 
@@ -932,8 +947,8 @@ pub fn launch_codebuddy_cn() -> Result<(), String> {
 pub fn status() -> Value {
     let data_dir = codebuddy_cn_data_dir();
     let db_path = codebuddy_cn_state_db_path();
-    let installed = codebuddy_cn_app_path().is_some()
-        || data_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let installed =
+        codebuddy_cn_app_path().is_some() || data_dir.as_ref().map(|p| p.exists()).unwrap_or(false);
     let db_exists = db_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     let running = is_codebuddy_cn_running();
 
@@ -965,16 +980,16 @@ pub fn status() -> Value {
 
 /// 切换 CodeBuddy CN IDE 账号：关进程 → 注入 secret → 启动。
 pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> {
-    let acc = account::find_account(account_id)
-        .ok_or_else(|| format!("账号不存在: {account_id}"))?;
+    let acc =
+        account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     let token = get_str(&acc, "access_token")
         .ok_or_else(|| "账号缺少 access_token，无法注入 CodeBuddy CN".to_string())?;
     if token.is_empty() {
         return Err("账号 access_token 为空".to_string());
     }
 
-    let data_dir = codebuddy_cn_data_dir()
-        .ok_or_else(|| "无法定位 CodeBuddy CN 数据目录".to_string())?;
+    let data_dir =
+        codebuddy_cn_data_dir().ok_or_else(|| "无法定位 CodeBuddy CN 数据目录".to_string())?;
     if !data_dir.exists() {
         return Err(format!(
             "未找到 CodeBuddy CN 用户数据目录（{}）。请先手动打开 CodeBuddy CN 并登录一次。",
@@ -1146,20 +1161,33 @@ mod tests {
             Some("Zhou"),
             &['C'],
         );
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert!(s.iter().any(|p| p.contains("Programs") && p.contains("CodeBuddy CN.exe")));
-        assert!(s.iter().any(|p| p.contains("CodeBuddy CN") && p.contains("CodeBuddy.exe")));
-        assert!(s.iter().any(|p| p.contains("Program Files") && p.contains("CodeBuddy CN.exe")));
-        assert!(!s.iter().any(|p| {
-            p.contains("CodeBuddy.exe") && !path_contains_codebuddy_cn_dir(p)
-        }));
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Programs") && p.contains("CodeBuddy CN.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("CodeBuddy CN") && p.contains("CodeBuddy.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Program Files") && p.contains("CodeBuddy CN.exe")));
+        assert!(!s
+            .iter()
+            .any(|p| { p.contains("CodeBuddy.exe") && !path_contains_codebuddy_cn_dir(p) }));
     }
 
     #[test]
     fn linux_cmdline_matcher_accepts_cn_not_switcher() {
-        assert!(linux_cmdline_is_codebuddy_cn("/opt/codebuddy-cn/codebuddy-cn --foo"));
+        assert!(linux_cmdline_is_codebuddy_cn(
+            "/opt/codebuddy-cn/codebuddy-cn --foo"
+        ));
         assert!(linux_cmdline_is_codebuddy_cn("/usr/bin/CodeBuddy CN"));
-        assert!(linux_exe_is_codebuddy_cn(Path::new("/usr/bin/codebuddy-cn")));
+        assert!(linux_exe_is_codebuddy_cn(Path::new(
+            "/usr/bin/codebuddy-cn"
+        )));
         assert!(!linux_cmdline_is_codebuddy_cn("/usr/bin/workbuddy-switch"));
         assert!(!linux_cmdline_is_codebuddy_cn(
             "/opt/codebuddy-cn/codebuddy-cn --type=gpu-process"
@@ -1183,7 +1211,10 @@ mod tests {
             vec!["/Applications/CodeBuddy CN.app/Contents/MacOS".to_string()]
         );
         let cands = macos_cn_app_candidates(Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
@@ -1209,7 +1240,8 @@ mod tests {
         let main_pids: Vec<u32> = main_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(main_pids, vec![6001]);
 
-        let bundle_kept = process::filter_ps_rows(&stdout, &macos_cn_bundle_patterns(None), self_pid);
+        let bundle_kept =
+            process::filter_ps_rows(&stdout, &macos_cn_bundle_patterns(None), self_pid);
         let bundle_pids: Vec<u32> = bundle_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(bundle_pids, vec![6001, 6004]);
     }

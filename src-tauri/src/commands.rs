@@ -8,9 +8,9 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage, credits,
-    export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
-    variant::WbVariant,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
+    credits, export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel,
+    update, variant::WbVariant,
 };
 
 #[derive(Serialize)]

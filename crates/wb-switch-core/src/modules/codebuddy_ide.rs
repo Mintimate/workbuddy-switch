@@ -9,13 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::modules::account::{self, get_str};
+#[cfg(target_os = "macos")]
+use crate::modules::config::home_dir;
 use crate::modules::config::{
     atomic_write, clear_codebuddy_ide_app_cache, load_codebuddy_ide_app_cache, now_ms,
     save_codebuddy_ide_app_cache, store_dir,
 };
 use crate::modules::variant::WbVariant;
-#[cfg(target_os = "macos")]
-use crate::modules::config::home_dir;
 // 复用 process 模块带并发管道读取的正确实现；本地轮询版会在子进程输出
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
@@ -202,7 +202,10 @@ fn parse_token_from_secret(secret: &str) -> Option<(Option<String>, String)> {
 fn match_account_for_token(uid: Option<&str>, token: &str) -> Option<Value> {
     let accounts = account::load_accounts();
     if let Some(uid) = uid.filter(|s| !s.is_empty()) {
-        if let Some(acc) = accounts.iter().find(|a| get_str(a, "uid").as_deref() == Some(uid)) {
+        if let Some(acc) = accounts
+            .iter()
+            .find(|a| get_str(a, "uid").as_deref() == Some(uid))
+        {
             return Some(acc.clone());
         }
     }
@@ -593,7 +596,9 @@ fn linux_exe_is_codebuddy_ide(exe: &Path) -> bool {
         .unwrap_or("")
         .trim();
     let lower = name.to_ascii_lowercase();
-    if lower.contains("codebuddy-cn") || lower.contains("codebuddycn") || lower.contains("workbuddy")
+    if lower.contains("codebuddy-cn")
+        || lower.contains("codebuddycn")
+        || lower.contains("workbuddy")
     {
         return false;
     }
@@ -722,7 +727,11 @@ fn close_codebuddy_ide_macos(timeout_secs: i64) -> Result<(), String> {
     let resolved = macos_ide_app_path_resolved();
     let main_patterns = macos_ide_main_patterns(resolved.as_deref());
     let bundle_patterns = macos_ide_bundle_patterns(resolved.as_deref());
-    let remaining = || timeout.saturating_sub(started.elapsed()).max(Duration::from_millis(100));
+    let remaining = || {
+        timeout
+            .saturating_sub(started.elapsed())
+            .max(Duration::from_millis(100))
+    };
 
     let quit_script = format!("quit app id \"{MACOS_BUNDLE_ID}\"");
     let quit = run_cmd("osascript", &["-e", quit_script.as_str()], 10);
@@ -816,8 +825,16 @@ fn close_codebuddy_ide_linux(timeout_secs: i64) -> Result<(), String> {
     }
     Err(format!(
         "CodeBuddy 进程无法关闭（残留进程: {}）。请手动执行: kill -9 {}",
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "),
-        leftover.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" ")
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        leftover
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     ))
 }
 
@@ -945,7 +962,8 @@ pub fn launch_codebuddy_ide() -> Result<(), String> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let exe = codebuddy_ide_app_path().ok_or_else(|| {
-            "未找到 CodeBuddy 可执行文件（尝试路径: /usr/bin/codebuddy）。请先手动打开一次。".to_string()
+            "未找到 CodeBuddy 可执行文件（尝试路径: /usr/bin/codebuddy）。请先手动打开一次。"
+                .to_string()
         })?;
         process::cmd_builder(&exe)
             .stdout(std::process::Stdio::null())
@@ -993,8 +1011,8 @@ pub fn status() -> Value {
 
 /// 切换 CodeBuddy IDE 账号：关进程 → 注入 secret → 启动。
 pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> {
-    let acc = account::find_account(account_id)
-        .ok_or_else(|| format!("账号不存在: {account_id}"))?;
+    let acc =
+        account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     if WbVariant::from_account(&acc) != WbVariant::Ai {
         return Err("国际版 CodeBuddy IDE 只能切换国际版（WorkBuddy AI）账号".to_string());
     }
@@ -1004,8 +1022,7 @@ pub fn switch_account(account_id: &str, restart: bool) -> Result<Value, String> 
         return Err("账号 access_token 为空".to_string());
     }
 
-    let data_dir = intl_data_dir()
-        .ok_or_else(|| "无法定位 CodeBuddy 数据目录".to_string())?;
+    let data_dir = intl_data_dir().ok_or_else(|| "无法定位 CodeBuddy 数据目录".to_string())?;
     if !data_dir.exists() {
         return Err(format!(
             "未找到 CodeBuddy 用户数据目录（{}）。请先手动打开 CodeBuddy 并登录一次。",
@@ -1179,24 +1196,39 @@ mod tests {
             Some("Zhou"),
             &['C'],
         );
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert!(s.iter().any(|p| p.contains("Programs") && p.contains("CodeBuddy.exe")));
-        assert!(s.iter().any(|p| p.contains("CodeBuddy") && p.contains("CodeBuddy.exe")));
-        assert!(s.iter().any(|p| p.contains("Program Files") && p.contains("CodeBuddy.exe")));
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Programs") && p.contains("CodeBuddy.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("CodeBuddy") && p.contains("CodeBuddy.exe")));
+        assert!(s
+            .iter()
+            .any(|p| p.contains("Program Files") && p.contains("CodeBuddy.exe")));
         assert!(!s.iter().any(|p| path_contains_codebuddy_cn_dir(p)));
     }
 
     #[test]
     fn linux_cmdline_matcher_accepts_intl_not_cn_or_switcher() {
-        assert!(linux_cmdline_is_codebuddy_ide("/opt/codebuddy/codebuddy --foo"));
+        assert!(linux_cmdline_is_codebuddy_ide(
+            "/opt/codebuddy/codebuddy --foo"
+        ));
         assert!(linux_cmdline_is_codebuddy_ide("/usr/bin/CodeBuddy"));
         assert!(linux_exe_is_codebuddy_ide(Path::new("/usr/bin/codebuddy")));
         assert!(!linux_cmdline_is_codebuddy_ide("/usr/bin/workbuddy-switch"));
-        assert!(!linux_cmdline_is_codebuddy_ide("/opt/CodeBuddy CN/codebuddy-cn"));
+        assert!(!linux_cmdline_is_codebuddy_ide(
+            "/opt/CodeBuddy CN/codebuddy-cn"
+        ));
         assert!(!linux_cmdline_is_codebuddy_ide(
             "/opt/codebuddy/codebuddy --type=gpu-process"
         ));
-        assert!(!linux_exe_is_codebuddy_ide(Path::new("/usr/bin/codebuddy-cn")));
+        assert!(!linux_exe_is_codebuddy_ide(Path::new(
+            "/usr/bin/codebuddy-cn"
+        )));
     }
 
     #[cfg(target_os = "macos")]
@@ -1215,7 +1247,10 @@ mod tests {
             vec!["/Applications/CodeBuddy.app/Contents/MacOS".to_string()]
         );
         let cands = macos_ide_app_candidates(Path::new("/Users/tester"));
-        let s: Vec<String> = cands.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(
             s,
             vec![
@@ -1242,7 +1277,8 @@ mod tests {
         let main_pids: Vec<u32> = main_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(main_pids, vec![6001]);
 
-        let bundle_kept = process::filter_ps_rows(&stdout, &macos_ide_bundle_patterns(None), self_pid);
+        let bundle_kept =
+            process::filter_ps_rows(&stdout, &macos_ide_bundle_patterns(None), self_pid);
         let bundle_pids: Vec<u32> = bundle_kept.iter().map(|(pid, _)| *pid).collect();
         assert_eq!(bundle_pids, vec![6001, 6004]);
     }

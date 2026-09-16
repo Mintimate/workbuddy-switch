@@ -1073,7 +1073,6 @@ mod tests {
                 write: 0,
             })
         );
-
     }
 
     #[test]
@@ -1182,10 +1181,14 @@ mod tests {
         .expect("write original fixture");
         fs::write(
             project.join("session-forked.jsonl"),
-            format!("{}\n{}\n", record, json!({
-                "timestamp": now + 1_000,
-                "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
-            })),
+            format!(
+                "{}\n{}\n",
+                record,
+                json!({
+                    "timestamp": now + 1_000,
+                    "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
+                })
+            ),
         )
         .expect("write forked fixture");
         // Back-to-back writes can land in the same millisecond, and the
@@ -1978,7 +1981,12 @@ mod tests {
             .set_modified(std::time::SystemTime::now())
             .expect("pin second-root mtime");
 
-        let result = source_from_roots(&[projects.clone(), sessions.clone()], "workbuddy-ai", None, false);
+        let result = source_from_roots(
+            &[projects.clone(), sessions.clone()],
+            "workbuddy-ai",
+            None,
+            false,
+        );
         // 两个根都被扫到；重放记录计一次，第二个根的新记录另计一次。
         assert_eq!(result["filesScanned"], 2);
         assert_eq!(result["summary"]["records"], 2);
