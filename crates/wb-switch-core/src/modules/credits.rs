@@ -25,9 +25,16 @@ const RESOURCE_PAID_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-paid
 const RESOURCE_FREE_PACKAGES_PATH: &str = "/billing/meter/get-user-resource-free-packages";
 const PRODUCT_CODE: &str = "p_tcaca";
 const EXPIRING_SOON_DAYS: i64 = 7;
+/// DeductionEndTime 比 CycleEndTime 晚超过该天数时，视前者为长期占位
+/// （官方数据形态：如 035 的 DeductionEndTime=2049 与 CycleEndTime=当月月底并存），改用 CycleEndTime。
+const EXPIRY_CYCLE_OVERRIDE_DAYS: i64 = 365;
+/// 最终解析出的到期时间距 now 超过该天数时视为长期有效（expireAt=null），
+/// 避免 2049 这类占位值流入前端。
+const FAR_FUTURE_EXPIRY_DAYS: i64 = 730;
 
-// WorkBuddy CN UserCenter 的商品码（来自其公开套餐配置）。解析器不会依赖
-// 这些常量，因此上游新增商品时仍可通过 summary/明细返回资源。
+// 付费/免费包查询码表：国内版公开套餐配置 ∪ 官网 usercenter 国际版码集
+// ∪ 官方客户端 PAID/FREE_PACKAGE_CODES。请求体多带码对不存在的包无副作用；
+// 解析器不依赖这份清单，summary 仍可带回未列出的包（但无时间字段）。
 const PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_002_AkiJS3ZHF5",
     "TCACA_code_023_4xbGhMrE6q",
@@ -35,6 +42,8 @@ const PAID_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_027_0FCGVA6vSa",
     "TCACA_code_009_0XmEQc2xOf",
     "TCACA_code_038_OhvqZtiPKr",
+    "TCACA_code_003_FAnt7lcmRT",
+    "TCACA_code_036_lupO5WgNdG",
 ];
 const FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_008_cfWoLwvjU4",
@@ -42,6 +51,12 @@ const FREE_PACKAGE_CODES: &[&str] = &[
     "TCACA_code_028_NtpWi0jzXs",
     "TCACA_code_029_6wCGEWquYy",
     "TCACA_code_030_BjSt89qTvr",
+    "TCACA_code_001_PqouKr6QWV",
+    "TCACA_code_006_DbXS0lrypC",
+    "TCACA_code_035_ArVxJcGDsm",
+    "TCACA_code_037_WxOD3MpI2o",
+    "TCACA_code_039_KRcQj7wUat",
+    "TCACA_code_040_mi9rCYg46x",
 ];
 
 fn first_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -173,6 +188,32 @@ fn has_resource_packages(response: &Value) -> bool {
     })
 }
 
+/// 到期时间：优先 DeductionEndTime/ExpiredTime；仅当 CycleEndTime 比其早超过
+/// `EXPIRY_CYCLE_OVERRIDE_DAYS` 时改用周期结束时间（视前者为长期占位）。
+/// 最终值距 now 超过 `FAR_FUTURE_EXPIRY_DAYS` 则视为长期有效。
+fn resolve_expire_at(raw: &Value, now: i64) -> Option<i64> {
+    let deduction_end = parse_timestamp_ms(first_value(
+        raw,
+        &[
+            "DeductionEndTime",
+            "deductionEndTime",
+            "ExpiredTime",
+            "expiredTime",
+        ],
+    ));
+    let cycle_end = parse_timestamp_ms(first_value(raw, &["CycleEndTime", "cycleEndTime"]));
+    let override_ms = EXPIRY_CYCLE_OVERRIDE_DAYS * 24 * 3600 * 1000;
+    let expire_at = match (deduction_end, cycle_end) {
+        (Some(deduction), Some(cycle)) if deduction.saturating_sub(cycle) > override_ms => {
+            Some(cycle)
+        }
+        (Some(deduction), _) => Some(deduction),
+        (None, cycle) => cycle,
+    };
+    let far_future_ms = FAR_FUTURE_EXPIRY_DAYS * 24 * 3600 * 1000;
+    expire_at.filter(|value| value.saturating_sub(now) <= far_future_ms)
+}
+
 fn resource_summary(raw: &Value, now: i64) -> Value {
     let slice = first_value(raw, &["SlicePeriodUsageDetails", "slicePeriodUsageDetails"])
         .and_then(Value::as_array)
@@ -226,17 +267,7 @@ fn resource_summary(raw: &Value, now: i64) -> Value {
     let used = raw_used
         .unwrap_or_else(|| (total - remaining).max(0.0))
         .max(0.0);
-    let expire_at = parse_timestamp_ms(first_value(
-        raw,
-        &[
-            "DeductionEndTime",
-            "deductionEndTime",
-            "ExpiredTime",
-            "expiredTime",
-            "CycleEndTime",
-            "cycleEndTime",
-        ],
-    ));
+    let expire_at = resolve_expire_at(raw, now);
     let expired = expire_at.map(|value| value <= now).unwrap_or(false);
     let expiring_soon = expire_at
         .map(|value| value > now && value - now <= EXPIRING_SOON_DAYS * 24 * 3600 * 1000)
@@ -1240,5 +1271,132 @@ mod tests {
             .map(|resource| resource["remaining"].as_f64().unwrap())
             .sum();
         assert_eq!(expiring, 80.0);
+    }
+
+    #[test]
+    fn prefers_cycle_end_when_deduction_end_is_a_far_placeholder() {
+        // 035：DeductionEndTime=2049 占位，CycleEndTime=月底 → 取月底
+        let now = 1_800_000_000_000_i64;
+        let cycle_end = now + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_035_ArVxJcGDsm",
+                "CycleTotalCapacity": 100,
+                "CycleRemainCapacity": 80,
+                "DeductionEndTime": 2_049_792_688_000_i64,
+                "CycleEndTime": cycle_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(cycle_end));
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn uses_deduction_end_when_only_real_expiry_is_present() {
+        // 006：只有 DeductionEndTime=14 天后 → 取 DeductionEndTime
+        let now = 1_800_000_000_000_i64;
+        let deduction_end = now + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_006_DbXS0lrypC",
+                "CycleTotalCapacity": 250,
+                "CycleRemainCapacity": 250,
+                "DeductionEndTime": deduction_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(deduction_end));
+    }
+
+    #[test]
+    fn keeps_subscription_deduction_end_when_cycle_is_within_override_window() {
+        // 订阅型：两者相差 14 天 → 取 DeductionEndTime（回归保护）
+        let now = 1_800_000_000_000_i64;
+        let cycle_end = now + 16 * 24 * 3600 * 1000;
+        let deduction_end = cycle_end + 14 * 24 * 3600 * 1000;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_002_AkiJS3ZHF5",
+                "CycleCapacitySizePrecise": "500",
+                "CycleCapacityRemainPrecise": "400",
+                "DeductionEndTime": deduction_end,
+                "CycleEndTime": cycle_end,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(deduction_end));
+    }
+
+    #[test]
+    fn drops_far_future_placeholder_when_no_cycle_end() {
+        // 远期单值：只有 DeductionEndTime=2049 → expireAt 为 null
+        let now = 1_800_000_000_000_i64;
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "placeholder",
+                "CycleTotalCapacity": 100,
+                "CycleRemainCapacity": 100,
+                "DeductionEndTime": 2_049_792_688_000_i64,
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"], Value::Null);
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn package_code_tables_include_intl_codes() {
+        let paid: HashSet<&str> = PAID_PACKAGE_CODES.iter().copied().collect();
+        let free: HashSet<&str> = FREE_PACKAGE_CODES.iter().copied().collect();
+        for code in [
+            "TCACA_code_003_FAnt7lcmRT",
+            "TCACA_code_036_lupO5WgNdG",
+        ] {
+            assert!(paid.contains(code), "missing paid code {code}");
+        }
+        for code in [
+            "TCACA_code_001_PqouKr6QWV",
+            "TCACA_code_006_DbXS0lrypC",
+            "TCACA_code_035_ArVxJcGDsm",
+            "TCACA_code_037_WxOD3MpI2o",
+            "TCACA_code_039_KRcQj7wUat",
+            "TCACA_code_040_mi9rCYg46x",
+        ] {
+            assert!(free.contains(code), "missing free code {code}");
+        }
+    }
+
+    #[test]
+    fn parses_string_cycle_end_from_official_detail_payload() {
+        // 官方明细响应里 CycleEndTime 是 "YYYY-MM-DD HH:mm:ss" 字符串（035 的真实形态），
+        // 与 2049 的 DeductionEndTime 并存时取字符串周期时间。
+        let now = Local
+            .with_ymd_and_hms(2026, 9, 16, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        let expected_cycle_end = Local
+            .with_ymd_and_hms(2026, 9, 30, 23, 59, 59)
+            .unwrap()
+            .timestamp_millis();
+        let resource = resource_summary(
+            &json!({
+                "PackageCode": "TCACA_code_035_ArVxJcGDsm",
+                "PackageName": "Free Plan Subscription",
+                "CapacitySize": 100,
+                "CapacityRemain": 100,
+                "CycleCapacitySize": 100,
+                "CycleCapacityRemain": 100,
+                "CycleEndTime": "2026-09-30 23:59:59",
+                "DeductionEndTime": 2_049_792_688_000_i64,
+                "ExpiredTime": "",
+            }),
+            now,
+        );
+        assert_eq!(resource["expireAt"].as_i64(), Some(expected_cycle_end));
+        assert_eq!(resource["expired"], false);
+        assert_eq!(resource["expiringSoon"], false);
     }
 }
