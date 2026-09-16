@@ -416,3 +416,29 @@ export interface CodeBuddyCnIdeSwitchResult {
   message?: string;
 }
 
+/** VS Code 内 CodeBuddy 扩展（tencent-cloud.coding-copilot）状态；与 CN IDE / CLI 独立。 */
+export interface VscodeExtStatus {
+  /** VS Code 用户数据目录是否存在。 */
+  installed: boolean;
+  /** CodeBuddy 扩展是否已安装（globalStorage/<extensionId> 存在）。 */
+  extensionInstalled: boolean;
+  running: boolean;
+  dataDir: string | null;
+  dbPath: string | null;
+  dbExists: boolean;
+  activeAccountId: string | null;
+  activeAccountName: string | null;
+  detectedFrom?: string;
+  statePath?: string;
+}
+
+export interface VscodeExtSwitchResult {
+  ok: boolean;
+  account: string;
+  accountId: string;
+  dbPath?: string;
+  /** 恒为 false：为避免丢失未保存内容，切换不会主动重启 VS Code。 */
+  restarted?: boolean;
+  message?: string;
+}
+

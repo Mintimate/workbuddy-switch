@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits, export_import, oauth,
-    process, refresh, rotate, session, switch, token_stats, travel, update,
+    process, refresh, rotate, session, switch, token_stats, travel, update, vscode_ext,
 };
 
 #[derive(Serialize)]
@@ -132,6 +132,45 @@ pub async fn switch_codebuddy_cn_ide_account(
 #[tauri::command]
 pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(codebuddy_cn_ide::detect_current_account)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// GET /api/vscode-ext/status —— VS Code CodeBuddy 扩展安装/运行/当前账号。
+///
+/// async + spawn_blocking：状态检测会跑 tasklist/ps 等子进程，账号页每次挂载都会
+/// 刷新，若在主线程执行会造成页面卡顿。
+#[tauri::command]
+pub async fn get_vscode_ext_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(vscode_ext::status)
+        .await
+        .map_err(|error| format!("查询 VS Code 扩展状态失败: {error}"))
+}
+
+/// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展（仅写入，不重启）。
+///
+/// async + spawn_blocking：读写 state.vscdb + DPAPI 解密可能阻塞，避免卡 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn switch_vscode_ext_account(
+    account_id: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        vscode_ext::switch_account(&account_id, restart.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/vscode-ext/detect —— 读取本机 VS Code 扩展当前登录并尝试匹配账号库。
+///
+/// async + spawn_blocking：会通过 Safe Storage 读取子进程，避免阻塞主线程。
+#[tauri::command]
+pub async fn detect_vscode_ext_account() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(vscode_ext::detect_current_account)
         .await
         .map_err(|e| e.to_string())?
 }

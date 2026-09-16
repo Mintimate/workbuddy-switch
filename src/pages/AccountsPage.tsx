@@ -14,7 +14,7 @@ import {
 
 import { AccountCard } from "@/components/account-card";
 import { DemoAction } from "@/components/demo-action";
-import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
+import { CodeBuddyCnIdeMark, CodeBuddyMark, VscodeExtMark, WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,7 +34,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus, VscodeExtStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -150,6 +150,8 @@ export default function AccountsPage() {
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
   const [codebuddyCnIdeSwitchingId, setCodebuddyCnIdeSwitchingId] = useState<string | null>(null);
+  const [vscodeExt, setVscodeExt] = useState<VscodeExtStatus | null>(null);
+  const [vscodeExtSwitchingId, setVscodeExtSwitchingId] = useState<string | null>(null);
   const [installingCodebuddyCli, setInstallingCodebuddyCli] = useState(false);
   /** 刷新按钮触发的批量签到进行中 */
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
@@ -244,6 +246,14 @@ export default function AccountsPage() {
     }
   }
 
+  async function refreshVscodeExtStatus() {
+    try {
+      setVscodeExt(await api.getVscodeExtStatus());
+    } catch {
+      setVscodeExt(null);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     void refreshCodebuddyCliStatus();
@@ -254,8 +264,16 @@ export default function AccountsPage() {
         } catch {
           /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
         }
+        try {
+          await api.detectVscodeExtAccount();
+        } catch {
+          /* VS Code 未登录或 Safe Storage 不可用时静默 */
+        }
       }
-      if (!cancelled) await refreshCodebuddyCnIdeStatus();
+      if (!cancelled) {
+        await refreshCodebuddyCnIdeStatus();
+        await refreshVscodeExtStatus();
+      }
     })();
     return () => {
       cancelled = true;
@@ -513,6 +531,29 @@ export default function AccountsPage() {
     }
   }
 
+  async function onSwitchVscodeExt(account: AccountMeta) {
+    if (vscodeExtSwitchingId !== null) return;
+    setVscodeExtSwitchingId(account.id);
+    const toastId = toast.loading("正在切换 VS Code CodeBuddy 扩展…", {
+      description: "将写入凭证（VS Code 需先完全退出）",
+    });
+    try {
+      const result = await api.switchVscodeExtAccount(account.id);
+      await refreshVscodeExtStatus();
+      toast.success("VS Code CodeBuddy 扩展已切换", {
+        id: toastId,
+        description: result.message || result.account,
+      });
+    } catch (error) {
+      toast.error("VS Code CodeBuddy 扩展切换失败", {
+        id: toastId,
+        description: api.asError(error),
+      });
+    } finally {
+      setVscodeExtSwitchingId(null);
+    }
+  }
+
   async function onInstallCodebuddyCli() {
     // 桌面 App（Tauri WebView）不支持 window.confirm，改用 Dialog 确认
     setInstallConfirmOpen(true);
@@ -570,6 +611,10 @@ export default function AccountsPage() {
   const cnIdeCurrentName = codebuddyCnIde?.installed
     ? codebuddyCnIde.activeAccountName || "未检测到"
     : "未安装";
+  const vscodeExtCurrentAccountId = vscodeExt?.activeAccountId;
+  const vscodeExtCurrentName = vscodeExt?.installed
+    ? vscodeExt.activeAccountName || "未检测到"
+    : "未接入";
   const codebuddyUsesSettingsEnv = codebuddyCli?.authMode === "settings-env";
   return (
     <div className="mx-auto w-full max-w-[1180px] px-6 py-8 sm:px-8 sm:py-9">
@@ -578,7 +623,7 @@ export default function AccountsPage() {
           <div className="min-w-0">
             <h1 className="text-[28px] font-semibold tracking-tight">账号管理</h1>
             <p className="mt-2 text-sm leading-6 text-muted-foreground">
-              统一管理 WorkBuddy、CodeBuddy IDE 与 CodeBuddy CLI 账号、积分和签到状态。
+              统一管理 WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code 扩展账号、积分和签到状态。
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-4 pt-1">
@@ -609,6 +654,20 @@ export default function AccountsPage() {
                 </span>
                 <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
                   CodeBuddy IDE：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
+                </span>
+              </span>
+              <span className="group relative inline-flex cursor-default">
+                <span
+                  className={
+                    vscodeExt?.installed && vscodeExt?.extensionInstalled
+                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
+                      : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
+                  }
+                >
+                  <VscodeExtMark size={28} />
+                </span>
+                <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
+                  VS Code CodeBuddy：{!vscodeExt?.installed ? "未检测到 VS Code" : !vscodeExt.extensionInstalled ? "未安装扩展" : vscodeExt.running ? "运行中" : "已接入"} · 当前账号：{vscodeExtCurrentName}
                 </span>
               </span>
               <span className="group relative inline-flex cursor-default">
@@ -835,6 +894,13 @@ export default function AccountsPage() {
                 codebuddyCnIdeBusy={codebuddyCnIdeSwitchingId !== null}
                 codebuddyCnIdeLoading={codebuddyCnIdeSwitchingId === a.id}
                 onSwitchCodebuddyCnIde={onSwitchCodebuddyCnIde}
+                vscodeExtInstalled={Boolean(vscodeExt?.installed)}
+                vscodeExtExtensionInstalled={Boolean(vscodeExt?.extensionInstalled)}
+                vscodeExtAvailable={Boolean(vscodeExt?.installed && vscodeExt?.extensionInstalled)}
+                vscodeExtActive={a.id === vscodeExtCurrentAccountId}
+                vscodeExtBusy={vscodeExtSwitchingId !== null}
+                vscodeExtLoading={vscodeExtSwitchingId === a.id}
+                onSwitchVscodeExt={onSwitchVscodeExt}
                 featuresDisabled={false}
               />
             ))}

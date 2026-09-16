@@ -1,8 +1,8 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
-  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
-  TravelConfig, TravelStatus,
+  TravelConfig, TravelStatus, VscodeExtStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
 
@@ -416,6 +416,30 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_status": return appStatus;
     case "get_accounts": return { accounts: demoAccounts };
     case "get_codebuddy_cli_status": return cliStatus;
+    case "get_codebuddy_cn_ide_status": return {
+      installed: true,
+      running: false,
+      dataDir: "/demo/CodeBuddy CN",
+      dbPath: "/demo/CodeBuddy CN/User/globalStorage/state.vscdb",
+      dbExists: true,
+      appPath: "/demo/CodeBuddy CN.app",
+      activeAccountId: demoAccounts[0].id,
+      activeAccountName: demoAccounts[0].nickname,
+      detectedFrom: "state",
+      statePath: "/demo/codebuddy_cn_ide.json",
+    } satisfies CodeBuddyCnIdeStatus;
+    case "get_vscode_ext_status": return {
+      installed: true,
+      extensionInstalled: true,
+      running: false,
+      dataDir: "/demo/Code",
+      dbPath: "/demo/Code/User/globalStorage/state.vscdb",
+      dbExists: true,
+      activeAccountId: demoAccounts[0].id,
+      activeAccountName: demoAccounts[0].nickname,
+      detectedFrom: "state",
+      statePath: "/demo/vscode_ext.json",
+    } satisfies VscodeExtStatus;
     case "switch_codebuddy_cli_account": {
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");
