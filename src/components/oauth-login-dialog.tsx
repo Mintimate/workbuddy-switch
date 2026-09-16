@@ -28,15 +28,16 @@ interface Props {
 const LOGIN_COPY = {
   cn: {
     title: "OAuth 扫码登录",
-    description: (appName: string) =>
-      `在浏览器中打开验证链接，扫码授权后将自动采集 ${appName} 账号并入库。`,
+    // 国内版保留产品名（档位与产品同名，无歧义）；产品名仍取自 variant.ts 单一来源
+    description: `在浏览器中打开验证链接，扫码授权后将自动采集 ${variantAppName("cn")} 账号并入库。`,
     start: "开始扫码登录",
     waiting: "正在等待扫码授权，请在浏览器完成操作…",
   },
   ai: {
     title: "OAuth Web 登录",
-    description: (appName: string) =>
-      `在浏览器中打开验证链接，完成 Web 登录授权后将自动采集 ${appName} 账号并入库。`,
+    // 国际版只说档位：与账号页同口径（原来写作「WorkBuddy 国际版 账号」，
+    // 既有中英混排的冗余空格，又让同一句话里出现产品名与档位名两种叫法）
+    description: "在浏览器中打开验证链接，完成 Web 登录授权后将自动采集国际版账号并入库。",
     start: "开始 Web 登录",
     waiting: "请在浏览器中完成 Web 登录授权，正在等待授权结果…",
   },
@@ -45,7 +46,6 @@ const LOGIN_COPY = {
 /** OAuth 登录采集：发起 → 打开浏览器 → 轮询采集结果 → 入库。 */
 export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT }: Props) {
   const reconcileAccounts = useAccountsStore((s) => s.reconcileAccounts);
-  const appName = variantAppName(variant);
   const copy = LOGIN_COPY[variant];
 
   const [busy, setBusy] = useState(false);
@@ -136,7 +136,7 @@ export function OAuthLoginDialog({ open, onOpenChange, variant = DEFAULT_VARIANT
       <DialogContent>
         <DialogHeader>
           <DialogTitle>{copy.title}（{variantLabel(variant)}）</DialogTitle>
-          <DialogDescription>{copy.description(appName)}</DialogDescription>
+          <DialogDescription>{copy.description}</DialogDescription>
         </DialogHeader>
 
         {!loginId && !result && (

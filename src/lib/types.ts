@@ -249,6 +249,8 @@ export interface CreditStatsAccount {
   lastCheckinResult: string | null;
   /** 按账号的逐日观察消耗（缺省兼容旧后端）；官方可用时趋势图优先使用官方 daily */
   daily?: CreditStatsDailyPoint[];
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export interface CreditStatsUsageEvent {
@@ -258,6 +260,8 @@ export interface CreditStatsUsageEvent {
   accountId: string;
   accountName: string;
   amount: number;
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export interface CreditStatsCheckinEvent {
@@ -268,6 +272,8 @@ export interface CreditStatsCheckinEvent {
   accountName: string;
   result: string;
   error?: string | null;
+  /** 档位标记。后端当前不下发，前端容忍性读取；缺省时回退到按 accountId 的映射表 */
+  variant?: WbVariant;
 }
 
 export type CreditStatsEvent = CreditStatsUsageEvent | CreditStatsCheckinEvent;

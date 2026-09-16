@@ -1,6 +1,6 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
-  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
+  CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
@@ -61,21 +61,23 @@ const usageSeeds: AccountUsageSeed[] = [
   },
 ];
 
+/**
+ * 演示数据刻意让三个账号的积分包数量不同（1 / 2 / 5），覆盖卡片内容区的三种高度：
+ * 1 行、2 行、2 行 + 「查看全部积分包」。这样演示模式能真实暴露「同排卡片因内容长度不同
+ * 而高低参差」的布局问题 —— 若三家都给同样多的包，这个问题在演示里永远看不见。
+ * 请勿"顺手"改回统一数量。
+ */
 const creditPackages = [
+  // 账号 A：1 条 → 1 行，无「查看全部积分包」
   [
-    ["CodeBuddy 个人版国内运营裂变包", 5000, 3186.4, 36],
-    ["CodeBuddy 个人版积分包", 2400, 1180.75, 18],
     ["CodeBuddy 新用户体验包", 800, 386.4, 5],
-    ["CodeBuddy 签到赠送积分", 300, 196.25, 11],
-    ["CodeBuddy 活动奖励积分", 600, 428.6, 27],
   ],
+  // 账号 B：2 条 → 2 行，无「查看全部积分包」（链接在 resources.length > 2 时才出现）
   [
-    ["CodeBuddy 个人版国内运营裂变包", 3600, 2468.2, 24],
     ["CodeBuddy 个人版积分包", 1800, 905.5, 42],
-    ["CodeBuddy 新用户体验包", 500, 128.2, 7],
     ["CodeBuddy 签到赠送积分", 240, 174.35, 15],
-    ["CodeBuddy 活动奖励积分", 400, 286.8, 31],
   ],
+  // 账号 C：5 条 → 2 行 + 「查看全部积分包」
   [
     ["CodeBuddy 个人版国内运营裂变包", 2400, 1680.4, 29],
     ["CodeBuddy 个人版积分包", 1200, 748.6, 55],
@@ -494,6 +496,30 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     }
     case "get_accounts": return { accounts: demoAccounts };
     case "get_codebuddy_cli_status": return cliStatus;
+    // 让演示里存在一个「CodeBuddy IDE 当前账号」：否则 IDE 标记与选中态染色（淡紫）在演示里永远不可见。
+    // 取第二个账号，使三张卡各自演示一种形态（A 占位行 / B IDE 选中 / C 查看全部）。
+    case "get_codebuddy_cn_ide_status": return {
+      installed: true,
+      running: true,
+      dataDir: "/demo/codebuddy-cn-ide",
+      dbPath: "/demo/codebuddy-cn-ide/state.vscdb",
+      dbExists: true,
+      appPath: "/demo/CodeBuddy CN.app",
+      activeAccountId: demoAccounts[1].id,
+      activeAccountName: demoAccounts[1].nickname,
+    } satisfies CodeBuddyCnIdeStatus;
+    // 国际版同理：不 mock 会让演示切到「国际版」时落到 default → throw（被 AccountsPage 的
+    // try/catch 吞掉），IDE 标记退化成「未接入」——而这正是本轮国际版 IDE 功能在演示页的展示面。
+    case "get_codebuddy_ide_status": return {
+      installed: true,
+      running: true,
+      dataDir: "/demo/codebuddy-ide",
+      dbPath: "/demo/codebuddy-ide/state.vscdb",
+      dbExists: true,
+      appPath: "/demo/CodeBuddy IDE.app",
+      activeAccountId: demoAccounts[1].id,
+      activeAccountName: demoAccounts[1].nickname,
+    } satisfies CodeBuddyCnIdeStatus;
     case "switch_codebuddy_cli_account": {
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");

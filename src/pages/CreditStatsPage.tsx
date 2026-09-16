@@ -114,9 +114,9 @@ function accountLabel(account: { accountName?: string | null; accountId: string 
   return account.accountName || account.accountId;
 }
 
-function taggedVariant(value: object): WbVariant | undefined {
-  if (!("variant" in value)) return undefined;
-  return normalizeVariant((value as { variant?: unknown }).variant);
+/** 读取可选的后端档位标记；缺省（当前后端不下发）时返回 undefined，由调用方回退到映射表。 */
+function taggedVariant(value: { variant?: unknown }): WbVariant | undefined {
+  return value.variant === undefined ? undefined : normalizeVariant(value.variant);
 }
 
 function resolveAccountVariant(
