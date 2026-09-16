@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
+  CalendarCheck,
   Columns3,
   Download,
   ExternalLink,
   FileDown,
   FileUp,
   Loader2,
+  Plane,
   QrCode,
   RefreshCw,
   Rows3,
@@ -26,7 +28,6 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -189,6 +190,8 @@ export default function AccountsPage() {
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
   const checkinAvailable = variantSupportsCheckin(variant);
+  const autoCheckinEnabled = autoCheckinConfig?.enabled ?? false;
+  const autoTravelEnabled = autoTravelConfig?.enabled ?? false;
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -738,7 +741,7 @@ export default function AccountsPage() {
             <h2 className="text-sm font-semibold text-foreground">添加与迁移账号</h2>
             <p className="mt-1 text-xs leading-5 text-muted-foreground">
               {variant === "ai"
-                ? `快速接入 ${appName} 账号，或从已有环境恢复`
+                ? "快速接入国际版账号，或从已有环境恢复"
                 : "快速接入新账号，或从已有环境恢复"}
             </p>
           </div>
@@ -755,7 +758,7 @@ export default function AccountsPage() {
             <DemoAction>
               <Button className="h-10 px-4" onClick={onImport} disabled={importing} variant="outline">
                 {importing ? <Loader2 className="animate-spin" /> : <Download />}
-                {variant === "ai" ? `导入本机 ${appName} 账号` : "导入本机账号"}
+                {variant === "ai" ? "导入本机国际版账号" : "导入本机账号"}
               </Button>
             </DemoAction>
           </div>
@@ -838,39 +841,63 @@ export default function AccountsPage() {
             <div className="ml-auto flex items-center gap-1">
               {/* 自动签到仅国内版开放，国际版隐藏入口 */}
               {checkinAvailable && (
-                <div className="mr-1 flex items-center gap-2.5">
-                  <label htmlFor="accounts-auto-checkin" className="cursor-pointer text-xs font-medium text-muted-foreground">
-                    自动签到
-                  </label>
-                  <DemoAction>
-                    <Switch
-                      id="accounts-auto-checkin"
-                      checked={autoCheckinConfig?.enabled ?? false}
-                      disabled={!autoCheckinConfig || autoCheckinSaving}
-                      onCheckedChange={(enabled) => void onAutoCheckinChange(enabled)}
-                      aria-label="自动签到"
-                    />
-                  </DemoAction>
-                  {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
-                </div>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <DemoAction>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className={cn("size-9 rounded-lg", autoCheckinEnabled && "bg-accent")}
+                          disabled={!autoCheckinConfig || autoCheckinSaving}
+                          onClick={() => void onAutoCheckinChange(!autoCheckinEnabled)}
+                          aria-pressed={autoCheckinEnabled}
+                          aria-label={autoCheckinEnabled ? "自动签到已开启" : "自动签到已关闭"}
+                          aria-busy={autoCheckinSaving}
+                        >
+                          {/* 品牌色必须落在图标上而非 Button：ghost 的 hover:text-accent-foreground
+                              (button.tsx:18) 特异性高于单个 text-brand，会把开启态在悬停时抹成关闭态的样子。
+                              子元素自带 color 胜过父级继承，与特异性无关。 */}
+                          {autoCheckinSaving
+                            ? <Loader2 className={cn("animate-spin", autoCheckinEnabled && "text-brand")} />
+                            : <CalendarCheck className={cn(autoCheckinEnabled && "text-brand")} />}
+                        </Button>
+                      </DemoAction>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {api.isDemoMode() ? "演示模式下不可操作" : `自动签到：${autoCheckinEnabled ? "已开启" : "已关闭"}`}
+                  </TooltipContent>
+                </Tooltip>
               )}
               {/* 成长中心（派猫猫旅行）仅国内版开放，国际版隐藏入口 */}
               {travelAvailable && (
-                <div className="mr-1 flex items-center gap-2.5">
-                  <label htmlFor="accounts-auto-travel" className="cursor-pointer text-xs font-medium text-muted-foreground">
-                    自动旅行
-                  </label>
-                  <DemoAction>
-                    <Switch
-                      id="accounts-auto-travel"
-                      checked={autoTravelConfig?.enabled ?? false}
-                      disabled={!autoTravelConfig || autoTravelSaving}
-                      onCheckedChange={(enabled) => void onAutoTravelChange(enabled)}
-                      aria-label="自动旅行"
-                    />
-                  </DemoAction>
-                  {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
-                </div>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <DemoAction>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className={cn("size-9 rounded-lg", autoTravelEnabled && "bg-accent")}
+                          disabled={!autoTravelConfig || autoTravelSaving}
+                          onClick={() => void onAutoTravelChange(!autoTravelEnabled)}
+                          aria-pressed={autoTravelEnabled}
+                          aria-label={autoTravelEnabled ? "自动旅行已开启" : "自动旅行已关闭"}
+                          aria-busy={autoTravelSaving}
+                        >
+                          {/* 同签到：品牌色落在图标上，避免被 ghost 的 hover:text-accent-foreground 抹掉 */}
+                          {autoTravelSaving
+                            ? <Loader2 className={cn("animate-spin", autoTravelEnabled && "text-brand")} />
+                            : <Plane className={cn(autoTravelEnabled && "text-brand")} />}
+                        </Button>
+                      </DemoAction>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">
+                    {api.isDemoMode() ? "演示模式下不可操作" : `自动旅行：${autoTravelEnabled ? "已开启" : "已关闭"}`}
+                  </TooltipContent>
+                </Tooltip>
               )}
               {/* 左侧开关都隐藏时（如国际版）不画悬空分隔线 */}
               {(checkinAvailable || travelAvailable) && <Separator orientation="vertical" className="mx-2 h-5" />}
@@ -919,10 +946,10 @@ export default function AccountsPage() {
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
             {variant === "ai" ? (
               <>
-                <p>暂无{appName}账号。</p>
+                <p>暂无国际版账号。</p>
                 <p className="mt-2 text-xs leading-5">
                   请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）并登录，
-                  再点击上方「导入本机 {appName} 账号」；也可以直接「OAuth 登录」添加国际版账号。
+                  再点击上方「导入本机国际版账号」；也可以直接「OAuth 登录」添加国际版账号。
                 </p>
               </>
             ) : (
@@ -930,7 +957,9 @@ export default function AccountsPage() {
             )}
           </div>
         ) : (
-          <div className={cn("grid min-w-0 items-start gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+          <div className={cn("grid min-w-0 gap-5", compact ? "grid-cols-[repeat(auto-fit,minmax(min(100%,300px),1fr))]" : "grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))]")}>
+            {/* 不要给这个网格加 items-start：它会覆盖 Grid 默认的 stretch，让同排卡片因内容长度不同而
+                高低参差。卡片内部 article 是 flex-col、内容区是 flex-1，会自动吸收差额、footer 自动贴底对齐。 */}
             {orderedAccounts.map((a) => (
               <AccountCard
                 key={a.id}
