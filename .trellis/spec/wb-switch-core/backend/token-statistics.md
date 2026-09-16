@@ -18,6 +18,11 @@
 - HTTP: `GET /api/token-stats` with optional query parameter `days`.
 - Accepted range values are `7`, `30`, and `90`; all other values mean the
   complete available local history (`rangeDays: null`).
+- Internal JSONL collector: `source(root, name, cutoff, detail: bool)`. Only the
+  CodeBuddy CLI source passes `detail = true`; the flag gates the optional
+  `requests` array and changes nothing else.
+- Detail constants: `REQUEST_WINDOW = 500` (rows returned per response) and
+  `REQUEST_COLLECT_LIMIT = 4_000` (in-scan memory cap).
 
 ### 3. Contracts
 
@@ -122,6 +127,33 @@
   `providerData.usage`, then top-level `usage`; `providerData.rawUsage` only
   supplements cache-write fields absent from the selected usage object.
 
+#### Request detail rows (`requests`, CodeBuddy CLI only)
+
+- The `codebuddy-cli` source additionally returns `requests`: one row per model
+  call, newest first, capped at `REQUEST_WINDOW` (500).
+- `workbuddy` and `codebuddy-ide` never emit the key. Their bodies stay
+  byte-for-byte unchanged, so consumers must read a missing `requests` as "not
+  available" rather than as an empty log.
+- Row shape: `{ timestamp, model, project, sessionId, title, input, output,
+  cacheRead, cacheWrite, total }` with `total = input + output + cacheWrite`,
+  produced by the same helper as `summary.total` — never by a second formula.
+- Rows come from the same decode / cutoff / fingerprint-dedupe / `subagents`
+  pipeline as the aggregates. A parallel parse path is forbidden: a detail row
+  must never disagree with the totals it sits next to.
+- A usage record without a `timestamp` cannot be ordered. It still counts in the
+  aggregates but never appears in `requests`, so `requests.length` may be lower
+  than `summary.records` by those rows; the UI must not promise equality.
+- `title` is file-scoped: `aiTitle` wins, the latest non-empty `summary` is the
+  fallback, and it is backfilled after the whole JSONL file is read because the
+  title event may follow the usage records.
+- Scanning holds at most `REQUEST_COLLECT_LIMIT` rows; on overflow it trims to
+  the newest `REQUEST_WINDOW` with a stable descending timestamp sort. The
+  retained set is always the globally newest window, independent of file order
+  (mtime-sorted) or row-arrival order.
+- Privacy: a row carries only the model label, the `cwd` basename, the session
+  id, the file-scoped title, and token counts. Message bodies, tool arguments,
+  raw paths, and authentication data are never included.
+
 ### 4. Validation & Error Matrix
 
 | Condition | Required behavior |
@@ -146,6 +178,12 @@
 | Equal titles in different files | Return separate session groups with stable unique keys. |
 | Older response without `dailyByModel` | Keep the aggregate daily trend and do not expose model-specific options. |
 | Selected model has no dated usage | Return an empty model trend; never fall back to the aggregate series under that model label. |
+| Non-CLI source | Omit `requests` entirely; never fill it from another source's window. |
+| Detail row candidate | Apply the same `seen` fingerprint as the aggregates, so copied/forked session replay cannot duplicate a row. |
+| Usage record without a timestamp | Count it in the aggregates; exclude it from `requests`. |
+| Candidates exceed `REQUEST_WINDOW` | Return only the newest 500 rows and let the UI disclose the truncation. |
+| `aiTitle` appears after the usage records | Backfill that title onto every detail row of the same file. |
+| Title event exists but the file has no in-range usage | Emit no detail row for it. |
 
 ### 5. Good / Base / Bad Cases
 
@@ -167,6 +205,14 @@
   project/session labels.
 - Bad title: never derive a title from message content, tool arguments, output,
   raw paths, or authentication data.
+- Good detail: a CLI fixture with three dated usage records returns three
+  `requests` rows, newest first, each with `total = input + output + cacheWrite`,
+  and their `total` sum stays inside `summary.total`.
+- Base detail: a source scanned with `detail = false`, or a source with no usage,
+  returns no `requests` key at all.
+- Bad detail: filling `requests` for every source, or rebuilding rows with a
+  second parser, makes the detail list disagree with the dashboard numbers it is
+  displayed next to.
 
 ### 6. Tests Required
 
@@ -190,6 +236,13 @@
 - Fixture tests assert CodeBuddy IDE conversation indexes are aggregated, message
   body files are ignored, titles/models come from the workspace index, and the
   shared cutoff applies to `startedAt`.
+- Detail fixtures must assert: the `requests` key is present only when
+  `detail = true`; row `total` uses the shared helper; rows sort newest-first
+  regardless of write order; the window keeps the globally newest `REQUEST_WINDOW`
+  rows after a trim, for out-of-order arrivals too; a copied/forked session
+  contributes one row; a record without a timestamp stays in the aggregates but
+  out of `requests`; and an `aiTitle` placed after the usage records still labels
+  every row of that file.
 
 ### 7. Wrong vs Correct
 
@@ -240,5 +293,31 @@ sessions.entry(event["aiTitle"].to_string()).or_default();
 collect_title_metadata(&event);
 if usage_is_in_range(&event, cutoff) {
     session_totals.add(normalize_usage(&event)?);
+}
+```
+
+#### Wrong
+
+```rust
+// A second walk over the logs for the detail list re-derives dedupe and cutoff,
+// so the rows can disagree with the totals rendered beside them. Emitting the
+// key unconditionally also breaks the sources that must stay unchanged.
+let rows = walk_logs_again_for_details();
+value["requests"] = json!(rows);
+```
+
+#### Correct
+
+```rust
+// Detail rows ride the same pass, after the shared fingerprint check, and the
+// key exists only for the source that asked for detail.
+if let Some(ts) = timestamp(&event) {
+    if seen.insert(fingerprint(&event, usage)) {
+        file_rows.push(RequestRow { timestamp: ts, usage, ..row_labels(&event) });
+    }
+}
+// after the file is read, backfill the file-scoped title
+if detail {
+    value["requests"] = json!(newest_window(file_rows));
 }
 ```

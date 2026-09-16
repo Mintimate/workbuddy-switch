@@ -74,3 +74,4 @@ Do not use native shortcuts such as `details/summary` as substitutes for menus, 
 - [ ] Kept Rhea density and project theme tokens.
 - [ ] Verified outside click, Escape, keyboard, focus, disabled, and loading behavior.
 - [ ] Documented why custom UI was necessary if shadcn was insufficient.
+- [ ] Kept read-only entries (detail dialogs, inspection views) usable in the demo build; `DemoAction` is only for command-backed controls.
