@@ -882,7 +882,7 @@ export default function AccountsPage() {
           <div className="rounded-xl border border-dashed px-4 py-16 text-center text-sm text-muted-foreground">
             {variant === "ai" ? (
               <>
-                <p>暂无{appName}（国际版）账号。</p>
+                <p>暂无{appName}账号。</p>
                 <p className="mt-2 text-xs leading-5">
                   请确认本机已安装 {appName}（客户端下载域名 {variantDownloadDomain(variant)}）并登录，
                   再点击上方「导入本机 {appName} 账号」；也可以直接「OAuth 登录」添加国际版账号。

@@ -1091,7 +1091,7 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
         </div>
         {source.source === "workbuddy-ai" && (
           <div className="mt-2 text-xs leading-5">
-            国际版数据源为空：本机可能未安装 WorkBuddy AI，或尚未产生本地会话日志；
+            国际版数据源为空：本机可能未安装 WorkBuddy 国际版客户端，或尚未产生本地会话日志；
             国际版数据与国内版分开统计，不参与国内版用量。
           </div>
         )}
@@ -1277,7 +1277,7 @@ export default function TokenStatsPage() {
 
   return (
     <div className="mx-auto w-full max-w-[1180px] min-w-0 px-4 py-6 sm:px-8 sm:py-9">
-      <header className="mb-10 flex min-w-0 flex-wrap items-start justify-between gap-4 sm:mb-12">
+      <header className="mb-6 flex min-w-0 flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           {loading && !stats ? (
             <div aria-hidden="true">
@@ -1293,65 +1293,65 @@ export default function TokenStatsPage() {
             </>
           )}
         </div>
-        <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
-          {loading && !stats ? (
-            <Skeleton className="h-8 w-44 rounded-lg" aria-hidden="true" />
-          ) : (
-            <Tabs
-              className="min-w-0 gap-0"
-              value={active}
-              onValueChange={(value) => {
-                if (!isSourceKey(value)) return;
-                if (stats && !stats.sources.some((item) => item.source === value)) return;
-                setActive(value);
-              }}
-            >
-              <TabsList className="h-auto max-w-full flex-wrap" aria-label="Token 数据来源">
-                <TabsTrigger
-                  className="max-w-full whitespace-normal"
-                  value="workbuddy"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy"))}
-                >
-                  WorkBuddy
-                </TabsTrigger>
-                <TabsTrigger
-                  className="max-w-full whitespace-normal"
-                  value="workbuddy-ai"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy-ai"))}
-                >
-                  WorkBuddy AI
-                </TabsTrigger>
-                <TabsTrigger
-                  className="max-w-full whitespace-normal"
-                  value="codebuddy-cli"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-cli"))}
-                >
-                  CodeBuddy CLI
-                </TabsTrigger>
-                <TabsTrigger
-                  className="max-w-full whitespace-normal"
-                  value="codebuddy-ide"
-                  disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
-                >
-                  CodeBuddy IDE
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
-          )}
-          <DemoAction>
-            <Button
-              className="shrink-0"
-              variant="outline"
-              size="sm"
-              onClick={() => setReload((value) => value + 1)}
-              disabled={loading}
-            >
-              {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
-              刷新统计
-            </Button>
-          </DemoAction>
-        </div>
+        <DemoAction>
+          <Button
+            className="shrink-0"
+            variant="outline"
+            size="sm"
+            onClick={() => setReload((value) => value + 1)}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="animate-spin" /> : <RefreshCw />}
+            刷新统计
+          </Button>
+        </DemoAction>
       </header>
+
+      {/* 数据源 Tab 独占一行：数据源变多时不与右上角操作挤在同一排 */}
+      {loading && !stats ? (
+        <Skeleton className="mb-8 h-9 w-full max-w-md rounded-lg" aria-hidden="true" />
+      ) : (
+        <Tabs
+          className="mb-8 min-w-0 gap-0"
+          value={active}
+          onValueChange={(value) => {
+            if (!isSourceKey(value)) return;
+            if (stats && !stats.sources.some((item) => item.source === value)) return;
+            setActive(value);
+          }}
+        >
+          <TabsList className="h-auto max-w-full flex-wrap" aria-label="Token 数据来源">
+            <TabsTrigger
+              className="max-w-full whitespace-normal"
+              value="workbuddy"
+              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy"))}
+            >
+              WorkBuddy
+            </TabsTrigger>
+            <TabsTrigger
+              className="max-w-full whitespace-normal"
+              value="workbuddy-ai"
+              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "workbuddy-ai"))}
+            >
+              WorkBuddy 国际版
+            </TabsTrigger>
+            <TabsTrigger
+              className="max-w-full whitespace-normal"
+              value="codebuddy-cli"
+              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-cli"))}
+            >
+              CodeBuddy CLI
+            </TabsTrigger>
+            <TabsTrigger
+              className="max-w-full whitespace-normal"
+              value="codebuddy-ide"
+              disabled={Boolean(stats && !stats.sources.some((item) => item.source === "codebuddy-ide"))}
+            >
+              CodeBuddy IDE
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
+      )}
 
       {error && (
         <Alert variant="destructive" className="mb-5">

@@ -17,9 +17,9 @@ export function variantLabel(variant: WbVariant): string {
   return variant === "ai" ? "国际版" : "国内版";
 }
 
-/** 档位对应的客户端名称（对话框、状态卡文案用）。 */
+/** 档位对应的客户端名称（对话框、状态卡、账号页 tooltip 用）。 */
 export function variantAppName(variant: WbVariant): string {
-  return variant === "ai" ? "WorkBuddy AI" : "WorkBuddy";
+  return variant === "ai" ? "WorkBuddy 国际版" : "WorkBuddy";
 }
 
 /**
