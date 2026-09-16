@@ -48,6 +48,7 @@ import {
   variantAppName,
   variantDownloadDomain,
   variantLabel,
+  variantSupportsCheckin,
   variantSupportsTravel,
 } from "@/lib/variant";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
@@ -182,6 +183,7 @@ export default function AccountsPage() {
   );
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
+  const checkinAvailable = variantSupportsCheckin(variant);
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -797,21 +799,24 @@ export default function AccountsPage() {
           </div>
           <TooltipProvider delayDuration={400}>
             <div className="ml-auto flex items-center gap-1">
-              <div className="mr-1 flex items-center gap-2.5">
-                <label htmlFor="accounts-auto-checkin" className="cursor-pointer text-xs font-medium text-muted-foreground">
-                  自动签到
-                </label>
-                <DemoAction>
-                  <Switch
-                    id="accounts-auto-checkin"
-                    checked={autoCheckinConfig?.enabled ?? false}
-                    disabled={!autoCheckinConfig || autoCheckinSaving}
-                    onCheckedChange={(enabled) => void onAutoCheckinChange(enabled)}
-                    aria-label="自动签到"
-                  />
-                </DemoAction>
-                {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
-              </div>
+              {/* 自动签到仅国内版开放，国际版隐藏入口 */}
+              {checkinAvailable && (
+                <div className="mr-1 flex items-center gap-2.5">
+                  <label htmlFor="accounts-auto-checkin" className="cursor-pointer text-xs font-medium text-muted-foreground">
+                    自动签到
+                  </label>
+                  <DemoAction>
+                    <Switch
+                      id="accounts-auto-checkin"
+                      checked={autoCheckinConfig?.enabled ?? false}
+                      disabled={!autoCheckinConfig || autoCheckinSaving}
+                      onCheckedChange={(enabled) => void onAutoCheckinChange(enabled)}
+                      aria-label="自动签到"
+                    />
+                  </DemoAction>
+                  {autoCheckinSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动签到设置" />}
+                </div>
+              )}
               {/* 成长中心（派猫猫旅行）仅国内版开放，国际版隐藏入口 */}
               {travelAvailable && (
                 <div className="mr-1 flex items-center gap-2.5">
@@ -830,7 +835,8 @@ export default function AccountsPage() {
                   {autoTravelSaving && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-label="正在保存自动旅行设置" />}
                 </div>
               )}
-              <Separator orientation="vertical" className="mx-2 h-5" />
+              {/* 左侧开关都隐藏时（如国际版）不画悬空分隔线 */}
+              {(checkinAvailable || travelAvailable) && <Separator orientation="vertical" className="mx-2 h-5" />}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button

@@ -41,3 +41,8 @@ export function accountVariant(account: { variant?: WbVariant } | null | undefin
 export function variantSupportsTravel(variant: WbVariant): boolean {
   return variant !== "ai";
 }
+
+/** 自动签到仅国内版开放；国际版签到接口未开放（后端已按 inactive 归类），不展示入口。 */
+export function variantSupportsCheckin(variant: WbVariant): boolean {
+  return variant !== "ai";
+}
