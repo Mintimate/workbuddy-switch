@@ -7,7 +7,11 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Instant 只在 macOS/Linux 的进程轮询路径里使用；Windows 上无条件导入会触发 unused_imports，
+// 而 CI 的 setup-rust-toolchain 默认带 -D warnings，会直接编译失败。
+#[cfg(not(target_os = "windows"))]
+use std::time::Instant;
 
 use crate::modules::account;
 use crate::modules::config::{atomic_write, home_dir, now_ms};
@@ -205,6 +209,11 @@ fn sync_cli_runtime_cache(settings: &Path, variant: WbVariant) -> Result<(), Str
 
 /// 只认 CodeBuddy CLI / prewarm 的包路径，排除 IDE（`.app` / `Programs\CodeBuddy`）
 /// 和本工具。禁止用 `codebuddy` 单字去匹配。
+///
+/// 只在 macOS 的 `list_codebuddy_cli_pids` 与 Linux 的 `/proc` 扫描路径里使用 ——
+/// Windows 走 PowerShell 查询，不需要它。Windows 的非测试构建会因此报 dead_code，
+/// 而 CI 的 setup-rust-toolchain 默认带 `-D warnings`，故显式放行（保留测试可用）。
+#[cfg_attr(all(target_os = "windows", not(test)), allow(dead_code))]
 fn is_codebuddy_cli_process_args(args: &str) -> bool {
     let lower = args.to_ascii_lowercase();
     if lower.contains("wb-switch") || lower.contains("workbuddy-switch") {
