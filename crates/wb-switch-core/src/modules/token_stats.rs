@@ -13,6 +13,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+/// 明细中最多返回的请求条数（响应窗口）。
+const REQUEST_WINDOW: usize = 500;
+/// 扫描期间明细缓存的内存硬上限；达到该值后立即裁剪到 `REQUEST_WINDOW`，
+/// 使峰值内存恒定，不随历史总量增长。
+const REQUEST_COLLECT_LIMIT: usize = 4_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Usage {
     input: u64,
@@ -36,6 +42,15 @@ struct SessionTotals {
     totals: Totals,
 }
 
+/// 展示总量：`input` 已包含 cache reads，因此只追加 output 与 cache write，
+/// 避免把缓存命中重复计入。聚合与请求明细共用这一口径。
+fn usage_total(usage: Usage) -> u64 {
+    usage
+        .input
+        .saturating_add(usage.output)
+        .saturating_add(usage.write)
+}
+
 impl Totals {
     fn add(&mut self, usage: Usage) {
         self.usage.input = self.usage.input.saturating_add(usage.input);
@@ -48,13 +63,7 @@ impl Totals {
     fn value(&self) -> Value {
         let cache_hit_rate = (self.usage.input > 0)
             .then(|| self.usage.read as f64 / self.usage.input as f64);
-        // `input` already includes cache reads; expose the same headline total
-        // used by the dashboard without double-counting the cached portion.
-        let total = self
-            .usage
-            .input
-            .saturating_add(self.usage.output)
-            .saturating_add(self.usage.write);
+        let total = usage_total(self.usage);
         json!({
             "total": total,
             "input": self.usage.input,
@@ -64,6 +73,35 @@ impl Totals {
             "uncachedInput": self.usage.input.saturating_sub(self.usage.read),
             "records": self.records,
             "cacheHitRate": cache_hit_rate,
+        })
+    }
+}
+
+/// 一次模型调用的明细行。只携带脱敏标识与 token 数字：不含消息正文、
+/// 工具参数、绝对路径或认证信息。
+#[derive(Clone, Debug)]
+struct RequestRow {
+    timestamp: i64,
+    model: String,
+    project: String,
+    session_id: String,
+    title: Option<String>,
+    usage: Usage,
+}
+
+impl RequestRow {
+    fn value(&self) -> Value {
+        json!({
+            "timestamp": self.timestamp,
+            "model": self.model,
+            "project": self.project,
+            "sessionId": self.session_id,
+            "title": self.title,
+            "input": self.usage.input,
+            "output": self.usage.output,
+            "cacheRead": self.usage.read,
+            "cacheWrite": self.usage.write,
+            "total": usage_total(self.usage),
         })
     }
 }
@@ -342,11 +380,28 @@ struct SourceCollector {
     coverage_start_at: Option<i64>,
     coverage_end_at: Option<i64>,
     session_key_counts: HashMap<String, usize>,
+    requests: Vec<RequestRow>,
+    collect_requests: bool,
 }
 
 impl SourceCollector {
     fn note_parse_error(&mut self) {
         self.parse_errors = self.parse_errors.saturating_add(1);
+    }
+
+    /// Append one request row. Once the in-memory hard limit is exceeded, keep
+    /// only the newest window: the sort is stable, so rows sharing a timestamp
+    /// keep their collection order and the oldest rows are dropped.
+    fn push_request(&mut self, row: RequestRow) {
+        if !self.collect_requests {
+            return;
+        }
+        self.requests.push(row);
+        if self.requests.len() > REQUEST_COLLECT_LIMIT {
+            self.requests
+                .sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+            self.requests.truncate(REQUEST_WINDOW);
+        }
     }
 
     fn add(&mut self, usage: Usage, value: &Value, project: &str) {
@@ -411,13 +466,13 @@ impl SourceCollector {
         });
     }
 
-    fn into_value(self, name: &str, files_scanned: usize) -> Value {
+    fn into_value(mut self, name: &str, files_scanned: usize) -> Value {
         let daily_by_model = self
             .daily_by_model
             .into_iter()
             .map(|(model, points)| (model, Value::Array(groups(points))))
             .collect::<Map<String, Value>>();
-        json!({
+        let mut value = json!({
             "source": name,
             "summary": self.total.value(),
             "models": groups(self.models),
@@ -430,14 +485,30 @@ impl SourceCollector {
             "parseErrors": self.parse_errors,
             "coverageStartAt": self.coverage_start_at,
             "coverageEndAt": self.coverage_end_at,
-        })
+        });
+        // Only detail sources take the new key; every other source keeps its
+        // previous response shape byte for byte.
+        if self.collect_requests {
+            self.requests
+                .sort_by_key(|row| std::cmp::Reverse(row.timestamp));
+            self.requests.truncate(REQUEST_WINDOW);
+            value["requests"] = Value::Array(self.requests.iter().map(RequestRow::value).collect());
+        }
+        value
     }
 }
 
-fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
+/// Aggregate one JSONL source. `detail` additionally keeps a bounded window of
+/// per-call request rows; both outputs share the same decode, cutoff, dedupe,
+/// and `subagents`-exclusion pipeline so a detail row can never disagree with
+/// the aggregate totals.
+fn source(root: PathBuf, name: &str, cutoff: Option<i64>, detail: bool) -> Value {
     let mut paths = Vec::new();
     files(&root, &mut paths);
-    let mut collector = SourceCollector::default();
+    let mut collector = SourceCollector {
+        collect_requests: detail,
+        ..SourceCollector::default()
+    };
 
     // Copied/forked sessions replay the parent history (including usage
     // records with their original timestamps) into their own JSONL, so the
@@ -468,6 +539,9 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
         };
 
         let mut session_totals = Totals::default();
+        // Detail rows are buffered per file so the file-scoped title can be
+        // backfilled once the whole file has been read.
+        let mut file_requests: Vec<RequestRow> = Vec::new();
         let mut session_project: Option<String> = None;
         let mut ai_title: Option<String> = None;
         let mut summary: Option<String> = None;
@@ -500,15 +574,20 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
                 continue;
             };
             // Fingerprint = (timestamp, full usage, model). Records without a
-            // timestamp cannot be fingerprinted and are counted as before.
-            let duplicate = timestamp(&value).is_some_and(|ts| {
+            // timestamp cannot be fingerprinted and are counted as before; they
+            // are also unsortable and therefore never appear in the detail
+            // window. Reuse the parsed model name for the fingerprint and the
+            // detail row instead of decoding it twice.
+            let ts = timestamp(&value);
+            let model_name = model(&value);
+            let duplicate = ts.is_some_and(|ts| {
                 !seen.insert((
                     ts,
                     usage.input,
                     usage.output,
                     usage.read,
                     usage.write,
-                    model(&value),
+                    model_name.clone(),
                 ))
             });
             if duplicate {
@@ -520,11 +599,34 @@ fn source(root: PathBuf, name: &str, cutoff: Option<i64>) -> Value {
             }
             session_totals.add(usage);
             collector.add(usage, &value, &project);
+            if collector.collect_requests {
+                if let Some(ts) = ts {
+                    file_requests.push(RequestRow {
+                        timestamp: ts,
+                        model: model_name,
+                        project,
+                        session_id: session_id.clone(),
+                        title: None,
+                        usage,
+                    });
+                }
+            }
         }
 
+        // `aiTitle` can appear anywhere in the file (including after the usage
+        // records), so the file title is only final once the file is read.
+        let title = ai_title.or(summary);
+        if !file_requests.is_empty() {
+            for row in &mut file_requests {
+                row.title = title.clone();
+            }
+            for row in file_requests {
+                collector.push_request(row);
+            }
+        }
         collector.push_session(
             session_id,
-            ai_title.or(summary),
+            title,
             session_project.unwrap_or(fallback_project),
             session_totals,
         );
@@ -802,8 +904,8 @@ pub fn get_statistics(days: Option<i64>) -> Value {
         "generatedAt": generated_at,
         "rangeDays": range_days,
         "sources": [
-            source(home.join(".workbuddy/projects"), "workbuddy", cutoff),
-            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff),
+            source(home.join(".workbuddy/projects"), "workbuddy", cutoff, false),
+            source(home.join(".codebuddy/projects"), "codebuddy-cli", cutoff, true),
             ide_source(
                 codebuddy_extension_data_dir(),
                 "codebuddy-ide",
@@ -884,6 +986,7 @@ mod tests {
                 write: 0,
             })
         );
+
     }
 
     #[test]
@@ -924,7 +1027,6 @@ mod tests {
                 write: 0,
             })
         );
-
     }
 
     #[test]
@@ -953,7 +1055,7 @@ mod tests {
             .expect("write fixture");
         fs::write(ignored.join("agent.jsonl"), format!("{}\n", record)).expect("write ignored fixture");
 
-        let result = source(root.clone(), "fixture", None);
+        let result = source(root.clone(), "fixture", None, false);
         assert_eq!(result["filesScanned"], 1);
         assert_eq!(result["parseErrors"], 1);
         assert_eq!(result["summary"]["input"], 10);
@@ -1009,7 +1111,7 @@ mod tests {
             .set_modified(std::time::SystemTime::now())
             .expect("pin forked mtime");
 
-        let result = source(root.clone(), "fixture", None);
+        let result = source(root.clone(), "fixture", None, false);
         // The replayed record counts once; the fork's new record still counts.
         assert_eq!(result["summary"]["records"], 2);
         assert_eq!(result["summary"]["input"], 17);
@@ -1046,7 +1148,7 @@ mod tests {
         )
         .expect("write fixture");
 
-        let result = source(root.clone(), "fixture", Some(now - 50_000));
+        let result = source(root.clone(), "fixture", Some(now - 50_000), false);
         assert_eq!(result["summary"]["records"], 1);
         assert_eq!(result["summary"]["input"], 10);
         assert_eq!(result["projects"][0]["key"], "example-project");
@@ -1118,7 +1220,7 @@ mod tests {
         )
         .expect("write duplicate title fixture");
 
-        let result = source(root.clone(), "fixture", Some(now - 50_000));
+        let result = source(root.clone(), "fixture", Some(now - 50_000), false);
         let sessions = result["sessions"].as_array().expect("session groups");
         let by_id = |session_id: &str| {
             sessions
@@ -1136,6 +1238,316 @@ mod tests {
         assert!(by_id("session-d")["title"].is_null());
         assert_eq!(by_id("session-a")["project"], "example-project");
         assert_ne!(by_id("session-a")["key"], by_id("session-e")["key"]);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_key_only_present_for_detail_sources() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-key-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": now,
+                    "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+                })
+            ),
+        )
+        .expect("write fixture");
+
+        let aggregate_only = source(root.clone(), "workbuddy", None, false);
+        assert!(aggregate_only.get("requests").is_none());
+
+        let detailed = source(root.clone(), "codebuddy-cli", None, true);
+        let rows = detailed["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 1);
+        // 明细只是附加键，聚合数值与不采集明细时完全一致。
+        assert_eq!(detailed["summary"], aggregate_only["summary"]);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_rows_share_the_total_formula_and_sort_newest_first() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-rows-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = |timestamp, input, write| {
+            json!({
+                "timestamp": timestamp,
+                "cwd": "/private/example-project",
+                "providerData": { "model": "fixture-model" },
+                "message": { "usage": {
+                    "input_tokens": input,
+                    "output_tokens": 2,
+                    "cache_read_input_tokens": 5,
+                    "cache_write_input_tokens": write
+                }}
+            })
+        };
+        // 文件顺序刻意与时间顺序相反，排序必须来自 timestamp。
+        fs::write(
+            project.join("session-detail.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                record(now - 1_000, 10, 1),
+                record(now - 2_000, 20, 2),
+                record(now - 3_000, 30, 3),
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "codebuddy-cli", None, true);
+        assert_eq!(result["summary"]["records"], 3);
+        // input 60 + output 6 + cacheWrite 6；cacheRead 不计入合计。
+        assert_eq!(result["summary"]["total"], 72);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["timestamp"], now - 1_000);
+        assert_eq!(rows[2]["timestamp"], now - 3_000);
+        assert_eq!(rows[0]["model"], "fixture-model");
+        // 只暴露 cwd 的 basename，不返回绝对路径。
+        assert_eq!(rows[0]["project"], "example-project");
+        assert_eq!(rows[0]["sessionId"], "session-detail");
+        assert!(rows[0]["title"].is_null());
+        assert_eq!(rows[0]["input"], 10);
+        assert_eq!(rows[0]["output"], 2);
+        assert_eq!(rows[0]["cacheRead"], 5);
+        assert_eq!(rows[0]["cacheWrite"], 1);
+        assert_eq!(rows[0]["total"], 13);
+        let row_total: u64 = rows
+            .iter()
+            .map(|row| row["total"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(row_total, result["summary"]["total"].as_u64().unwrap_or(0));
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_window_keeps_only_the_newest_rows() {
+        let row = |timestamp| RequestRow {
+            timestamp,
+            model: "fixture-model".to_string(),
+            project: "fixture-project".to_string(),
+            session_id: "fixture-session".to_string(),
+            title: None,
+            usage: Usage {
+                input: 1,
+                output: 1,
+                read: 0,
+                write: 0,
+            },
+        };
+
+        // 触达内存硬上限后只保留最新窗口，且按时间倒序。
+        let mut collector = SourceCollector {
+            collect_requests: true,
+            ..SourceCollector::default()
+        };
+        for timestamp in 0..=(REQUEST_COLLECT_LIMIT as i64) {
+            collector.push_request(row(timestamp));
+        }
+        assert_eq!(collector.requests.len(), REQUEST_WINDOW);
+        assert_eq!(
+            collector.requests[0].timestamp,
+            REQUEST_COLLECT_LIMIT as i64
+        );
+
+        // 未触达硬上限时，输出窗口同样截断到最新 REQUEST_WINDOW 条。
+        let mut bounded = SourceCollector {
+            collect_requests: true,
+            ..SourceCollector::default()
+        };
+        for timestamp in 0..(REQUEST_WINDOW as i64 + 100) {
+            bounded.push_request(row(timestamp));
+        }
+        let value = bounded.into_value("fixture", 1);
+        let rows = value["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), REQUEST_WINDOW);
+        assert_eq!(rows[0]["timestamp"], REQUEST_WINDOW as i64 + 99);
+        assert_eq!(rows[REQUEST_WINDOW - 1]["timestamp"], 100);
+
+        // 关闭明细采集时不缓存任何行，也不输出 requests 键。
+        let mut off = SourceCollector::default();
+        off.push_request(row(1));
+        assert!(off.into_value("fixture", 1).get("requests").is_none());
+    }
+
+    #[test]
+    fn request_detail_window_stays_the_global_newest_after_any_arrival_order() {
+        let row = |timestamp| RequestRow {
+            timestamp,
+            model: "fixture-model".to_string(),
+            project: "fixture-project".to_string(),
+            session_id: "fixture-session".to_string(),
+            title: None,
+            usage: Usage {
+                input: 1,
+                output: 1,
+                read: 0,
+                write: 0,
+            },
+        };
+
+        // 文件按 mtime 顺序处理、行内时间戳可以乱序：中途裁剪过之后，后到的
+        // 旧行不能占位，后到的新行仍须进入窗口 —— 结果恒等于「全局最新 500」。
+        let mut collector = SourceCollector {
+            collect_requests: true,
+            ..SourceCollector::default()
+        };
+        for timestamp in 0..=(REQUEST_COLLECT_LIMIT as i64) {
+            collector.push_request(row(timestamp));
+        }
+        collector.push_request(row(-1));
+        for timestamp in 10_000..10_100 {
+            collector.push_request(row(timestamp));
+        }
+
+        let value = collector.into_value("fixture", 1);
+        let rows = value["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), REQUEST_WINDOW);
+        assert_eq!(rows[0]["timestamp"], 10_099);
+        assert_eq!(rows[99]["timestamp"], 10_000);
+        // 裁剪后残留的旧行必须让位：第 101 条是最新一轮保留里的最新一行。
+        assert_eq!(rows[100]["timestamp"], REQUEST_COLLECT_LIMIT as i64);
+        // 全局最新 500 = 100 条新行 + 上一轮保留里最新的 400 条（4000..=3601）。
+        assert_eq!(rows[REQUEST_WINDOW - 1]["timestamp"], 3_601);
+        assert!(rows.iter().all(|row| row["timestamp"] != -1));
+    }
+
+    #[test]
+    fn request_detail_deduplicates_copied_session_history() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-fork-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = json!({
+            "timestamp": now,
+            "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+        });
+        fs::write(
+            project.join("session-original.jsonl"),
+            format!("{}\n", record),
+        )
+        .expect("write original fixture");
+        fs::write(
+            project.join("session-forked.jsonl"),
+            format!(
+                "{}\n{}\n",
+                record,
+                json!({
+                    "timestamp": now + 1_000,
+                    "message": { "usage": { "input_tokens": 7, "output_tokens": 2 } }
+                })
+            ),
+        )
+        .expect("write forked fixture");
+        // 与聚合去重用例相同：固定 mtime，保证原始会话先于副本被处理。
+        std::fs::File::open(project.join("session-original.jsonl"))
+            .expect("open original fixture")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("pin original mtime");
+        std::fs::File::open(project.join("session-forked.jsonl"))
+            .expect("open forked fixture")
+            .set_modified(std::time::SystemTime::now())
+            .expect("pin forked mtime");
+
+        let result = source(root.clone(), "fixture", None, true);
+        assert_eq!(result["summary"]["records"], 2);
+        let rows = result["requests"].as_array().expect("request rows");
+        // 复制会话重放的记录沿用同一指纹，明细里只出现一次。
+        assert_eq!(rows.len(), 2);
+        let inputs: Vec<u64> = rows
+            .iter()
+            .filter_map(|row| row["input"].as_u64())
+            .collect();
+        assert_eq!(inputs, [7, 10]);
+        assert_eq!(rows[0]["sessionId"], "session-forked");
+        assert_eq!(rows[1]["sessionId"], "session-original");
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_skips_records_without_timestamp() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-undated-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": now,
+                    "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+                }),
+                // 没有 timestamp 的记录仍然计入聚合，但无法排序，不进明细。
+                json!({ "message": { "usage": { "input_tokens": 90, "output_tokens": 9 } } }),
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "fixture", None, true);
+        assert_eq!(result["summary"]["records"], 2);
+        assert_eq!(result["summary"]["input"], 100);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["input"], 10);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_backfills_file_title_after_usage() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-title-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        let record = |timestamp| {
+            json!({
+                "timestamp": timestamp,
+                "message": { "usage": { "input_tokens": 10, "output_tokens": 3 } }
+            })
+        };
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                json!({ "type": "summary", "summary": "摘要回退标题" }),
+                record(now - 1_000),
+                // aiTitle 出现在 usage 之后：文件读完后必须回填到所有明细行。
+                json!({ "type": "ai-title", "aiTitle": "最新 AI 标题" }),
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "fixture", None, true);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "最新 AI 标题");
 
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -1243,6 +1655,8 @@ mod tests {
         assert_eq!(result["sessions"][0]["sessionId"], "conv-a");
         assert_eq!(result["sessions"][0]["title"], "IDE 会话标题");
         assert_eq!(result["sessions"].as_array().map(Vec::len), Some(1));
+        // IDE 来源不是明细来源，响应形状保持不变。
+        assert!(result.get("requests").is_none());
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert_eq!(result["dailyByModel"]["deepseek-v4-flash"][0]["key"], today);
 

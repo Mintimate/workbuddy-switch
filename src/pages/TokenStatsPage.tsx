@@ -5,7 +5,10 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   Check,
+  ChevronLeft,
+  ChevronRight,
   Gauge,
+  ListTree,
   Loader2,
   MessagesSquare,
   RefreshCw,
@@ -31,6 +34,21 @@ import {
   type ChartConfig,
 } from "@/components/ui/chart";
 import { DemoAction } from "@/components/demo-action";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -40,6 +58,7 @@ import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
   TokenStatistics,
   TokenStatsGroup,
+  TokenStatsRequestRow,
   TokenStatsSource,
   TokenStatsTotals,
 } from "@/lib/types";
@@ -51,6 +70,7 @@ type DistributionKey = "projects" | "models";
 
 const TOKEN_SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
 const RANKING_LIMIT = 10;
+const REQUEST_PAGE_SIZE = 50;
 
 function isSourceKey(value: unknown): value is SourceKey {
   return value === "workbuddy" || value === "codebuddy-cli" || value === "codebuddy-ide";
@@ -122,9 +142,10 @@ const tokenTotal = (value: TokenStatsTotals) =>
 const percentage = (value: number, sum: number) =>
   sum > 0 ? `${((value / sum) * 100).toFixed(1)}%` : "—";
 
+const pad2 = (value: number) => String(value).padStart(2, "0");
+
 function dateKey(date: Date): string {
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
 }
 
 function dateDaysAgo(days: number): string {
@@ -146,6 +167,12 @@ function formatDateTime(timestamp?: number | null): string {
 
 function formatChartDate(date: string): string {
   return date.slice(5).replace("-", "/");
+}
+
+/** 请求明细的精确时间：本地时区 `YYYY-MM-DD HH:mm:ss`。 */
+function formatRequestTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
 }
 
 function formatHeatmapDate(date: Date): string {
@@ -1073,6 +1100,142 @@ function Distribution({ source }: { source: TokenStatsSource }) {
   );
 }
 
+/**
+ * 明细表格与分页。页状态挂在 `DialogContent` 的子组件里：Radix 关闭即卸载，
+ * 因此重新打开弹框会自动回到第 1 页，不需要额外的重置逻辑。
+ */
+function RequestDetailRows({ rows, records }: { rows: TokenStatsRequestRow[]; records: number }) {
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(rows.length / REQUEST_PAGE_SIZE));
+  const start = page * REQUEST_PAGE_SIZE;
+  const pageRows = rows.slice(start, start + REQUEST_PAGE_SIZE);
+  const shownEnd = start + pageRows.length;
+
+  return (
+    <>
+      <div className="min-h-0 flex-1 overflow-y-auto rounded-lg border">
+        <Table className="min-w-[860px]">
+          <TableHeader>
+            <TableRow className="hover:bg-transparent">
+              <TableHead>时间</TableHead>
+              <TableHead>模型</TableHead>
+              <TableHead>会话</TableHead>
+              <TableHead>项目</TableHead>
+              <TableHead className="text-right">输入</TableHead>
+              <TableHead className="text-right">输出</TableHead>
+              <TableHead className="text-right">缓存读</TableHead>
+              <TableHead className="text-right">缓存写</TableHead>
+              <TableHead className="text-right">合计</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {pageRows.map((row, index) => {
+              const sessionTitle = row.title?.trim();
+              const sessionLabel = sessionTitle || row.sessionId.slice(0, 8);
+              return (
+                <TableRow key={`${row.timestamp}-${row.sessionId}-${start + index}`}>
+                  <TableCell className="tabular-nums text-muted-foreground">
+                    {formatRequestTime(row.timestamp)}
+                  </TableCell>
+                  <TableCell className="max-w-[200px] truncate" title={row.model}>
+                    {row.model}
+                  </TableCell>
+                  <TableCell
+                    className="max-w-[220px] truncate"
+                    title={sessionTitle || row.sessionId}
+                  >
+                    {sessionLabel}
+                  </TableCell>
+                  <TableCell className="max-w-[160px] truncate" title={row.project}>
+                    {row.project}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatTokenExact(row.input)}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatTokenExact(row.output)}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatTokenExact(row.cacheRead)}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {formatTokenExact(row.cacheWrite)}
+                  </TableCell>
+                  <TableCell className="text-right font-medium tabular-nums">
+                    {formatTokenExact(row.total)}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </div>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-[11px] text-muted-foreground">
+          {rows.length < records
+            ? `仅展示最近 ${exact.format(rows.length)} 条（共 ${exact.format(records)} 次调用）`
+            : `共 ${exact.format(rows.length)} 次调用`}
+        </span>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPage((value) => Math.max(0, value - 1))}
+            disabled={page === 0}
+          >
+            <ChevronLeft />
+            上一页
+          </Button>
+          <span className="text-[11px] text-muted-foreground tabular-nums">
+            第 {exact.format(start + 1)}–{exact.format(shownEnd)} 条 · 共 {exact.format(rows.length)} 条
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}
+            disabled={page >= pageCount - 1}
+          >
+            下一页
+            <ChevronRight />
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function RequestDetailDialog({
+  open,
+  onOpenChange,
+  source,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  source: TokenStatsSource;
+}) {
+  const rows = source.requests ?? [];
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="flex max-h-[85vh] min-w-0 flex-col gap-3 sm:max-w-5xl">
+        <DialogHeader>
+          <DialogTitle>请求明细</DialogTitle>
+          <DialogDescription>
+            每次模型调用一行，按时间倒序展示本地 CodeBuddy CLI 日志记录。
+          </DialogDescription>
+        </DialogHeader>
+        {rows.length === 0 ? (
+          <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
+            该来源暂无可展示的请求明细。
+          </div>
+        ) : (
+          <RequestDetailRows rows={rows} records={source.summary.records} />
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function Dashboard({ source }: { source: TokenStatsSource }) {
   const denominator = tokenTotal(source.summary);
 
@@ -1228,6 +1391,7 @@ export default function TokenStatsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const [detailOpen, setDetailOpen] = useState(false);
 
   useEffect(() => {
     let disposed = false;
@@ -1320,6 +1484,17 @@ export default function TokenStatsPage() {
               </TabsList>
             </Tabs>
           )}
+          {active === "codebuddy-cli" && (
+            <Button
+              className="shrink-0"
+              variant="outline"
+              size="sm"
+              onClick={() => setDetailOpen(true)}
+            >
+              <ListTree />
+              查看请求明细
+            </Button>
+          )}
           <DemoAction>
             <Button
               className="shrink-0"
@@ -1356,6 +1531,14 @@ export default function TokenStatsPage() {
             该来源暂无可用统计数据，请点击刷新重试。
           </div>
         )
+      )}
+
+      {source && (
+        <RequestDetailDialog
+          open={detailOpen}
+          onOpenChange={setDetailOpen}
+          source={source}
+        />
       )}
     </div>
   );

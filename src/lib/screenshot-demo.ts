@@ -1,7 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsSource, TokenStatsTotals,
+  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -367,6 +367,41 @@ function demoTokenSession(key: string, title: string, project: string, input: nu
   return { ...demoTokenGroup(key, input, output, cacheRead, cacheWrite, records), title, project, sessionId: keyParts[keyParts.length - 1] };
 }
 
+/** 演示用请求明细：约 120 条，时间戳落在最近 14 天内且按时间倒序。 */
+function demoTokenRequests(scale: number): TokenStatsRequestRow[] {
+  const models = ["deepseek-v4-flash", "deepseek-v4-flash", "kimi-k3-1", "deepseek-v4-flash", "glm-5.2"];
+  const sessions = [
+    { project: "wb-switch-rust", sessionId: "token-stats-dashboard", title: "完善 Token 统计仪表盘与本地用量分析" },
+    { project: "wb-switch-rust", sessionId: "account-card-redesign", title: "统一账号卡片视觉和交互" },
+    { project: "my-code-teams", sessionId: "settings-agent-acp", title: "设计 Agent 与 ACP 管理设置" },
+    { project: "LetterTotTown", sessionId: "character-audio", title: "补全角色成语双音频" },
+  ];
+  // 每天 9 条、小时降序，保证整体严格倒序（最新在前）；从昨天开始，
+  // 避免演示时间戳落在当前时刻之后。
+  const hours = [23, 21, 20, 17, 16, 15, 14, 11, 10];
+
+  return Array.from({ length: 120 }, (_, index) => {
+    const session = sessions[Math.floor(index / 3) % sessions.length];
+    const factor = 0.55 + ((index * 37) % 23) / 20;
+    const input = Math.round(310_000 * factor * scale);
+    const cacheRead = Math.round(input * 0.87);
+    const output = Math.round(20_000 * factor * scale);
+    const cacheWrite = index % 4 === 0 ? 0 : Math.round(4_000 * factor * scale);
+    return {
+      timestamp: atLocalTime(Math.floor(index / 9) + 1, hours[index % 9], (index * 13) % 60),
+      model: models[index % models.length],
+      project: session.project,
+      sessionId: session.sessionId,
+      title: session.title,
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+      total: input + output + cacheWrite,
+    };
+  });
+}
+
 function demoTokenSource(source: TokenStatsSource["source"], scale: number): TokenStatsSource {
   const daily = Array.from({ length: 14 }, (_, index) => {
     const wave = [0.62, 0.86, 1.1, 0.72, 1.3, 0.94, 0.38][index % 7] * scale;
@@ -395,7 +430,15 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
     demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
   ];
   const now = Date.now();
-  return { source, summary, models, projects, sessions, daily, hours, filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41, parseErrors: 0, coverageStartAt: now - 13 * 86_400_000, coverageEndAt: now };
+  return {
+    source, summary, models, projects, sessions, daily, hours,
+    filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41,
+    parseErrors: 0,
+    coverageStartAt: now - 13 * 86_400_000,
+    coverageEndAt: now,
+    // 只有 CodeBuddy CLI 来源返回请求明细，与真实后端行为一致。
+    ...(source === "codebuddy-cli" ? { requests: demoTokenRequests(scale) } : {}),
+  };
 }
 
 function demoTokenStatistics(days?: number): TokenStatistics {
