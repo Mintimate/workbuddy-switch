@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/chart";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import * as api from "@/lib/api";
+import { creditResourceName } from "@/lib/credit-package-names";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
 import type {
   CreditExpiry,
@@ -40,7 +41,6 @@ import type {
   CreditOfficialUsageAccount,
   CreditOfficialUsageModel,
   CreditOfficialUsageRequest,
-  CreditResource,
   CreditStatsAccount,
   CreditStatsDailyPoint,
   // CreditStatsEvent, // 最近事件卡片隐藏后未使用
@@ -235,10 +235,6 @@ function checkinBadgeVariant(
   }
 }
 */
-
-function resourceName(resource: CreditResource): string {
-  return resource.packageName || resource.packageCode || "未命名资源包";
-}
 
 function StatMetric({
   icon: Icon,
@@ -687,7 +683,7 @@ function ResourceBreakdown({ credit, loading }: { credit?: CreditExpiry; loading
         return (
           <div key={`${resource.packageCode || resource.packageName || "resource"}-${index}`} className="min-w-0 px-4 py-1.5 sm:px-5">
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <div className="min-w-0 truncate text-[13px] font-medium">{resourceName(resource)}</div>
+              <div className="min-w-0 truncate text-[13px] font-medium">{creditResourceName(resource, "未命名资源包")}</div>
               <div className="flex shrink-0 items-center gap-2.5">
                 <span className="text-[11px] text-muted-foreground">
                   {resource.expired ? "已到期" : resource.expiringSoon ? "7 天内到期" : `到期 ${formatDate(resource.expireAt)}`}

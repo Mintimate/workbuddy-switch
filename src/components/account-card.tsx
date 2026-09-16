@@ -15,6 +15,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
+import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
 import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
 
@@ -441,7 +442,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
             <div className={cn("text-[11px] font-medium text-muted-foreground", compact ? "mt-3" : "mt-4")}>近期到期</div>
             <div className={cn(compact ? "mt-1.5 space-y-2" : "mt-2 space-y-2.5")}>
               {visibleResources.length > 0 ? visibleResources.map((resource, index) => {
-                const resourceName = resource.packageName || resource.packageCode || "积分包";
+                const resourceName = creditResourceName(resource, "积分包");
                 const ratio = resource.total > 0 ? Math.min(100, Math.max(0, (resource.remaining / resource.total) * 100)) : 0;
                 return (
                   <div key={`${resource.packageCode ?? "resource"}-${resource.expireAt ?? "none"}-${index}`} className="min-w-0" title={`${resourceName} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${formatCreditExpiry(resource.expireAt)}`}>
@@ -526,7 +527,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   <div key={`${resource.packageCode || resource.packageName || "resource"}-${index}`} className="min-w-0 py-3 first:pt-0 last:pb-0">
                     <div className="flex min-w-0 items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <div className="truncate text-sm font-medium">{resource.packageName || resource.packageCode || "未命名资源包"}</div>
+                        <div className="truncate text-sm font-medium">{creditResourceName(resource, "未命名资源包")}</div>
                         <div className="mt-1 text-[11px] text-muted-foreground">
                           {resource.expired ? "已到期" : resource.expiringSoon ? "7 天内到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
                         </div>
