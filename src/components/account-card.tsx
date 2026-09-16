@@ -1,5 +1,5 @@
-import { ArrowRight, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ArrowRight, CalendarCheck2, CalendarDays, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -89,6 +89,33 @@ function accountIdentity(account: AccountMeta): string {
 
 const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
 
+/**
+ * 纯图标状态 chip：状态由图标 + 色调 + tooltip 共同表达，不再占文案宽度。
+ * 签到与旅行共用这一份实现（角标样式、`aria-label`、tooltip 位置统一）。
+ */
+function statusIconChip({
+  icon,
+  label,
+  tooltip,
+  variant,
+}: {
+  icon: ReactNode;
+  label: string;
+  tooltip: string;
+  variant: "secondary" | "success";
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
+          {icon}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent side="top">{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function travelIconChip({
   label,
   tooltip,
@@ -98,16 +125,7 @@ function travelIconChip({
   tooltip: string;
   variant: "secondary" | "success";
 }) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
-          <PlaneTakeoff className="size-3.5" />
-        </Badge>
-      </TooltipTrigger>
-      <TooltipContent side="top">{tooltip}</TooltipContent>
-    </Tooltip>
-  );
+  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant });
 }
 
 function formatTravelRemaining(arriveAt: number | null | undefined): string | null {
@@ -243,9 +261,17 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
 
   const statusChips = (
     <>
-      {todayCheckedIn !== undefined && (
-        <Badge variant={todayCheckedIn ? "success" : "secondary"} className={cn(chipClass, !todayCheckedIn && "text-muted-foreground")}><CircleCheck /> {todayCheckedIn ? "已签到" : "未签到"}</Badge>
-      )}
+      {todayCheckedIn !== undefined &&
+        statusIconChip({
+          icon: todayCheckedIn ? (
+            <CalendarCheck2 className="size-3.5" />
+          ) : (
+            <CalendarDays className="size-3.5" />
+          ),
+          label: todayCheckedIn ? "今日已签到" : "今日未签到",
+          tooltip: todayCheckedIn ? "今日已签到" : "今日未签到",
+          variant: todayCheckedIn ? "success" : "secondary",
+        })}
       {travelChip(travelStatus)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
       {creditPriority && (
@@ -529,7 +555,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium">{creditResourceName(resource, "未命名资源包")}</div>
                         <div className="mt-1 text-[11px] text-muted-foreground">
-                          {resource.expired ? "已到期" : resource.expiringSoon ? "7 天内到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
+                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
                         </div>
                       </div>
                       <div className="shrink-0 text-right text-xs">

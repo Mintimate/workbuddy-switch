@@ -16,6 +16,7 @@ import {
 import { AccountCard } from "@/components/account-card";
 import { DemoAction } from "@/components/demo-action";
 import {
+  CodeBuddyAiIdeMark,
   CodeBuddyCnIdeMark,
   CodeBuddyMark,
   WorkBuddyAiMark,
@@ -46,10 +47,12 @@ import {
   accountVariant,
   normalizeVariant,
   variantAppName,
+  variantCodebuddyIdeName,
   variantDownloadDomain,
   variantLabel,
   variantSupportsCheckin,
   variantSupportsTravel,
+  variantUsesIntlCodebuddyIde,
 } from "@/lib/variant";
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -174,6 +177,8 @@ export default function AccountsPage() {
   const [checkinAllRunning, setCheckinAllRunning] = useState(false);
   /** 接入/升级 CLI helper 确认框 */
   const [installConfirmOpen, setInstallConfirmOpen] = useState(false);
+  /** 切换 CodeBuddy CLI 确认目标（null=关闭） */
+  const [cliSwitchTarget, setCliSwitchTarget] = useState<AccountMeta | null>(null);
   /** 删除账号确认目标（null=关闭） */
   const [deleteTarget, setDeleteTarget] = useState<AccountMeta | null>(null);
   /** 当前档位下的账号：列表、计数、签到、积分等一律只作用于当前档位。 */
@@ -269,7 +274,11 @@ export default function AccountsPage() {
 
   async function refreshCodebuddyCnIdeStatus() {
     try {
-      setCodebuddyCnIde(await api.getCodebuddyCnIdeStatus());
+      setCodebuddyCnIde(
+        variantUsesIntlCodebuddyIde(variant)
+          ? await api.getCodebuddyIdeStatus()
+          : await api.getCodebuddyCnIdeStatus(),
+      );
     } catch {
       setCodebuddyCnIde(null);
     }
@@ -281,7 +290,12 @@ export default function AccountsPage() {
     void (async () => {
       if (!api.isDemoMode()) {
         try {
-          await api.detectCodebuddyCnIdeAccount();
+          // 国际版探测 CodeBuddy.app 钥匙串；国内版探测 CodeBuddy CN。不要交叉读。
+          if (variantUsesIntlCodebuddyIde(variant)) {
+            await api.detectCodebuddyIdeAccount();
+          } else {
+            await api.detectCodebuddyCnIdeAccount();
+          }
         } catch {
           /* 未登录或钥匙串拒绝时静默，下面仍拉安装/运行状态 */
         }
@@ -291,7 +305,7 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [accounts.length]);
+  }, [accounts.length, variant]);
 
   // 当前档位账号列表变化后并行查询各账号今日签到状态
   useEffect(() => {
@@ -521,12 +535,20 @@ export default function AccountsPage() {
 
   async function onSwitchCodebuddyCli(account: AccountMeta) {
     if (codebuddyCliSwitchingId !== null) return;
+    setCliSwitchTarget(account);
+  }
+
+  async function confirmSwitchCodebuddyCli() {
+    const account = cliSwitchTarget;
+    if (!account || codebuddyCliSwitchingId !== null) return;
+    const closeRunningCli = cliSwitchIsRegionChange;
+    setCliSwitchTarget(null);
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
       description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
     });
     try {
-      const result = await api.switchCodebuddyCliAccount(account.id);
+      const result = await api.switchCodebuddyCliAccount(account.id, closeRunningCli);
       await refreshCodebuddyCliStatus();
       toast.success("CodeBuddy CLI 默认账号已更新", {
         id: toastId,
@@ -549,7 +571,9 @@ export default function AccountsPage() {
       description: "将注入凭证并重启 CodeBuddy IDE",
     });
     try {
-      const result = await api.switchCodebuddyCnIdeAccount(account.id, true);
+      const result = variantUsesIntlCodebuddyIde(variant)
+        ? await api.switchCodebuddyIdeAccount(account.id, true)
+        : await api.switchCodebuddyCnIdeAccount(account.id, true);
       await refreshCodebuddyCnIdeStatus();
       toast.success("CodeBuddy IDE 已切换", {
         id: toastId,
@@ -612,6 +636,15 @@ export default function AccountsPage() {
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
+  const cliSwitchIsRegionChange = Boolean(
+    cliSwitchTarget
+    && accountVariant(cliSwitchTarget) !== normalizeVariant(codebuddyCli?.activeAccountVariant),
+  );
+  const cliSwitchAccountLabel = cliSwitchTarget
+    ? cliSwitchTarget.nickname || cliSwitchTarget.email || cliSwitchTarget.id
+    : "";
+  const cliSwitchTargetRegion = cliSwitchTarget ? variantLabel(accountVariant(cliSwitchTarget)) : "";
+  const cliSwitchCurrentRegion = variantLabel(normalizeVariant(codebuddyCli?.activeAccountVariant));
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
     : "未登录";
@@ -667,10 +700,14 @@ export default function AccountsPage() {
                       : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
                   }
                 >
-                  <CodeBuddyCnIdeMark size={28} />
+                  {variantUsesIntlCodebuddyIde(variant) ? (
+                    <CodeBuddyAiIdeMark size={28} />
+                  ) : (
+                    <CodeBuddyCnIdeMark size={28} />
+                  )}
                 </span>
                 <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 hidden whitespace-nowrap rounded-md bg-popover px-2.5 py-1.5 text-xs text-popover-foreground shadow-lg ring-1 ring-black/5 group-hover:block">
-                  CodeBuddy IDE：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
+                  {variantCodebuddyIdeName(variant)}：{codebuddyCnIde?.installed ? (codebuddyCnIde.running ? "运行中" : "已接入") : "未接入"} · 当前账号：{cnIdeCurrentName}
                 </span>
               </span>
               <span className="group relative inline-flex cursor-default">
@@ -988,6 +1025,36 @@ export default function AccountsPage() {
               取消
             </Button>
             <Button onClick={() => void confirmInstallCodebuddyCli()}>继续</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 切换 CodeBuddy CLI 确认（桌面 App 不支持 window.confirm） */}
+      <Dialog open={cliSwitchTarget !== null} onOpenChange={(open) => !open && setCliSwitchTarget(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>切换 CodeBuddy CLI</DialogTitle>
+            <DialogDescription>
+              {cliSwitchIsRegionChange ? (
+                <>
+                  将把默认账号设为「{cliSwitchAccountLabel}」，并从{cliSwitchCurrentRegion}切到{cliSwitchTargetRegion}。
+                  确认后会关闭正在运行的 CodeBuddy CLI，避免旧进程继续打旧站并覆盖站点缓存。当前会话会中断，之后请重新打开 CLI。
+                </>
+              ) : (
+                <>
+                  将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
+                  当前已打开的会话不会换号，重新加载会话或新开会话后生效。
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCliSwitchTarget(null)}>
+              取消
+            </Button>
+            <Button onClick={() => void confirmSwitchCodebuddyCli()}>
+              {cliSwitchIsRegionChange ? "关闭 CLI 并切换" : "切换"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

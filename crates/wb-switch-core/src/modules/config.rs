@@ -221,6 +221,34 @@ pub fn clear_codebuddy_cn_app_cache() {
     let _ = std::fs::remove_file(codebuddy_cn_app_cache_file());
 }
 
+pub fn codebuddy_ide_app_cache_file() -> PathBuf {
+    store_dir().join("codebuddy_ide_app.json")
+}
+
+fn parse_codebuddy_ide_app_cache_json(text: &str) -> Option<PathBuf> {
+    parse_workbuddy_exe_cache_json(text)
+}
+
+pub fn load_codebuddy_ide_app_cache() -> Option<PathBuf> {
+    let f = codebuddy_ide_app_cache_file();
+    if !f.exists() {
+        return None;
+    }
+    let text = std::fs::read_to_string(&f).ok()?;
+    parse_codebuddy_ide_app_cache_json(&text)
+}
+
+pub fn save_codebuddy_ide_app_cache(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(store_dir())?;
+    let content =
+        serde_json::to_string_pretty(&json!({ "exe": path.to_string_lossy() })).unwrap_or_default();
+    atomic_write(&codebuddy_ide_app_cache_file(), &content)
+}
+
+pub fn clear_codebuddy_ide_app_cache() {
+    let _ = std::fs::remove_file(codebuddy_ide_app_cache_file());
+}
+
 // ---------------------------------------------------------------------------
 // 签到配置 / 日志（对照 server.py load/save_checkin_config / load/save/add_checkin_log）
 // ---------------------------------------------------------------------------
@@ -1154,6 +1182,10 @@ mod tests {
         assert!(codebuddy_cn_app_cache_file()
             .file_name()
             .is_some_and(|n| n == "codebuddy_cn_app.json"));
+        assert_ne!(codebuddy_ide_app_cache_file(), codebuddy_cn_app_cache_file());
+        assert!(codebuddy_ide_app_cache_file()
+            .file_name()
+            .is_some_and(|n| n == "codebuddy_ide_app.json"));
     }
 
     #[test]

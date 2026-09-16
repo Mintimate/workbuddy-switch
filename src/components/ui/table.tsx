@@ -2,9 +2,23 @@ import * as React from "react";
 
 import { cn } from "@/lib/utils";
 
-function Table({ className, ...props }: React.ComponentProps<"table">) {
+function Table({
+  className,
+  containerClassName,
+  ...props
+}: React.ComponentProps<"table"> & {
+  /**
+   * 覆盖外层滚动容器的类名。需要纵向 sticky 表头时必须传 `overflow-visible`：
+   * `overflow-x: auto` 会把 `overflow-y` 的计算值一并变成 `auto`，让这个 wrapper
+   * 也成为滚动容器，从而吃掉 sticky 的参照系；此时横向滚动改由调用方容器承担。
+   */
+  containerClassName?: string;
+}) {
   return (
-    <div data-slot="table-container" className="relative w-full overflow-x-auto">
+    <div
+      data-slot="table-container"
+      className={cn("relative w-full overflow-x-auto", containerClassName)}
+    >
       <table
         data-slot="table"
         className={cn("w-full caption-bottom text-xs", className)}

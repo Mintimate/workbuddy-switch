@@ -41,7 +41,7 @@ import { screenshotDemoResponse } from "./screenshot-demo";
 const API_BASE = "http://127.0.0.1:57890";
 
 const DEMO_READ_COMMANDS = new Set([
-  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_checkin_status",
+  "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
@@ -84,6 +84,9 @@ const ROUTES: Record<string, Route> = {
   get_codebuddy_cn_ide_status: { method: "GET", path: "/api/codebuddy-cn-ide/status" },
   switch_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/switch" },
   detect_codebuddy_cn_ide_account: { method: "POST", path: "/api/codebuddy-cn-ide/detect" },
+  get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
+  switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
+  detect_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/detect" },
   delete_account: { method: "POST", path: "/api/delete" },
   oauth_start: { method: "POST", path: "/api/oauth/start" },
   oauth_status: { method: "POST", path: "/api/oauth/status" },
@@ -196,19 +199,27 @@ export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> 
   return call("install_codebuddy_cli_helper");
 }
 
-export function switchCodebuddyCliAccount(accountId: string): Promise<CodeBuddyCliSwitchResult> {
+export function switchCodebuddyCliAccount(
+  accountId: string,
+  closeRunningCli = false,
+): Promise<CodeBuddyCliSwitchResult> {
   if (demoModeEnabled) {
     return new Promise((resolve, reject) => {
       window.setTimeout(() => {
         try {
-          resolve(screenshotDemoResponse("switch_codebuddy_cli_account", { accountId }) as CodeBuddyCliSwitchResult);
+          resolve(
+            screenshotDemoResponse("switch_codebuddy_cli_account", {
+              accountId,
+              closeRunningCli,
+            }) as CodeBuddyCliSwitchResult,
+          );
         } catch (error) {
           reject(error);
         }
       }, 1200);
     });
   }
-  return call("switch_codebuddy_cli_account", { accountId });
+  return call("switch_codebuddy_cli_account", { accountId, closeRunningCli });
 }
 
 export function getCodebuddyCnIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
@@ -230,6 +241,27 @@ export function detectCodebuddyCnIdeAccount(): Promise<{
   message?: string;
 }> {
   return call("detect_codebuddy_cn_ide_account");
+}
+
+export function getCodebuddyIdeStatus(): Promise<CodeBuddyCnIdeStatus> {
+  return call("get_codebuddy_ide_status");
+}
+
+export function switchCodebuddyIdeAccount(
+  accountId: string,
+  restart = true,
+): Promise<CodeBuddyCnIdeSwitchResult> {
+  return call("switch_codebuddy_ide_account", { accountId, restart });
+}
+
+export function detectCodebuddyIdeAccount(): Promise<{
+  ok: boolean;
+  found: boolean;
+  matched?: boolean;
+  accountId?: string;
+  message?: string;
+}> {
+  return call("detect_codebuddy_ide_account");
 }
 
 

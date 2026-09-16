@@ -17,7 +17,7 @@ use rust_embed::RustEmbed;
 use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, config, credit_usage, credits,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config, credit_usage, credits,
     export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
     variant::WbVariant,
 };
@@ -76,6 +76,9 @@ pub fn router() -> Router {
             "/api/codebuddy-cn-ide/detect",
             post(api_codebuddy_cn_ide_detect),
         )
+        .route("/api/codebuddy-ide/status", get(api_codebuddy_ide_status))
+        .route("/api/codebuddy-ide/switch", post(api_codebuddy_ide_switch))
+        .route("/api/codebuddy-ide/detect", post(api_codebuddy_ide_detect))
         .route("/api/delete", post(api_delete))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
@@ -197,7 +200,12 @@ async fn api_codebuddy_cli_install_helper() -> Response {
 
 async fn api_codebuddy_cli_switch(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    match codebuddy_cli::set_active_account(id) {
+    let close_running_cli = body
+        .get("closeRunningCli")
+        .or_else(|| body.get("close_running_cli"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match codebuddy_cli::switch_active_account(id, close_running_cli) {
         Ok(result) => json_ok(result),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
@@ -225,6 +233,33 @@ async fn api_codebuddy_cn_ide_switch(Json(body): Json<Value>) -> Response {
 
 async fn api_codebuddy_cn_ide_detect() -> Response {
     match codebuddy_cn_ide::detect_current_account() {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_codebuddy_ide_status() -> Response {
+    json_ok(codebuddy_ide::status())
+}
+
+async fn api_codebuddy_ide_switch(Json(body): Json<Value>) -> Response {
+    let account_id = body
+        .get("accountId")
+        .or_else(|| body.get("account_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let restart = body
+        .get("restart")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    match codebuddy_ide::switch_account(account_id, restart) {
+        Ok(v) => json_ok(v),
+        Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_codebuddy_ide_detect() -> Response {
+    match codebuddy_ide::detect_current_account() {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
     }

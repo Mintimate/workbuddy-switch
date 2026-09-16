@@ -1237,8 +1237,8 @@ mod tests {
     fn workbuddy_image_name_is_exact_not_substring() {
         assert!(is_workbuddy_image_name("WorkBuddy.exe", WbVariant::Cn));
         assert!(is_workbuddy_image_name("workbuddy", WbVariant::Cn));
-        assert!(is_workbuddy_image_name("CodeBuddy.exe", WbVariant::Cn));
-        assert!(is_workbuddy_image_name("CODEBUDDY", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name("CodeBuddy.exe", WbVariant::Cn));
+        assert!(!is_workbuddy_image_name("CODEBUDDY", WbVariant::Cn));
         assert!(!is_workbuddy_image_name(
             "workbuddy-switch.exe",
             WbVariant::Cn
@@ -1304,7 +1304,7 @@ mod tests {
         );
         assert_eq!(
             windows_exe_names(WbVariant::Cn),
-            vec!["WorkBuddy.exe".to_string(), "CodeBuddy.exe".to_string()]
+            vec!["WorkBuddy.exe".to_string()]
         );
     }
 
@@ -1336,8 +1336,9 @@ mod tests {
         assert!(ai.contains("workbuddy-switch|wb-switch"), "自排除保留");
 
         let cn = windows_registry_probe_script(WbVariant::Cn);
-        assert!(cn.contains("@('WorkBuddy.exe','CodeBuddy.exe')"));
-        assert!(cn.contains("-notmatch 'WorkBuddy|CodeBuddy'"));
+        assert!(cn.contains("@('WorkBuddy.exe')"));
+        assert!(cn.contains("-notmatch 'WorkBuddy'"));
+        assert!(!cn.contains("CodeBuddy.exe"));
     }
 
     #[test]
@@ -1427,7 +1428,7 @@ mod tests {
         let kept =
             filter_windows_workbuddy_rows(&parse_windows_process_rows(stdout), WbVariant::Cn);
         let pids: Vec<u32> = kept.iter().map(|r| r.pid).collect();
-        assert_eq!(pids, vec![1003, 1005]);
+        assert_eq!(pids, vec![1003]);
     }
 
     #[test]
@@ -1506,10 +1507,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
         // 主进程层：解析到路径 → 只用该路径的 Contents/MacOS；失败 → 字面量变体
         assert_eq!(
             macos_main_patterns(None, WbVariant::Cn),
-            vec![
-                "WorkBuddy.app/Contents/MacOS".to_string(),
-                "CodeBuddy.app/Contents/MacOS".to_string()
-            ]
+            vec!["WorkBuddy.app/Contents/MacOS".to_string()]
         );
         assert_eq!(
             macos_main_patterns(None, WbVariant::Ai),
@@ -1526,12 +1524,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
         // 包内层：解析到路径 → 只用完整路径；失败 → 字面量 + 全小写变体
         assert_eq!(
             macos_bundle_patterns(None, WbVariant::Cn),
-            vec![
-                "WorkBuddy.app".to_string(),
-                "workbuddy.app".to_string(),
-                "CodeBuddy.app".to_string(),
-                "codebuddy.app".to_string()
-            ]
+            vec!["WorkBuddy.app".to_string(), "workbuddy.app".to_string()]
         );
         assert_eq!(
             macos_bundle_patterns(None, WbVariant::Ai),
@@ -1542,10 +1535,10 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
         );
         assert_eq!(
             macos_bundle_patterns(
-                Some(Path::new("/Applications/CodeBuddy.app")),
+                Some(Path::new("/Applications/WorkBuddy.app")),
                 WbVariant::Cn
             ),
-            vec!["/Applications/CodeBuddy.app".to_string()]
+            vec!["/Applications/WorkBuddy.app".to_string()]
         );
     }
 
@@ -1581,6 +1574,16 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
             !cn_bundle.iter().any(|p| ai_args.contains(p.as_str())),
             "国际版进程不得命中国内版包内模式"
         );
+
+        let ide_args = "/Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy";
+        assert!(
+            !cn_patterns.iter().any(|p| ide_args.contains(p.as_str())),
+            "国际 CodeBuddy IDE 不得命中国内版 WorkBuddy 主进程模式"
+        );
+        assert!(
+            !cn_bundle.iter().any(|p| ide_args.contains(p.as_str())),
+            "国际 CodeBuddy IDE 不得命中国内版 WorkBuddy 包内模式"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1601,7 +1604,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
         let patterns = macos_main_patterns(None, WbVariant::Cn);
         let kept = filter_ps_rows(&stdout, &patterns, self_pid);
         let pids: Vec<u32> = kept.iter().map(|(pid, _)| *pid).collect();
-        assert_eq!(pids, vec![5001, 5004]);
+        assert_eq!(pids, vec![5001]);
     }
 
     #[cfg(target_os = "macos")]
@@ -1652,9 +1655,7 @@ D:\Users\Zhou\AppData\Local\Programs\WorkBuddy\WorkBuddy.exe
             s,
             vec![
                 "/Applications/WorkBuddy.app".to_string(),
-                "/Applications/CodeBuddy.app".to_string(),
                 "/Users/tester/Applications/WorkBuddy.app".to_string(),
-                "/Users/tester/Applications/CodeBuddy.app".to_string(),
             ]
         );
 

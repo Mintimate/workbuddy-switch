@@ -5,7 +5,7 @@ import type {
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
-import { normalizeVariant } from "./variant";
+import { accountVariant, normalizeVariant } from "./variant";
 
 export const screenshotDemoEnabled = demoModeEnabled;
 
@@ -389,6 +389,8 @@ function demoTokenRequests(scale: number): TokenStatsRequestRow[] {
     const cacheRead = Math.round(input * 0.87);
     const output = Math.round(20_000 * factor * scale);
     const cacheWrite = index % 4 === 0 ? 0 : Math.round(4_000 * factor * scale);
+    // 思考过程是 output 的子集：比例随行变化，保证 thinking <= output。
+    const thinking = Math.round(output * [0.34, 0.12, 0.05, 0.41, 0.22][index % 5]);
     return {
       timestamp: atLocalTime(Math.floor(index / 9) + 1, hours[index % 9], (index * 13) % 60),
       model: models[index % models.length],
@@ -399,6 +401,9 @@ function demoTokenRequests(scale: number): TokenStatsRequestRow[] {
       output,
       cacheRead,
       cacheWrite,
+      // 与后端明细行同口径：input 已含 cacheRead，未命中部分为两者之差。
+      uncachedInput: Math.max(0, input - cacheRead),
+      thinking,
       total: input + output + cacheWrite,
     };
   });
@@ -468,7 +473,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
   const appStatus: AppStatus = { running: true, authFile: "/demo/workbuddy/auth.json", current: { uid: demoAccounts[0].uid, nickname: demoAccounts[0].nickname, email: demoAccounts[0].email }, appPath: "/demo/WorkBuddy.app", version: "0.1.24" };
   const activeIndex = Math.max(0, demoAccounts.findIndex((account) => account.id === demoActiveCliAccountId));
   const activeAccount = demoAccounts[activeIndex] ?? demoAccounts[0];
-  const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
+  const cliStatus: CodeBuddyCliStatus = { configured: true, settingsPresent: true, helperPresent: true, helperSupportsAccountIds: true, activeIndex, activeAccountId: activeAccount.id, activeAccountName: activeAccount.nickname, activeAccountVariant: accountVariant(activeAccount), accountCount: demoAccounts.length, statePath: "/demo/codebuddy-cli-state.json" };
   const config = rotateConfig();
   const rotateStatus: RotateStatus = { config, cliConfigured: true, activeAccountId: demoAccounts[0].id, activeAccountName: demoAccounts[0].nickname, lastCheckAt: atLocalTime(0, 9, 30), lastSwitchAt: atLocalTime(1, 16, 20) };
   const githubConfig: GithubConfig = { owner: "zhangjia", repo: "wb-switch", proxy: "" };
@@ -493,7 +498,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       const target = demoAccounts.find((account) => account.id === args?.accountId);
       if (!target) throw new Error("账号不存在");
       demoActiveCliAccountId = target.id;
-      return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
+      return { ok: true, configured: true, synced: true, verified: true, activeIndex: demoAccounts.indexOf(target), activeAccountId: target.id, regionChanged: false, cliClosed: false, closedProcessCount: 0, message: "演示切换已完成" } satisfies CodeBuddyCliSwitchResult;
     }
     case "get_checkin_status": return { ok: true, todayCheckedIn: true };
     case "get_credit_expiry": return creditExpiry(String(args?.accountId ?? ""));

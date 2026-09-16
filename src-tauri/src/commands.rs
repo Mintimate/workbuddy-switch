@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, credit_usage, credits,
+    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage, credits,
     export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel, update,
     variant::WbVariant,
 };
@@ -94,16 +94,24 @@ pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cli/switch —— 只切换 CodeBuddy CLI，不重启 WorkBuddy。
 ///
+/// `close_running_cli`：账号页确认后的跨站切换会关闭正在运行的 CLI；
+/// 自动轮换不传，保持「下次会话生效」。
+///
 /// async + spawn_blocking：切换会用登录 shell 定位 node 并执行 apiKeyHelper
 /// 校验账号（子进程无超时），同步 command 会阻塞主线程造成 UI 卡顿。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn switch_codebuddy_cli_account(account_id: String) -> Result<Value, String> {
+pub async fn switch_codebuddy_cli_account(
+    account_id: String,
+    close_running_cli: Option<bool>,
+) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::set_active_account(&account_id))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        codebuddy_cli::switch_active_account(&account_id, close_running_cli.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// GET /api/codebuddy-cn-ide/status —— CodeBuddy IDE 安装/运行/当前账号。
@@ -142,6 +150,35 @@ pub async fn switch_codebuddy_cn_ide_account(
 #[tauri::command]
 pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(codebuddy_cn_ide::detect_current_account)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn get_codebuddy_ide_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide::status)
+        .await
+        .map_err(|error| format!("查询 CodeBuddy IDE 状态失败: {error}"))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn switch_codebuddy_ide_account(
+    account_id: String,
+    restart: Option<bool>,
+) -> Result<Value, String> {
+    if account_id.trim().is_empty() {
+        return Err("缺少 accountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        codebuddy_ide::switch_account(&account_id, restart.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn detect_codebuddy_ide_account() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(codebuddy_ide::detect_current_account)
         .await
         .map_err(|e| e.to_string())?
 }

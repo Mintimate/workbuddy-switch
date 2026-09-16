@@ -25,10 +25,10 @@ const AI_AUTH_FILE_NAME: &str = "workbuddy-desktop-ai.info";
 const CN_DATA_ROOT: &str = ".workbuddy";
 const AI_DATA_ROOT: &str = ".workbuddy-ai";
 
-const CN_WINDOWS_IMAGES: [&str; 2] = ["WorkBuddy", "CodeBuddy"];
+const CN_WINDOWS_IMAGES: [&str; 1] = ["WorkBuddy"];
 const AI_WINDOWS_IMAGES: [&str; 1] = ["WorkBuddyAI"];
 
-const CN_MACOS_APPS: [&str; 2] = ["WorkBuddy.app", "CodeBuddy.app"];
+const CN_MACOS_APPS: [&str; 1] = ["WorkBuddy.app"];
 const AI_MACOS_APPS: [&str; 1] = ["WorkBuddy AI.app"];
 const CN_MACOS_BUNDLE_ID: &str = "com.tencent.workbuddy.mac";
 const AI_MACOS_BUNDLE_ID: &str = "com.workbuddy.workbuddy-ai";
@@ -442,7 +442,7 @@ mod tests {
 
         assert_eq!(
             WbVariant::Cn.windows_image_names(),
-            ["WorkBuddy", "CodeBuddy"].as_slice()
+            ["WorkBuddy"].as_slice()
         );
         assert_eq!(
             WbVariant::Ai.windows_image_names(),
@@ -450,7 +450,7 @@ mod tests {
         );
         assert_eq!(
             WbVariant::Cn.macos_app_names(),
-            ["WorkBuddy.app", "CodeBuddy.app"].as_slice()
+            ["WorkBuddy.app"].as_slice()
         );
         assert_eq!(
             WbVariant::Ai.macos_app_names(),

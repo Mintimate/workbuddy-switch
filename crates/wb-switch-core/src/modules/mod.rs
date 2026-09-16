@@ -3,6 +3,7 @@ pub mod auth_file;
 pub mod checkin;
 pub mod codebuddy_cli;
 pub mod codebuddy_cn_ide;
+pub mod codebuddy_ide;
 pub mod config;
 pub mod credit_usage;
 pub mod credits;

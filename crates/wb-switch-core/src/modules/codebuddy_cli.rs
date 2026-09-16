@@ -7,9 +7,12 @@
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 use crate::modules::account;
 use crate::modules::config::{atomic_write, home_dir, now_ms};
+use crate::modules::process;
+use crate::modules::variant::WbVariant;
 
 const ROTATE_DIR: &str = ".codebuddy-rotate";
 const STATE_FILE: &str = "state.json";
@@ -22,6 +25,25 @@ const LEGACY_WINDOWS_HELPER_FILE: &str = "helper.cmd";
 const SETTINGS_DIR: &str = ".codebuddy";
 const SETTINGS_FILE: &str = "settings.json";
 const CODEBUDDY_AUTH_TOKEN: &str = "CODEBUDDY_AUTH_TOKEN";
+const CODEBUDDY_INTERNET_ENVIRONMENT: &str = "CODEBUDDY_INTERNET_ENVIRONMENT";
+const CODEBUDDY_BASE_URL: &str = "CODEBUDDY_BASE_URL";
+const CN_INTERNET_ENVIRONMENT: &str = "internal";
+/// 官网 IAM：国际版「不设，或 public」。必须写成明确值，不能只删 key：
+/// CLI 启动会把 local_storage 里的 Environment-Cache 写进 process.env，
+/// settings.json 缺省时就会继续走国内站。
+const AI_INTERNET_ENVIRONMENT: &str = "public";
+const CN_CLI_ENDPOINT: &str = "https://copilot.tencent.com";
+const AI_CLI_ENDPOINT: &str = "https://www.codebuddy.ai";
+/// CLI `resolveModelBaseURL`：若设置了 `CODEBUDDY_BASE_URL`，会原样当作 OpenAI
+/// client `baseURL`，**不会**再拼 `/v2`。写成门户根地址
+/// `https://www.codebuddy.ai` 会 POST `/chat/completions` 到官网 nginx，返回
+/// `405 Not Allowed`（nginx/1.27.3）。国际版 OpenAI 兼容接口是 `${endpoint}/v2`。
+const AI_CLI_OPENAI_BASE_URL: &str = "https://www.codebuddy.ai/v2";
+/// CodeBuddy CLI ProductManager 写入 `~/.codebuddy/local_storage/entry_<md5(key)>.info`
+/// 的固定 key。切换档位时必须改这两份缓存，否则 settings.json 改了 CLI 仍打国内站。
+const CLI_ENV_CACHE_KEY: &str = "CodeBuddy-Environment-Cache";
+const CLI_ENDPOINT_CACHE_KEY: &str = "CodeBuddy-Endpoint-Cache";
+const CLI_PRODUCT_CACHE_KEY: &str = "CodeBuddy-Product-Cache";
 const STANDARD_HELPER: &str = include_str!("../../../../scripts/codebuddy-cli-helper.cjs");
 
 fn rotate_dir() -> PathBuf {
@@ -59,6 +81,13 @@ fn process_env_token_present() -> bool {
         .is_some_and(|token| !token.to_string_lossy().trim().is_empty())
 }
 
+fn process_internet_environment() -> Option<String> {
+    std::env::var(CODEBUDDY_INTERNET_ENVIRONMENT)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn ensure_no_process_env_override() -> Result<(), String> {
     if process_env_token_present() {
         return Err(auth_config_error(
@@ -69,14 +98,304 @@ fn ensure_no_process_env_override() -> Result<(), String> {
     Ok(())
 }
 
-fn write_settings_env_token(value: &mut Value, token: &str) -> Result<(), String> {
+fn ensure_region_env_compatible(variant: WbVariant) -> Result<(), String> {
+    let Some(value) = process_internet_environment() else {
+        return Ok(());
+    };
+    let is_cn_env = value.eq_ignore_ascii_case(CN_INTERNET_ENVIRONMENT)
+        || value.eq_ignore_ascii_case("ioa");
+    let is_ai_env = value.eq_ignore_ascii_case(AI_INTERNET_ENVIRONMENT)
+        || value.eq_ignore_ascii_case("external");
+    let conflict = match variant {
+        WbVariant::Cn => !is_cn_env,
+        WbVariant::Ai => is_cn_env || !(is_ai_env || value.is_empty()),
+    };
+    if conflict {
+        return Err(auth_config_error(
+            "环境阶段",
+            "检测到进程环境变量 CODEBUDDY_INTERNET_ENVIRONMENT 与所选账号档位冲突；它会覆盖 settings.json，请先删除该用户或系统环境变量并重启应用与 CodeBuddy CLI",
+        ));
+    }
+    Ok(())
+}
+
+fn env_object_mut(value: &mut Value) -> Result<&mut serde_json::Map<String, Value>, String> {
     let object = value
         .as_object_mut()
         .ok_or_else(|| "CodeBuddy settings.json 顶层不是对象".to_string())?;
     let env = object.entry("env").or_insert_with(|| json!({}));
-    let env = env
-        .as_object_mut()
-        .ok_or_else(|| "CodeBuddy settings.json 的 env 字段不是对象".to_string())?;
+    env.as_object_mut()
+        .ok_or_else(|| "CodeBuddy settings.json 的 env 字段不是对象".to_string())
+}
+
+fn apply_cli_region_env(value: &mut Value, variant: WbVariant) -> Result<(), String> {
+    let env = env_object_mut(value)?;
+    match variant {
+        WbVariant::Cn => {
+            env.insert(
+                CODEBUDDY_INTERNET_ENVIRONMENT.to_string(),
+                json!(CN_INTERNET_ENVIRONMENT),
+            );
+            env.remove(CODEBUDDY_BASE_URL);
+        }
+        WbVariant::Ai => {
+            env.insert(
+                CODEBUDDY_INTERNET_ENVIRONMENT.to_string(),
+                json!(AI_INTERNET_ENVIRONMENT),
+            );
+            env.insert(
+                CODEBUDDY_BASE_URL.to_string(),
+                json!(AI_CLI_OPENAI_BASE_URL),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cli_local_storage_dir_for_settings(settings: &Path) -> PathBuf {
+    settings
+        .parent()
+        .unwrap_or(settings)
+        .join("local_storage")
+}
+
+fn cli_cache_filename(key: &str) -> &'static str {
+    match key {
+        CLI_ENV_CACHE_KEY => "entry_3bab4ce61838088127d444e4cc042d6d.info",
+        CLI_ENDPOINT_CACHE_KEY => "entry_933d5543e80177622c17a73869c0fad7.info",
+        CLI_PRODUCT_CACHE_KEY => "entry_604f48c944053e01d9546675443286c1.info",
+        _ => "entry_unknown.info",
+    }
+}
+
+fn write_cli_json_string_cache(path: &Path, value: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| {
+            auth_config_error("配置阶段", "无法创建 CodeBuddy CLI 缓存目录，请检查用户目录权限")
+        })?;
+    }
+    let content = serde_json::to_string(&json!(value)).map_err(|_| {
+        auth_config_error("配置阶段", "无法生成 CodeBuddy CLI 缓存")
+    })?;
+    atomic_write(path, &content).map_err(|_| {
+        auth_config_error("配置阶段", "无法写入 CodeBuddy CLI 缓存，请检查文件权限")
+    })
+}
+
+fn sync_cli_runtime_cache_at(storage_dir: &Path, variant: WbVariant) -> Result<(), String> {
+    let env_path = storage_dir.join(cli_cache_filename(CLI_ENV_CACHE_KEY));
+    let endpoint_path = storage_dir.join(cli_cache_filename(CLI_ENDPOINT_CACHE_KEY));
+    let product_path = storage_dir.join(cli_cache_filename(CLI_PRODUCT_CACHE_KEY));
+    // 产品包缓存按环境选 product.internal.json / product.json；切档位必须丢掉。
+    let _ = std::fs::remove_file(&product_path);
+    match variant {
+        WbVariant::Cn => {
+            write_cli_json_string_cache(&env_path, CN_INTERNET_ENVIRONMENT)?;
+            write_cli_json_string_cache(&endpoint_path, CN_CLI_ENDPOINT)?;
+        }
+        WbVariant::Ai => {
+            write_cli_json_string_cache(&env_path, AI_INTERNET_ENVIRONMENT)?;
+            write_cli_json_string_cache(&endpoint_path, AI_CLI_ENDPOINT)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_cli_runtime_cache(settings: &Path, variant: WbVariant) -> Result<(), String> {
+    sync_cli_runtime_cache_at(&cli_local_storage_dir_for_settings(settings), variant)
+}
+
+/// 只认 CodeBuddy CLI / prewarm 的包路径，排除 IDE（`.app` / `Programs\CodeBuddy`）
+/// 和本工具。禁止用 `codebuddy` 单字去匹配。
+fn is_codebuddy_cli_process_args(args: &str) -> bool {
+    let lower = args.to_ascii_lowercase();
+    if lower.contains("wb-switch") || lower.contains("workbuddy-switch") {
+        return false;
+    }
+    if lower.contains(".app/contents/") {
+        return false;
+    }
+    if lower.contains("codebuddy cn") || lower.contains("codebuddycn") {
+        return false;
+    }
+    if lower.contains("\\programs\\codebuddy\\") || lower.contains("/programs/codebuddy/") {
+        return false;
+    }
+    lower.contains("@tencent-ai/codebuddy-code")
+        || lower.contains("codebuddy-code/dist-server")
+        || lower.contains("codebuddy-code\\dist-server")
+        || lower.contains("codebuddy-code/bin/")
+        || lower.contains("codebuddy-code\\bin\\")
+        || lower.contains("/bin/codebuddy")
+        || lower.contains("\\bin\\codebuddy")
+        || lower.contains("codebuddy.cmd")
+        || lower.contains("cbc-prewarm")
+}
+
+fn current_cli_variant(accounts: &[Value], state: &Value) -> Option<WbVariant> {
+    let active = if cfg!(windows) {
+        read_json_file(&settings_path())
+            .as_ref()
+            .and_then(settings_env_token)
+            .and_then(|token| account_index_by_token(accounts, token))
+    } else {
+        state_account_index(state, accounts)
+    }?;
+    accounts.get(active.0).map(WbVariant::from_account)
+}
+
+fn list_codebuddy_cli_pids() -> Vec<u32> {
+    let self_pid = std::process::id();
+    #[cfg(target_os = "macos")]
+    {
+        let patterns = [
+            "@tencent-ai/codebuddy-code".to_string(),
+            "cbc-prewarm".to_string(),
+            "/bin/codebuddy".to_string(),
+        ];
+        return process::macos_rows_by_patterns(&patterns)
+            .into_iter()
+            .filter(|(pid, args)| *pid != self_pid && is_codebuddy_cli_process_args(args))
+            .map(|(pid, _)| pid)
+            .collect();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | \
+             Where-Object { \
+               $_.CommandLine -and ( \
+                 $_.CommandLine -like '*@tencent-ai/codebuddy-code*' -or \
+                 $_.CommandLine -like '*codebuddy-code*dist-server*' -or \
+                 $_.CommandLine -like '*\\bin\\codebuddy*' -or \
+                 $_.CommandLine -like '*cbc-prewarm*' -or \
+                 $_.CommandLine -like '*codebuddy.cmd*' \
+               ) \
+             } | ForEach-Object { $_.ProcessId }";
+        let Some(stdout) = process::ps_output(script, 5) else {
+            return Vec::new();
+        };
+        return stdout
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|pid| *pid != self_pid)
+            .collect();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let mut pids = Vec::new();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return pids;
+        };
+        for entry in entries.flatten() {
+            let pid: u32 = match entry.file_name().to_string_lossy().parse() {
+                Ok(pid) => pid,
+                Err(_) => continue,
+            };
+            if pid == self_pid {
+                continue;
+            }
+            let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    String::from_utf8_lossy(&bytes).replace('\0', " ")
+                }
+                _ => continue,
+            };
+            if is_codebuddy_cli_process_args(&cmdline) {
+                pids.push(pid);
+            }
+        }
+        return pids;
+    }
+}
+
+fn terminate_codebuddy_cli_pids(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let owned: Vec<String> = std::iter::once("-15".to_string())
+            .chain(pids.iter().map(u32::to_string))
+            .collect();
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let _ = process::run_cmd_timeout("kill", &args, 10);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        process::kill_macos_pids(pids);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for pid in pids {
+            let pid_s = pid.to_string();
+            let _ = process::run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T"], 10);
+        }
+        let remaining = process::wait_windows_pids_gone(pids, Duration::from_secs(3));
+        for pid in remaining {
+            let pid_s = pid.to_string();
+            let _ = process::run_cmd_timeout("taskkill", &["/PID", &pid_s, "/T", "/F"], 10);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let term: Vec<String> = std::iter::once("-15".to_string())
+            .chain(pids.iter().map(u32::to_string))
+            .collect();
+        let args: Vec<&str> = term.iter().map(String::as_str).collect();
+        let _ = process::run_cmd_timeout("kill", &args, 10);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive: Vec<u32> = pids
+                .iter()
+                .copied()
+                .filter(|pid| Path::new(&format!("/proc/{pid}")).exists())
+                .collect();
+            if alive.is_empty() || Instant::now() >= deadline {
+                if !alive.is_empty() {
+                    let kill: Vec<String> = std::iter::once("-9".to_string())
+                        .chain(alive.iter().map(u32::to_string))
+                        .collect();
+                    let args: Vec<&str> = kill.iter().map(String::as_str).collect();
+                    let _ = process::run_cmd_timeout("kill", &args, 10);
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+fn close_running_codebuddy_cli() -> (bool, usize) {
+    let pids = list_codebuddy_cli_pids();
+    if pids.is_empty() {
+        return (false, 0);
+    }
+    terminate_codebuddy_cli_pids(&pids);
+    (true, pids.len())
+}
+
+fn region_switch_message(
+    variant: WbVariant,
+    closed: bool,
+    closed_count: usize,
+) -> String {
+    let region = if variant == WbVariant::Ai {
+        "国际版"
+    } else {
+        "国内版"
+    };
+    if closed {
+        format!(
+            "已切换到{region}并关闭正在运行的 CodeBuddy CLI（{closed_count} 个进程）。请重新打开 CLI 后再发会话"
+        )
+    } else {
+        format!("已切换到{region}。未发现正在运行的 CodeBuddy CLI，新开会话即可")
+    }
+}
+
+fn write_settings_env_token(value: &mut Value, token: &str) -> Result<(), String> {
+    let env = env_object_mut(value)?;
     env.insert(CODEBUDDY_AUTH_TOKEN.to_string(), json!(token));
     Ok(())
 }
@@ -119,6 +438,7 @@ fn validate_persisted_env_token_at(settings: &PathBuf, expected_token: &str) -> 
 fn prepare_settings_env_update(
     settings: &PathBuf,
     token: &str,
+    variant: WbVariant,
 ) -> Result<(Option<String>, Value), String> {
     let previous = std::fs::read_to_string(settings).ok();
     let mut value = previous
@@ -128,7 +448,29 @@ fn prepare_settings_env_update(
         .map_err(|_| "CodeBuddy settings.json 不是有效 JSON")?
         .unwrap_or_else(|| json!({}));
     write_settings_env_token(&mut value, clean_bearer_token(token))?;
+    apply_cli_region_env(&mut value, variant)?;
     Ok((previous, value))
+}
+
+fn persist_cli_region_env(variant: WbVariant) -> Result<(), String> {
+    let settings = settings_path();
+    let previous = std::fs::read_to_string(&settings).ok();
+    let mut value = previous
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| "CodeBuddy settings.json 不是有效 JSON")?
+        .unwrap_or_else(|| json!({}));
+    apply_cli_region_env(&mut value, variant)?;
+    persist_settings_at(&settings, &value).map_err(|error| {
+        restore_file(&settings, previous.as_deref());
+        error
+    })?;
+    if let Err(error) = sync_cli_runtime_cache(&settings, variant) {
+        restore_file(&settings, previous.as_deref());
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn commit_settings_env_update(
@@ -136,9 +478,11 @@ fn commit_settings_env_update(
     previous: Option<&str>,
     value: &Value,
     expected_token: &str,
+    variant: WbVariant,
 ) -> Result<(), String> {
     if let Err(error) = persist_settings_at(settings, value)
         .and_then(|_| validate_persisted_env_token_at(settings, expected_token))
+        .and_then(|_| sync_cli_runtime_cache(settings, variant))
     {
         restore_file(settings, previous);
         return Err(error);
@@ -645,8 +989,18 @@ pub fn sync_windows_env_for_account(
     if already_synced {
         return Ok(true);
     }
-    let (previous, value) = prepare_settings_env_update(&settings, updated_token)?;
-    commit_settings_env_update(&settings, previous.as_deref(), &value, updated_token)?;
+    let (previous, value) = prepare_settings_env_update(
+        &settings,
+        updated_token,
+        WbVariant::from_account(account_value),
+    )?;
+    commit_settings_env_update(
+        &settings,
+        previous.as_deref(),
+        &value,
+        updated_token,
+        WbVariant::from_account(account_value),
+    )?;
     Ok(true)
 }
 
@@ -686,7 +1040,8 @@ pub fn status() -> Value {
         "helperSupportsAccountIds": helper_supports_account_ids(),
         "activeIndex": active.as_ref().map(|(index, _)| *index),
         "activeAccountId": active.as_ref().map(|(_, id)| id),
-        "activeAccountName": active.and_then(|(_, id)| account::find_account(&id).map(|account| account::account_display_name(&account))),
+        "activeAccountName": active.as_ref().and_then(|(_, id)| account::find_account(id).map(|account| account::account_display_name(&account))),
+        "activeAccountVariant": active.as_ref().and_then(|(index, _)| accounts.get(*index)).map(WbVariant::from_account).map(WbVariant::as_str),
         "accountCount": accounts.len(),
         "statePath": state_path().to_string_lossy(),
     })
@@ -703,13 +1058,16 @@ fn install_env_auth() -> Result<Value, String> {
         .ok_or_else(|| {
             auth_config_error("账号阶段", "当前没有可供 CodeBuddy CLI 使用的账号")
         })?;
+    ensure_region_env_compatible(WbVariant::from_account(active))?;
     let token = settings_account_token(active)?;
-    let (previous_settings, settings_value) = prepare_settings_env_update(&settings, token)?;
+    let (previous_settings, settings_value) =
+        prepare_settings_env_update(&settings, token, WbVariant::from_account(active))?;
     commit_settings_env_update(
         &settings,
         previous_settings.as_deref(),
         &settings_value,
         token,
+        WbVariant::from_account(active),
     )?;
 
     Ok(json!({
@@ -820,20 +1178,28 @@ pub fn install_helper() -> Result<Value, String> {
 
     let accounts = account::load_accounts();
     let state = load_state();
-    let active = state_account_index(&state, &accounts)
-        .and_then(|(index, _)| accounts.get(index))
+    let active_account = state_account_index(&state, &accounts)
+        .and_then(|(index, _)| accounts.get(index));
+    let variant = active_account.map(WbVariant::from_account);
+    let validation = active_account
         .ok_or_else(|| {
             helper_validation_error(
                 "账号阶段",
                 "当前没有可供 helper 验证的账号，请先添加账号",
             )
-        });
-    let validation =
-        active.and_then(|account| validate_helper_for_account(&configured_command, account));
+        })
+        .and_then(|account| validate_helper_for_account(&configured_command, account));
     if let Err(error) = validation {
         restore_file(&settings, previous_settings.as_deref());
         restore_file(&logic_target, previous_logic.as_deref());
         return Err(error);
+    }
+    if let Some(variant) = variant {
+        if let Err(error) = persist_cli_region_env(variant) {
+            restore_file(&settings, previous_settings.as_deref());
+            restore_file(&logic_target, previous_logic.as_deref());
+            return Err(error);
+        }
     }
 
     // 验证通过后再清理旧版 helper.sh，避免失败时破坏旧配置。
@@ -856,7 +1222,17 @@ pub fn install_helper() -> Result<Value, String> {
 }
 
 /// 将 CodeBuddy CLI 的当前账号设置为 WorkBuddy 账号库中的目标账号。
+/// 自动轮换走这条路径，不关闭正在运行的 CLI。
 pub fn set_active_account(account_id: &str) -> Result<Value, String> {
+    switch_active_account(account_id, false)
+}
+
+/// 账号页手动切 CLI。`close_running_cli` 为 true 且发生国内/国际跨站时，
+/// 关闭正在运行的 CLI 进程，避免旧进程把国内站缓存写回去。
+pub fn switch_active_account(
+    account_id: &str,
+    close_running_cli: bool,
+) -> Result<Value, String> {
     if cfg!(windows) {
         ensure_no_process_env_override()?;
     }
@@ -877,13 +1253,15 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
     let Some((index, canonical_id)) = account_index(&accounts, account_id) else {
         return Err("账号不存在".to_string());
     };
+    let variant = WbVariant::from_account(&accounts[index]);
+    ensure_region_env_compatible(variant)?;
 
     // Windows 先验证并生成完整 settings，再写独立账号状态，避免无效 JSON、
     // 缺失 token 等前置错误造成只有 state.json 被修改的半成功。
     let windows_settings = if cfg!(windows) {
         let settings = settings_path();
         let token = settings_account_token(&accounts[index])?;
-        let (previous, value) = prepare_settings_env_update(&settings, token)?;
+        let (previous, value) = prepare_settings_env_update(&settings, token, variant)?;
         Some((settings, previous, value, token.to_string()))
     } else {
         None
@@ -891,6 +1269,7 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
 
     let previous_state = std::fs::read_to_string(state_path()).ok();
     let mut state = load_state();
+    let previous_variant = current_cli_variant(&accounts, &state);
     state["active"] = json!(index);
     state["activeAccountId"] = json!(canonical_id);
     state["updatedAt"] = json!(now_ms());
@@ -916,6 +1295,7 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
             previous_settings.as_deref(),
             &settings_value,
             &token,
+            variant,
         ) {
             restore_file(&state_path(), previous_state.as_deref());
             return Err(error);
@@ -928,7 +1308,27 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
             restore_file(&state_path(), previous_state.as_deref());
             return Err(error);
         }
+        if let Err(error) = persist_cli_region_env(variant) {
+            restore_file(&state_path(), previous_state.as_deref());
+            return Err(error);
+        }
     }
+
+    let region_changed = previous_variant != Some(variant);
+    let (cli_closed, closed_count) = if close_running_cli && region_changed {
+        close_running_codebuddy_cli()
+    } else {
+        (false, 0)
+    };
+    let message = if region_changed && close_running_cli {
+        region_switch_message(variant, cli_closed, closed_count)
+    } else if region_changed {
+        "CodeBuddy CLI 默认账号与站点已更新；当前运行会话不会切换，重新加载会话或重启 CLI 后生效"
+            .to_string()
+    } else {
+        "CodeBuddy CLI 默认账号已更新；当前运行会话不会切换，请重新加载会话或新开会话后生效"
+            .to_string()
+    };
 
     Ok(json!({
         "ok": true,
@@ -938,11 +1338,10 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
         "authMode": if cfg!(windows) { "settings-env" } else { "api-key-helper" },
         "activeIndex": index,
         "activeAccountId": canonical_id,
-        "message": if cfg!(windows) {
-            "CodeBuddy CLI 默认账号已更新；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效"
-        } else {
-            "CodeBuddy CLI 默认账号已更新；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效"
-        },
+        "regionChanged": region_changed,
+        "cliClosed": cli_closed,
+        "closedProcessCount": closed_count,
+        "message": message,
     }))
 }
 
@@ -1035,15 +1434,127 @@ mod tests {
         .unwrap();
 
         let (previous, value) =
-            prepare_settings_env_update(&settings, "Bearer RAW_SECRET").unwrap();
-        commit_settings_env_update(&settings, previous.as_deref(), &value, "RAW_SECRET").unwrap();
+            prepare_settings_env_update(&settings, "Bearer RAW_SECRET", WbVariant::Cn).unwrap();
+        commit_settings_env_update(
+            &settings,
+            previous.as_deref(),
+            &value,
+            "RAW_SECRET",
+            WbVariant::Cn,
+        )
+        .unwrap();
 
         let persisted = read_json_file(&settings).unwrap();
         assert_eq!(settings_env_token(&persisted), Some("RAW_SECRET"));
         assert_eq!(persisted["apiKeyHelper"], "C:/Users/tester/bin/wb-helper.bat");
         assert_eq!(persisted["trustedDirectories"][0], "C:/Users/tester");
         assert_eq!(persisted["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
+        assert_eq!(
+            persisted["env"][CODEBUDDY_INTERNET_ENVIRONMENT],
+            CN_INTERNET_ENVIRONMENT
+        );
         fs::remove_dir_all(test_dir).unwrap();
+    }
+
+    #[test]
+    fn codebuddy_cli_process_args_match_package_and_skip_ide() {
+        assert!(is_codebuddy_cli_process_args(
+            "node /Users/me/.nvm/versions/node/v22.20.0/lib/node_modules/@tencent-ai/codebuddy-code/dist-server/codebuddy.js"
+        ));
+        assert!(is_codebuddy_cli_process_args(
+            "node C:\\Users\\me\\AppData\\Roaming\\npm\\node_modules\\@tencent-ai\\codebuddy-code\\bin\\codebuddy"
+        ));
+        assert!(is_codebuddy_cli_process_args(
+            "/Users/me/.nvm/versions/node/v22.20.0/lib/node_modules/@tencent-ai/codebuddy-code/bin/cbc-prewarm"
+        ));
+        assert!(is_codebuddy_cli_process_args(
+            "node /Users/me/.nvm/versions/node/v22.20.0/bin/codebuddy --acp"
+        ));
+        assert!(!is_codebuddy_cli_process_args(
+            "/Applications/CodeBuddy.app/Contents/MacOS/CodeBuddy"
+        ));
+        assert!(!is_codebuddy_cli_process_args(
+            "/Applications/CodeBuddy CN.app/Contents/MacOS/CodeBuddy CN"
+        ));
+        assert!(!is_codebuddy_cli_process_args(
+            r"C:\Users\me\AppData\Local\Programs\CodeBuddy\CodeBuddy.exe"
+        ));
+        assert!(!is_codebuddy_cli_process_args(
+            "node /Users/me/Documents/github-project/wb-switch/src-tauri"
+        ));
+    }
+
+    #[test]
+    fn apply_cli_region_env_writes_internal_for_cn_and_public_for_ai() {
+        let mut settings = json!({
+            "env": {
+                "HTTPS_PROXY": "http://127.0.0.1:7890",
+                CODEBUDDY_INTERNET_ENVIRONMENT: "internal",
+                CODEBUDDY_BASE_URL: AI_CLI_ENDPOINT
+            }
+        });
+        apply_cli_region_env(&mut settings, WbVariant::Ai).unwrap();
+        assert_eq!(
+            settings["env"][CODEBUDDY_INTERNET_ENVIRONMENT],
+            AI_INTERNET_ENVIRONMENT
+        );
+        assert_eq!(
+            settings["env"][CODEBUDDY_BASE_URL],
+            AI_CLI_OPENAI_BASE_URL
+        );
+        assert_eq!(settings["env"]["HTTPS_PROXY"], "http://127.0.0.1:7890");
+        apply_cli_region_env(&mut settings, WbVariant::Cn).unwrap();
+        assert_eq!(
+            settings["env"][CODEBUDDY_INTERNET_ENVIRONMENT],
+            CN_INTERNET_ENVIRONMENT
+        );
+        assert!(settings["env"].get(CODEBUDDY_BASE_URL).is_none());
+    }
+
+    #[test]
+    fn apply_cli_region_env_replaces_portal_root_base_url_with_openai_v2() {
+        let mut settings = json!({
+            "env": { CODEBUDDY_BASE_URL: "https://www.codebuddy.ai" }
+        });
+        apply_cli_region_env(&mut settings, WbVariant::Ai).unwrap();
+        assert_eq!(
+            settings["env"][CODEBUDDY_BASE_URL],
+            "https://www.codebuddy.ai/v2"
+        );
+    }
+
+    #[test]
+    fn sync_cli_runtime_cache_rewrites_endpoint_and_drops_internal_env_for_ai() {
+        let dir = helper_test_dir().join("local_storage");
+        fs::create_dir_all(&dir).unwrap();
+        let env_path = dir.join(cli_cache_filename(CLI_ENV_CACHE_KEY));
+        let endpoint_path = dir.join(cli_cache_filename(CLI_ENDPOINT_CACHE_KEY));
+        let product_path = dir.join(cli_cache_filename(CLI_PRODUCT_CACHE_KEY));
+        fs::write(&env_path, "\"internal\"").unwrap();
+        fs::write(&endpoint_path, "\"https://copilot.tencent.com\"").unwrap();
+        fs::write(&product_path, "gzip-placeholder").unwrap();
+
+        sync_cli_runtime_cache_at(&dir, WbVariant::Ai).unwrap();
+        assert!(!product_path.exists());
+        assert_eq!(
+            fs::read_to_string(&env_path).unwrap(),
+            serde_json::to_string(&json!(AI_INTERNET_ENVIRONMENT)).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&endpoint_path).unwrap(),
+            serde_json::to_string(&json!(AI_CLI_ENDPOINT)).unwrap()
+        );
+
+        sync_cli_runtime_cache_at(&dir, WbVariant::Cn).unwrap();
+        assert_eq!(
+            fs::read_to_string(&env_path).unwrap(),
+            serde_json::to_string(&json!(CN_INTERNET_ENVIRONMENT)).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(&endpoint_path).unwrap(),
+            serde_json::to_string(&json!(CN_CLI_ENDPOINT)).unwrap()
+        );
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -1073,7 +1584,7 @@ mod tests {
         fs::create_dir_all(&test_dir).unwrap();
         fs::write(&settings, "not-json SECRET_ON_DISK").unwrap();
 
-        let error = prepare_settings_env_update(&settings, "NEW_SECRET").unwrap_err();
+        let error = prepare_settings_env_update(&settings, "NEW_SECRET", WbVariant::Cn).unwrap_err();
         assert!(error.contains("不是有效 JSON"));
         assert!(!error.contains("NEW_SECRET"));
         assert!(!error.contains("SECRET_ON_DISK"));

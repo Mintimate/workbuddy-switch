@@ -94,6 +94,8 @@ struct RequestRow {
     session_id: String,
     title: Option<String>,
     usage: Usage,
+    /// 思考过程 token 数（`output` 的子集），仅用于拆分「思考 / 回复」。
+    thinking: u64,
 }
 
 impl RequestRow {
@@ -108,6 +110,12 @@ impl RequestRow {
             "output": self.usage.output,
             "cacheRead": self.usage.read,
             "cacheWrite": self.usage.write,
+            // 与 `Totals::value()` 同一口径：input 已含 cacheRead，
+            // 未命中部分即两者之差，下溢时饱和为 0。
+            "uncachedInput": self.usage.input.saturating_sub(self.usage.read),
+            // 回复内容 = max(0, output - thinking) 由前端做，这里只给原始计数；
+            // 实测存在 thinking > output 的异常记录，故前端必须饱和减。
+            "thinking": self.thinking,
             "total": usage_total(self.usage),
         })
     }
@@ -277,6 +285,29 @@ fn model(value: &Value) -> String {
         .filter(|model| !model.is_empty())
         .unwrap_or("未知模型")
         .to_string()
+}
+
+/// 思考过程 token 数：优先 `providerData.rawUsage.completion_thinking_tokens`，
+/// 回退到 OpenAI 形状的 `completion_tokens_details.reasoning_tokens`，都没有则为 0。
+///
+/// 只读取计数字段：`providerData.reasoning` 是思考**正文**，属隐私红线，
+/// 任何情况下都不得读取或返回。
+fn thinking(value: &Value) -> u64 {
+    let Some(raw_usage) = value
+        .get("providerData")
+        .and_then(|data| data.get("rawUsage"))
+        .and_then(Value::as_object)
+    else {
+        return 0;
+    };
+    field(raw_usage, &["completion_thinking_tokens"])
+        .or_else(|| {
+            raw_usage
+                .get("completion_tokens_details")
+                .and_then(Value::as_object)
+                .and_then(|details| field(details, &["reasoning_tokens"]))
+        })
+        .unwrap_or(0)
 }
 
 fn files(root: &Path, output: &mut Vec<PathBuf>) {
@@ -629,6 +660,7 @@ fn source_from_roots(roots: &[PathBuf], name: &str, cutoff: Option<i64>, detail:
                         session_id: session_id.clone(),
                         title: None,
                         usage,
+                        thinking: thinking(&value),
                     });
                 }
             }
@@ -1386,11 +1418,23 @@ mod tests {
         assert_eq!(rows[0]["cacheRead"], 5);
         assert_eq!(rows[0]["cacheWrite"], 1);
         assert_eq!(rows[0]["total"], 13);
+        // 缓存未命中 = input - cacheRead，与 `summary` 同口径。
+        assert_eq!(rows[0]["uncachedInput"], 5);
+        // 无 providerData.rawUsage 时思考过程为 0。
+        assert_eq!(rows[0]["thinking"], 0);
         let row_total: u64 = rows
             .iter()
             .map(|row| row["total"].as_u64().unwrap_or(0))
             .sum();
         assert_eq!(row_total, result["summary"]["total"].as_u64().unwrap_or(0));
+        let row_uncached: u64 = rows
+            .iter()
+            .map(|row| row["uncachedInput"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(
+            row_uncached,
+            result["summary"]["uncachedInput"].as_u64().unwrap_or(0)
+        );
 
         fs::remove_dir_all(root).expect("remove fixture");
     }
@@ -1409,6 +1453,7 @@ mod tests {
                 read: 0,
                 write: 0,
             },
+            thinking: 0,
         };
 
         // 触达内存硬上限后只保留最新窗口，且按时间倒序。
@@ -1459,6 +1504,7 @@ mod tests {
                 read: 0,
                 write: 0,
             },
+            thinking: 0,
         };
 
         // 文件按 mtime 顺序处理、行内时间戳可以乱序：中途裁剪过之后，后到的
@@ -1607,6 +1653,126 @@ mod tests {
         let rows = result["requests"].as_array().expect("request rows");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["title"], "最新 AI 标题");
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_thinking_prefers_completion_thinking_tokens() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-thinking-priority-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": now,
+                    "message": { "usage": { "input_tokens": 10, "output_tokens": 40 } },
+                    // 两个来源同时存在时取扁平的 completion_thinking_tokens。
+                    "providerData": { "rawUsage": {
+                        "completion_thinking_tokens": 7,
+                        "completion_tokens_details": { "reasoning_tokens": 3 }
+                    }}
+                })
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "fixture", None, true);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["thinking"], 7);
+        assert_eq!(rows[0]["output"], 40);
+        // 思考过程只是 output 的拆分，不改变合计口径。
+        assert_eq!(rows[0]["total"], result["summary"]["total"]);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_thinking_falls_back_to_reasoning_tokens_and_defaults_to_zero() {
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-thinking-fallback-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": now,
+                    "message": { "usage": { "input_tokens": 11, "output_tokens": 21 } },
+                    // rawUsage 只有思考计数字段时取 OpenAI 形状的 reasoning_tokens。
+                    "providerData": { "rawUsage": {
+                        "completion_tokens_details": { "reasoning_tokens": 5 }
+                    }}
+                }),
+                json!({
+                    "timestamp": now - 1_000,
+                    "message": { "usage": { "input_tokens": 10, "output_tokens": 20 } },
+                    // rawUsage 缺少思考计数 -> 0；`reasoning` 是思考正文，
+                    // 只用来验证它不会被当成计数读取（隐私红线）。
+                    "providerData": {
+                        "reasoning": "思考正文不得进入明细",
+                        "rawUsage": { "prompt_cache_write_tokens": 1 }
+                    }
+                })
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "fixture", None, true);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["thinking"], 5);
+        assert_eq!(rows[1]["thinking"], 0);
+        assert_eq!(rows[1]["cacheWrite"], 1);
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn request_detail_thinking_over_output_saturates_reply_to_zero() {
+        // 实测存在 thinking > output 的异常记录：后端如实返回两个原始计数，
+        // 前端的 `output.saturating_sub(thinking)` 必须得到 0 而不是负数。
+        let now = crate::modules::config::now_ms();
+        let root = std::env::temp_dir().join(format!(
+            "wb-switch-token-stats-detail-thinking-overflow-{}-{now}",
+            std::process::id()
+        ));
+        let project = root.join("fixture-project");
+        fs::create_dir_all(&project).expect("create fixture dirs");
+        fs::write(
+            project.join("session.jsonl"),
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": now,
+                    "message": { "usage": { "input_tokens": 10, "output_tokens": 2 } },
+                    "providerData": { "rawUsage": { "completion_thinking_tokens": 9 } }
+                })
+            ),
+        )
+        .expect("write fixture");
+
+        let result = source(root.clone(), "fixture", None, true);
+        let rows = result["requests"].as_array().expect("request rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["output"], 2);
+        assert_eq!(rows[0]["thinking"], 9);
+        let reply = rows[0]["output"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_sub(rows[0]["thinking"].as_u64().unwrap_or(0));
+        assert_eq!(reply, 0);
 
         fs::remove_dir_all(root).expect("remove fixture");
     }

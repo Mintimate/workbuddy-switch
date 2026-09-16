@@ -22,6 +22,11 @@ export function variantAppName(variant: WbVariant): string {
   return variant === "ai" ? "WorkBuddy 国际版" : "WorkBuddy";
 }
 
+/** CodeBuddy IDE 的档位展示名（账号页档位标记 tooltip 用），与 WorkBuddy 命名保持一致。 */
+export function variantCodebuddyIdeName(variant: WbVariant): string {
+  return variant === "ai" ? "CodeBuddy IDE 国际版" : "CodeBuddy IDE";
+}
+
 /**
  * 档位对应的客户端下载域名（空状态提示用）。
  *
@@ -45,4 +50,9 @@ export function variantSupportsTravel(variant: WbVariant): boolean {
 /** 自动签到仅国内版开放；国际版签到接口未开放（后端已按 inactive 归类），不展示入口。 */
 export function variantSupportsCheckin(variant: WbVariant): boolean {
   return variant !== "ai";
+}
+
+/** 国际版 Tab 切 CodeBuddy.app；国内版 Tab 仍切 CodeBuddy CN。 */
+export function variantUsesIntlCodebuddyIde(variant: WbVariant): boolean {
+  return variant === "ai";
 }
