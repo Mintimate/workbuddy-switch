@@ -746,10 +746,22 @@ fn credit_result(account: &Value, resources: Vec<Value>, now: i64) -> Value {
     })
 }
 
+/// 是否走 summary/paid/free 三路新接口。
+///
+/// 三路只对国内版存在；国际版只用 `get-user-resource`（用户 2026-09-16 HAR
+/// 抓包证实），对它发三路等于 3×2 个 404，故按档位分派取数入口。
+fn uses_three_endpoint_query(variant: WbVariant) -> bool {
+    matches!(variant, WbVariant::Cn)
+}
+
 /// 查询单账号的积分资源及到期时间。
 pub async fn get_credit_expiry(account: &Value) -> Value {
-    let account_id = account.get("id").cloned().unwrap_or(Value::Null);
     let now = now_ms();
+
+    if !uses_three_endpoint_query(variant_of(account)) {
+        return fetch_legacy_credit(account, now).await;
+    }
+
     let responses = fetch_new_resource_responses(account).await;
     if let Some(resources) =
         normalized_new_resources(&responses.summary, &responses.paid, &responses.free, now)
@@ -774,8 +786,34 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
         fallback_account = refresh_account_token(fallback_account).await;
         response = fetch_legacy_user_resource(&fallback_account).await;
     }
-    if is_success(&response) && has_resource_accounts(&response) {
-        let resources = resource_accounts(&response)
+    legacy_credit_result(account, &response, now)
+}
+
+/// 单接口档位（国际版）的取数：旧接口自带完整鉴权链路。
+///
+/// 不能复用「三路已刷新账号」的前提——国际版不经过 `fetch_new_resource_responses`，
+/// 必须自己完成惰性刷新与 401 后最多一次的 token 刷新。
+async fn fetch_legacy_credit(account: &Value, now: i64) -> Value {
+    let config = load_checkin_config();
+    let mut working_account = ensure_fresh_token(account.clone(), &config).await;
+    let mut response = fetch_legacy_user_resource(&working_account).await;
+    if is_unauthorized(&response)
+        && !working_account
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
+    {
+        working_account = refresh_account_token(working_account).await;
+        response = fetch_legacy_user_resource(&working_account).await;
+    }
+    legacy_credit_result(account, &response, now)
+}
+
+/// 旧接口响应 → 积分结果：成功走正常投影，失败带可读错误。
+fn legacy_credit_result(account: &Value, response: &Value, now: i64) -> Value {
+    if is_success(response) && has_resource_accounts(response) {
+        let resources = resource_accounts(response)
             .into_iter()
             .map(|resource| resource_summary(resource, now))
             .collect();
@@ -783,9 +821,9 @@ pub async fn get_credit_expiry(account: &Value) -> Value {
     }
     json!({
         "ok": false,
-        "accountId": account_id,
+        "accountId": account.get("id").cloned().unwrap_or(Value::Null),
         "accountName": account_display_name(account),
-        "error": response_error(&response),
+        "error": response_error(response),
     })
 }
 
@@ -1398,5 +1436,13 @@ mod tests {
         assert_eq!(resource["expireAt"].as_i64(), Some(expected_cycle_end));
         assert_eq!(resource["expired"], false);
         assert_eq!(resource["expiringSoon"], false);
+    }
+
+    #[test]
+    fn three_endpoint_query_only_for_domestic_variant() {
+        // 国际版没有 summary/paid/free 三路（官网只用 get-user-resource），
+        // 发三路等于 3×2 个 404，故只对国内版启用。
+        assert!(uses_three_endpoint_query(WbVariant::Cn));
+        assert!(!uses_three_endpoint_query(WbVariant::Ai));
     }
 }
