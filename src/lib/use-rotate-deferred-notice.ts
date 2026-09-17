@@ -17,14 +17,24 @@ type RotateDeferredNotice = { title?: string; body?: string };
 export function useRotateDeferredNotice() {
   useEffect(() => {
     if (api.isWebui()) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void listen<RotateDeferredNotice>("rotate-deferred", (event) => {
       const body = event.payload?.body?.trim();
       if (!body) return;
       toast.warning("自动轮换已推迟", { description: body, duration: 10_000 });
     }).then((fn) => {
+      // StrictMode 开发态会「挂载 → 卸载 → 再挂载」：`listen` 的 Promise 在清理之后才
+      // resolve，不补这一步就会残留一个监听，同一事件弹两条 toast。
+      if (disposed) {
+        fn();
+        return;
+      }
       unlisten = fn;
     });
-    return () => unlisten?.();
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, []);
 }
