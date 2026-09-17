@@ -188,9 +188,9 @@ function travelChip(status: TravelStatus | undefined) {
   }
 }
 
-/** 「2h14m 后恢复」；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
-function formatRateLimitRemaining(resetAt: number): string {
-  const remainingMs = resetAt - Date.now();
+/** 倒计时：`2h14m 后恢复`；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
+function formatRateLimitRemaining(resetAt: number, now: number): string {
+  const remainingMs = resetAt - now;
   if (remainingMs <= 0) return "即将恢复";
   const totalMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
   const hours = Math.floor(totalMinutes / 60);
@@ -200,11 +200,23 @@ function formatRateLimitRemaining(resetAt: number): string {
   return `${minutes}m 后恢复`;
 }
 
+/** 恢复时刻：今天 `17:59`、明天 `明天 09:00`、更远 `9/18 09:00`。 */
+function formatRateLimitClock(resetAt: number, now: number): string {
+  const reset = new Date(resetAt);
+  const time = `${String(reset.getHours()).padStart(2, "0")}:${String(reset.getMinutes()).padStart(2, "0")}`;
+  const midnight = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const days = Math.round((midnight(reset) - midnight(new Date(now))) / 86_400_000);
+  if (days <= 0) return time;
+  if (days === 1) return `明天 ${time}`;
+  return `${reset.getMonth() + 1}/${reset.getDate()} ${time}`;
+}
+
 /**
  * 模型限额 chip：放在旅行图标旁。
  *
  * - 该账号当前没有受限模型 → 不渲染（AC1）；
- * - 悬停按恢复时间**升序**列出全部受限模型（最早的解锁时刻最有行动价值）；
+ * - 悬停按恢复时间**升序**列出全部受限模型（最早的解锁时刻最有行动价值），
+ *   每行是「模型 · 倒计时（恢复时刻）」——倒计时看还剩多久，括号里的时刻看具体什么时候；
  * - 受限模型数 >1 → 图标带数量角标（AC2.1）；
  * - `resetAt` 已过本地时钟的条目每秒被过滤掉，全部过期后图标自动消失，不依赖后端刷新；
  * - 归因失败的模型显示「未知模型」，不猜测。
@@ -215,13 +227,15 @@ function rateLimitChip(limits: RateLimitEntry[] | undefined, now: number) {
     .sort((left, right) => left.resetAt - right.resetAt);
   if (active.length === 0) return null;
   const lines = active.map(
-    (limit) => `${limit.model ?? "未知模型"} · ${formatRateLimitRemaining(limit.resetAt)}`,
+    (limit) =>
+      `${limit.model ?? "未知模型"} · ${formatRateLimitRemaining(limit.resetAt, now)}（${formatRateLimitClock(limit.resetAt, now)}）`,
   );
   return statusIconChip({
     icon: <Gauge className="size-3.5" />,
     label: `模型限额：${lines.join("；")}`,
+    // 多模型时会有多行，字号比全局 TooltipContent（text-xs）再小一号。
     tooltip: (
-      <span className="flex flex-col gap-0.5">
+      <span className="flex flex-col gap-0.5 text-[11px] leading-4">
         {lines.map((line) => (
           <span key={line}>{line}</span>
         ))}
