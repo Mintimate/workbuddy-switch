@@ -210,6 +210,8 @@ export default function AccountsPage() {
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
   const checkinAvailable = variantSupportsCheckin(variant);
+  /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
+  const refreshCreditsLabel = checkinAvailable ? "签到并刷新全部账号积分" : "刷新全部账号积分";
   const autoCheckinEnabled = autoCheckinConfig?.enabled ?? false;
   const autoTravelEnabled = autoTravelConfig?.enabled ?? false;
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
@@ -331,8 +333,9 @@ export default function AccountsPage() {
   }, [accounts.length, variant]);
 
   // 当前档位账号列表变化后并行查询各账号今日签到状态
+  // 国际版没有签到接口：不查询状态（后端也不发请求）。
   useEffect(() => {
-    if (!visibleAccounts.length) return;
+    if (!visibleAccounts.length || !checkinAvailable) return;
     let cancelled = false;
     void fetchTodayCheckinMap(
       visibleAccounts.map((account) => account.id),
@@ -345,7 +348,7 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [visibleAccounts]);
+  }, [visibleAccounts, checkinAvailable]);
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
@@ -571,53 +574,54 @@ export default function AccountsPage() {
   }
 
   /**
-   * 批量签到：逐个调用单账号签到（后端按账号自身档位取基址与路径），
-   * 只覆盖传入的账号，即当前档位的账号集合。
-   */
-  /**
-   * 当前档位的批量签到：后端一次调用完成（保留并发保护），国际版账号返回
-   * `inactive`（官方未开放签到活动）时不计成功也不计失败。
+   * 当前档位的批量签到：后端一次调用完成（保留并发保护），只处理支持签到的
+   * 账号；国际版没有签到接口，不参与批量签到。
    */
   async function runBatchCheckin() {
     const res = await api.checkinAll(variant);
     return res.accounts ?? [];
   }
 
-  /** 刷新按钮：先跑一轮当前档位的批量签到并重查今日签到状态，再强制刷新全部积分。 */
+  /**
+   * 刷新按钮：先跑一轮当前档位的批量签到并重查今日签到状态，再强制刷新全部积分。
+   * 国际版没有签到接口：跳过整块签到逻辑，只刷新积分。
+   */
   async function onRefreshCredits() {
     if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
     setCheckinAllRunning(true);
     const ids = visibleAccounts.map((account) => account.id);
     try {
-      try {
-        const entries = await runBatchCheckin();
-        const success = entries.filter((e) => e.result === "success").length;
-        const already = entries.filter((e) => e.result === "already").length;
-        const failed = entries.filter((e) => e.result === "error").length;
-        const inactive = entries.filter((e) => e.inactive === true || e.result === "inactive").length;
-        const parts: string[] = [];
-        if (success > 0) parts.push(`${success} 个签到成功`);
-        if (already > 0) parts.push(`${already} 个已签到`);
-        if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
-        if (failed > 0) parts.push(`${failed} 个失败`);
-        const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
-        const counted = success + already + failed;
-        if (failed > 0 && counted === failed) {
-          toast.error("签到失败", { description: summary });
-        } else if (counted === 0 && inactive > 0) {
-          // 全部是 inactive（官方未开放签到活动）：既不算成功也不算失败，
-          // 不得呈现为绿色成功（design D8）。
-          toast.info("签到未开放", { description: summary });
-        } else {
-          toast.success("签到完成", { description: summary });
+      if (checkinAvailable) {
+        try {
+          const entries = await runBatchCheckin();
+          const success = entries.filter((e) => e.result === "success").length;
+          const already = entries.filter((e) => e.result === "already").length;
+          const failed = entries.filter((e) => e.result === "error").length;
+          const inactive = entries.filter((e) => e.inactive === true || e.result === "inactive").length;
+          const parts: string[] = [];
+          if (success > 0) parts.push(`${success} 个签到成功`);
+          if (already > 0) parts.push(`${already} 个已签到`);
+          if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
+          if (failed > 0) parts.push(`${failed} 个失败`);
+          const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
+          const counted = success + already + failed;
+          if (failed > 0 && counted === failed) {
+            toast.error("签到失败", { description: summary });
+          } else if (counted === 0 && inactive > 0) {
+            // 全部是 inactive（官方未开放签到活动）：既不算成功也不算失败，
+            // 不得呈现为绿色成功（design D8）。
+            toast.info("签到未开放", { description: summary });
+          } else {
+            toast.success("签到完成", { description: summary });
+          }
+          // 批量签到后重查当前档位账号的今日签到状态，无需切换页面即反映最新结果
+          const next = await fetchTodayCheckinMap(ids);
+          if (Object.keys(next).length > 0) {
+            setCheckinMap((prev) => ({ ...prev, ...next }));
+          }
+        } catch (e) {
+          toast.error("批量签到失败", { description: api.asError(e) });
         }
-        // 批量签到后重查当前档位账号的今日签到状态，无需切换页面即反映最新结果
-        const next = await fetchTodayCheckinMap(ids);
-        if (Object.keys(next).length > 0) {
-          setCheckinMap((prev) => ({ ...prev, ...next }));
-        }
-      } catch (e) {
-        toast.error("批量签到失败", { description: api.asError(e) });
       }
       await refreshCredits(ids);
       if (travelAvailable) await loadTravelMap(ids);
@@ -1016,14 +1020,14 @@ export default function AccountsPage() {
                         className="size-9 rounded-lg"
                         disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
                         onClick={() => void onRefreshCredits()}
-                        aria-label="签到并刷新全部账号积分"
+                        aria-label={refreshCreditsLabel}
                       >
                         <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
                       </Button>
                     </DemoAction>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
+                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : refreshCreditsLabel}</TooltipContent>
               </Tooltip>
             </div>
           </TooltipProvider>
