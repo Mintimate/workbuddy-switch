@@ -3,19 +3,20 @@
 //!
 //! 数据流：hook 脚本 append payload（行级、O_APPEND）→ 本模块按**已读 offset** 逐行消费
 //! （只有完整行才处理，写到一半的行留到下一轮）→ 识别限额文案（`QUOTA_MARKERS`）并取官方
-//! 恢复时刻（`limits::parse_reset_at`）→ 归因（CLI：该会话进程启动时刻的生效账号；
-//! WorkBuddy：登录态文件 / 会话表）→ 入账（内存 + 落盘）→ 由宿主 emit
+//! 恢复时刻（`limits::parse_reset_at`）→ 归因（CLI：会话进程启动时刻不早于 `state.json`
+//! 写入时刻即当前账号；WorkBuddy：登录态文件 / 会话表）→ 入账（内存 + 落盘）→ 由宿主 emit
 //! `rate-limits-updated` 通知前端。
 //!
 //! 关键决定（实施时定的开放点）：
 //! - **消费方式**：记 offset + 到 1 MB 轮转（`rename` 后再读旧 inode 的增量），不裁剪写入方
 //!   正在追加的文件；轮转失败不动文件，宁可继续增长也不丢事件。
-//! - **CLI 归因**：key 是**进程级快照**（`switch_active_account` 只对新进程生效），所以
-//!   不能看事件时刻的 `state.json`；先取「该会话当前进程的启动时刻」（`sessions/<pid>.json`
-//!   的 `startedAt`，兜底 transcript 首行）。若快照时刻 ≥ state 文件 mtime，当前
-//!   `activeAccountId` 就是这把 key 的归属（进程在最后一次切换之后启动）；否则查
-//!   `cli_switch_history` 在该时刻生效的账号。仍不确定就丢弃（宁可少显示，不可显示错账号）。
-//!   mtime 优先于历史：历史漏记时不能把新进程归到旧账号。
+//! - **CLI 归因**：key 是**进程级快照**（切换只对新进程生效）。本轮起「活进程 key ==
+//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/model-rate-limits.md`）：
+//!   手动切换先关进程再写 `state.json`，自动轮换只在没有存活会话时才切。因此归因只需
+//!   「读当前账号 + 一个陈旧守卫」：取「该会话进程的启动时刻」（`sessions/<pid>.json` 的
+//!   `startedAt`，兜底 transcript 首行），`startedAt ≥ state.json mtime` → 当前账号；
+//!   早于 mtime ⇒ INV 被破坏（有进程持旧 key）⇒ 丢弃 + 告警；时刻取不到也丢弃。
+//!   宁可少显示，不可显示错账号。
 //! - **WorkBuddy 归因**：① 客户端登录态文件里的 uid → 账号库；② 兜底用会话 id 查 `sessions`
 //!   表（与日志扫描同源）；都拿不到就丢弃（宁可少显示，不可显示错账号）。
 //! - **轮询节奏**：1 秒一次 `stat`（未变则不做任何读取），hook 事件要求秒级可见；
@@ -33,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::modules::account;
-use crate::modules::cli_switch_history;
+use crate::modules::codebuddy_cli;
 use crate::modules::config::{atomic_write, home_dir, now_ms, store_dir};
 use crate::modules::limits::{self, Resolved};
 use crate::modules::rate_limit_hook;
@@ -50,12 +51,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 模型字段的未知哨兵值（与 IDE 解析同一套）：不得作为模型名展示。
 const MODEL_SENTINELS: [&str; 3] = ["auto", "undefined", "null"];
-
-/// CLI 运行中会话注册表目录名（`~/.codebuddy/sessions/<pid>.json`）。
-///
-/// 每份记录 `{sessionId, startedAt, …}`：`startedAt` = 持有该会话的**进程启动时刻**，
-/// 也就是该进程首次取 key 的时刻（key 是进程级快照）。
-const CLI_SESSIONS_DIR_NAME: &str = "sessions";
 
 /// transcript 首行上限：`session-meta` 很小；防止无换行的坏文件把数十 MB 读进内存。
 const TRANSCRIPT_HEAD_LIMIT: u64 = 64 * 1024;
@@ -190,9 +185,9 @@ struct IngestContext<'a> {
     /// CLI 当前生效账号的 `activeAccountId` 状态文件。
     cli_state_path: PathBuf,
     /// CLI 运行中会话注册表目录（`~/.codebuddy/sessions`）：`sessionId → 进程启动时刻`。
+    ///
+    /// 路径由 `codebuddy_cli::sessions_dir()` 给出（唯一拼接点），这里只做注入以便单测。
     cli_sessions_dir: PathBuf,
-    /// CLI 切换历史：`快照时刻 → 当时生效的账号`（`cli_switch_history` 写入）。
-    cli_switch_history: PathBuf,
     /// 两档位的客户端登录态文件。
     auth_file_paths: Vec<(WbVariant, PathBuf)>,
     /// 兜底：会话 id → 账号 id（默认实现查 `sessions` 表）。
@@ -216,10 +211,7 @@ impl IngestContext<'_> {
             cli_state_path: home_dir()
                 .join(limits::CLI_ROTATE_DIR)
                 .join(limits::CLI_STATE_FILE),
-            cli_sessions_dir: home_dir()
-                .join(limits::CLI_DATA_DIR)
-                .join(CLI_SESSIONS_DIR_NAME),
-            cli_switch_history: cli_switch_history::history_path(),
+            cli_sessions_dir: codebuddy_cli::sessions_dir(),
             auth_file_paths: WbVariant::ALL
                 .into_iter()
                 .map(|variant| (variant, crate::modules::auth_file::auth_file_path(variant)))
@@ -336,12 +328,17 @@ fn cli_state_snapshot(path: &Path) -> Option<(String, Option<i64>)> {
     Some((current_id, mtime))
 }
 
-/// CLI 归因：按「该会话当前进程的启动时刻」（key 快照时刻）对应的账号归属。
+/// CLI 归因：按「该会话进程的启动时刻」（key 快照时刻）判断这把 key 属于谁。
 ///
-/// 顺序：mtime 权威（`snap_at ≥ state.mtime` → 当前账号）→ 历史命中 → 丢弃。
-/// 进程在最后一次切换之后启动时，当前 `state.json` 就是这把 key 的归属；此时
-/// 再信历史会把「漏记的一次切换」变成反向错归（新进程记到旧账号）。
-/// `snap_at < mtime` 时当前值是切换后的账号，必须查历史，命中也不再参考当前值。
+/// 不变式（INV）：活着的 CLI 进程持有的 key == `state.json` 的 `activeAccountId`。
+/// 由两条写路径共同维持——手动切换先关进程再写 state；自动轮换只在无存活会话时切。
+/// 于是归因只需要一个陈旧守卫：
+///
+/// - `snap_at ≥ state.mtime`：进程在最后一次切换之后启动 ⇒ 当前账号就是它的 key；
+/// - `snap_at < state.mtime`：进程在切换之前启动且（按 INV）本该已经被关掉 ⇒
+///   INV 被破坏（第三方改写 state / 关闭失败 / 时钟异常）⇒ **丢弃 + 告警**，
+///   绝不猜"也许是切换前那个账号"；
+/// - `snap_at` 或 `mtime` 取不到 ⇒ 丢弃（宁可少显示，不可显示错账号）。
 fn attribute_cli(event: &QuotaEvent, ctx: &IngestContext, now: i64) -> Option<String> {
     let snap_at = session_snapshot_time(&ctx.cli_sessions_dir, event.session_id.as_deref(), now)
         .or_else(|| session_created_at(&event.transcript_path))?;
@@ -350,16 +347,25 @@ fn attribute_cli(event: &QuotaEvent, ctx: &IngestContext, now: i64) -> Option<St
         return None;
     }
     let (current_id, mtime) = cli_state_snapshot(&ctx.cli_state_path)?;
-    if mtime.is_some_and(|mtime| snap_at >= mtime) {
+    let Some(mtime) = mtime else {
+        eprintln!(
+            "[cli-attribution] 丢弃限额事件：无法读取 state.json 的写入时刻，无法判断归因是否成立"
+        );
+        return None;
+    };
+    if snap_at >= mtime {
         return account_exists(&ctx.accounts, &current_id).then_some(current_id);
     }
-    let account_id = cli_switch_history::account_at(&ctx.cli_switch_history, snap_at)?;
-    account_exists(&ctx.accounts, &account_id).then_some(account_id)
+    eprintln!(
+        "[cli-attribution] 丢弃限额事件：会话进程启动于 {snap_at}，早于 state.json 的写入时刻 {mtime}；\
+         活进程持有的 key 与当前账号不一致（不变式被破坏）"
+    );
+    None
 }
 
 /// 归因：payload 不含账号 uid，只能靠客户端侧「谁在持 key」。
 ///
-/// - CLI：该会话进程启动时刻的生效账号（key 是进程级快照，切换只对新进程生效）；
+/// - CLI：会话进程启动时刻不早于 `state.json` 写入时刻 → 当前账号（见 `attribute_cli`）；
 /// - WorkBuddy：① 登录态文件 uid → 账号库；② 会话 id 查 `sessions` 表兜底；
 /// - 都拿不到 → 丢弃（宁可少显示，不可显示错账号）。
 fn attribute(
@@ -658,10 +664,6 @@ mod tests {
             self.root.join("codebuddy-sessions")
         }
 
-        fn cli_history(&self) -> PathBuf {
-            self.root.join("cli_switch_history.jsonl")
-        }
-
         fn auth_file(&self) -> PathBuf {
             self.root.join("workbuddy-desktop.info")
         }
@@ -700,7 +702,6 @@ mod tests {
                 source_roots,
                 cli_state_path: self.cli_state(),
                 cli_sessions_dir: self.cli_sessions_dir(),
-                cli_switch_history: self.cli_history(),
                 auth_file_paths: vec![
                     (WbVariant::Cn, self.auth_file()),
                     (WbVariant::Ai, self.root.join("workbuddy-desktop-ai.info")),
@@ -722,7 +723,7 @@ mod tests {
             load_state(&self.state_file())
         }
 
-        /// 写一份 CLI 会话注册表（`<pid>.json`）：`sessionId → 进程启动时刻`。
+        /// 预置一份 CLI 会话注册表（`sessionId → 进程启动时刻`）。
         fn write_session_registry(&self, pid: u32, session: &str, started_at: i64) {
             let dir = self.cli_sessions_dir();
             std::fs::create_dir_all(&dir).expect("会话注册表目录");
@@ -733,20 +734,13 @@ mod tests {
             .expect("会话注册表");
         }
 
-        /// 预置切换历史（`(时刻, 账号 id)` 序列），模拟 wb-switch 的写入。
-        fn write_history(&self, entries: &[(i64, &str)]) {
-            let mut text = String::new();
-            for (at, account_id) in entries {
-                text.push_str(&json!({ "at": at, "accountId": account_id }).to_string());
-                text.push('\n');
-            }
-            std::fs::write(self.cli_history(), text).expect("切换历史");
-        }
-
-        /// 让 `session` 的事件按历史命中归到 `account_id`（快照时刻 = 500）。
-        fn seed_cli_attribution(&self, session: &str, account_id: &str) {
-            self.write_session_registry(4242, session, 500);
-            self.write_history(&[(500, account_id)]);
+        /// 写 `state.json`（当前账号 + 其后由 `set_state_mtime` 钉住的写入时刻）。
+        fn write_cli_state(&self, active_account_id: &str) {
+            std::fs::write(
+                self.cli_state(),
+                json!({ "activeAccountId": active_account_id }).to_string(),
+            )
+            .expect("状态文件");
         }
     }
 
@@ -866,14 +860,11 @@ mod tests {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli", "updatedAt": 1 }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-cli");
+        // 写入时刻钉在会话启动之前 ⇒ 该进程取到的 key 就是当前账号。
+        set_state_mtime(&fixture, 1);
         let session = "01a0ad53-0c95-7767-bd6a-d43356edb644";
-        // 快照时刻（进程启动=取 key 时刻）命中 acc-cli 的历史。
-        fixture.seed_cli_attribution(session, "acc-cli");
+        fixture.write_session_registry(4242, session, 500);
         fixture.append(&[stop_payload(
             session,
             "deepseek-v4.1-flash",
@@ -917,8 +908,6 @@ mod tests {
     const NEW_PROCESS_STARTED_AT: i64 = 1_789_641_842_256;
     /// 18:00:30 state.json 切到 wkbdtest。
     const SWITCHED_TO_WKBDTEST_AT: i64 = 1_789_639_230_009;
-    /// 11:00:30 更早一次切换（张佳）。
-    const SWITCHED_TO_ZHANGJIA_AT: i64 = 1_789_614_030_009;
     /// 18:43:56 旧进程触发 429。
     const EVENT_AT: i64 = 1_789_639_436_000;
 
@@ -975,7 +964,7 @@ mod tests {
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
-    /// 注册表缺失 → 兜底 transcript 首行的会话创建时刻。
+    /// 注册表缺失（或坏文件被跳过）→ 兜底 transcript 首行的会话创建时刻。
     #[test]
     fn session_snapshot_falls_back_to_the_transcript_first_line() {
         let fixture = Fixture::new();
@@ -994,21 +983,21 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-other" }).to_string(),
-        )
-        .expect("状态文件");
-        // 钉到切换之后：snap_at < mtime，必须靠 transcript 时刻去查历史，不能用当前 state。
-        set_state_mtime(&fixture, SWITCHED_TO_WKBDTEST_AT);
+        fixture.write_cli_state("acc-cli");
         // 注册表目录在但文件坏：跳过，仍走 transcript。
         std::fs::create_dir_all(fixture.cli_sessions_dir()).expect("会话注册表目录");
         std::fs::write(fixture.cli_sessions_dir().join("9312.json"), "{").expect("坏注册表");
-        // 历史命中只能靠 transcript 提供的快照时刻。
-        fixture.write_history(&[(OLD_PROCESS_STARTED_AT + 769, "acc-cli")]);
-        let ctx = fixture.context(
-            vec![cli_account(), json!({ "id": "acc-other" })],
-            &absent_lookup,
+        // state 的写入时刻早于会话创建时刻 ⇒ 这个进程取到的就是当前账号。
+        set_state_mtime(&fixture, OLD_PROCESS_STARTED_AT);
+        let ctx = fixture.context(vec![cli_account()], &absent_lookup);
+        assert_eq!(
+            session_snapshot_time(&fixture.cli_sessions_dir(), Some(CLI_SESSION), EVENT_AT),
+            None,
+            "坏注册表不提供快照时刻"
+        );
+        assert_eq!(
+            session_created_at(&transcript.to_string_lossy()),
+            Some(OLD_PROCESS_STARTED_AT + 769)
         );
         assert_eq!(
             attribute(
@@ -1033,53 +1022,33 @@ mod tests {
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
-    /// AC1：切换前启动的旧进程，切换后触发的限额仍归到切换前账号。
+    /// 切换之后仍有旧进程触发限额：按不变式这种进程本该已经被关闭 ⇒ 丢弃（不猜账号）。
     #[test]
-    fn old_process_event_after_switch_uses_the_pre_switch_account() {
+    fn old_process_event_after_switch_is_dropped() {
         let fixture = Fixture::new();
-        fixture.write_history(&[
-            (SWITCHED_TO_ZHANGJIA_AT, "acc-zhangjia"),
-            (SWITCHED_TO_WKBDTEST_AT, "acc-wkbdtest"),
-        ]);
         fixture.write_session_registry(9312, CLI_SESSION, OLD_PROCESS_STARTED_AT);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-wkbdtest" }).to_string(),
-        )
-        .expect("状态文件");
-        // 钉到切换时刻：mtime 权威路径看到的是「快照早于最后一次写入」，必须走历史。
+        fixture.write_cli_state("acc-wkbdtest");
+        // state 在旧进程启动之后才被改写：它持有的是切换前的 key。
         set_state_mtime(&fixture, SWITCHED_TO_WKBDTEST_AT);
-        let ctx = fixture.context(
-            vec![
-                json!({ "id": "acc-zhangjia" }),
-                json!({ "id": "acc-wkbdtest" }),
-            ],
-            &absent_lookup,
-        );
+        let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
         assert_eq!(
             attribute(
                 &cli_quota_event(&fixture, CLI_SESSION),
                 HookSource::Cli,
                 &ctx,
                 EVENT_AT
-            )
-            .as_deref(),
-            Some("acc-zhangjia"),
-            "旧进程仍持张佳的 key，不得归到事件时刻的 wkbdtest"
+            ),
+            None,
+            "不变式被破坏时应丢弃，不得猜切换前的账号"
         );
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
-    /// AC2：切换后新启动的进程；无历史覆盖时快照时刻 ≥ state 写入时刻即用当前值。
+    /// 快照时刻恰等于 state 写入时刻 ⇒ 进程在最后一次切换之后启动，归当前账号。
     #[test]
     fn new_process_event_after_the_last_switch_uses_the_state_account() {
         let fixture = Fixture::new();
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-wkbdtest" }).to_string(),
-        )
-        .expect("状态文件");
-        // 快照时刻 = state 文件最后写入时刻 ⇒ 自那以后账号未变。
+        fixture.write_cli_state("acc-wkbdtest");
         let mtime = state_mtime_ms(&fixture);
         fixture.write_session_registry(60705, CLI_SESSION, mtime);
         let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
@@ -1096,86 +1065,12 @@ mod tests {
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
-    /// AC2：切换后新进程 + 完整历史 → 新账号（mtime 权威与历史一致）。
+    /// 快照时刻比 state 写入时刻早 1ms ⇒ 归因边界收紧到「丢弃」。
     #[test]
-    fn new_process_with_complete_history_uses_the_new_account() {
+    fn snapshot_one_millisecond_before_the_state_write_is_dropped() {
         let fixture = Fixture::new();
-        fixture.write_history(&[
-            (SWITCHED_TO_ZHANGJIA_AT, "acc-zhangjia"),
-            (SWITCHED_TO_WKBDTEST_AT, "acc-wkbdtest"),
-        ]);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-wkbdtest" }).to_string(),
-        )
-        .expect("状态文件");
-        set_state_mtime(&fixture, SWITCHED_TO_WKBDTEST_AT);
-        fixture.write_session_registry(60705, CLI_SESSION, NEW_PROCESS_STARTED_AT);
-        let ctx = fixture.context(
-            vec![
-                json!({ "id": "acc-zhangjia" }),
-                json!({ "id": "acc-wkbdtest" }),
-            ],
-            &absent_lookup,
-        );
-        assert_eq!(
-            attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
-                HookSource::Cli,
-                &ctx,
-                NEW_PROCESS_STARTED_AT + 1_000
-            )
-            .as_deref(),
-            Some("acc-wkbdtest")
-        );
-        std::fs::remove_dir_all(&fixture.root).ok();
-    }
-
-    /// 历史漏记最后一次切换时，不得把新进程归到旧账号（反向错归）。
-    #[test]
-    fn stale_history_does_not_reassign_a_new_process_to_an_old_account() {
-        let fixture = Fixture::new();
-        // 实际已切到 wkbdtest，但历史只留着张佳（追加失败 / 升级空窗）。
-        fixture.write_history(&[(SWITCHED_TO_ZHANGJIA_AT, "acc-zhangjia")]);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-wkbdtest" }).to_string(),
-        )
-        .expect("状态文件");
-        set_state_mtime(&fixture, SWITCHED_TO_WKBDTEST_AT);
-        fixture.write_session_registry(60705, CLI_SESSION, NEW_PROCESS_STARTED_AT);
-        let ctx = fixture.context(
-            vec![
-                json!({ "id": "acc-zhangjia" }),
-                json!({ "id": "acc-wkbdtest" }),
-            ],
-            &absent_lookup,
-        );
-        assert_eq!(
-            attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
-                HookSource::Cli,
-                &ctx,
-                NEW_PROCESS_STARTED_AT + 1_000
-            )
-            .as_deref(),
-            Some("acc-wkbdtest"),
-            "snap_at ≥ mtime 时当前 state 权威，过期历史不得覆盖"
-        );
-        std::fs::remove_dir_all(&fixture.root).ok();
-    }
-
-    /// AC3：历史无覆盖（只有切换后的记录）且快照时刻早于 state 最后写入 → 丢弃。
-    #[test]
-    fn stale_history_without_coverage_for_the_snapshot_is_dropped() {
-        let fixture = Fixture::new();
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-wkbdtest" }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-wkbdtest");
         let mtime = state_mtime_ms(&fixture);
-        fixture.write_history(&[(mtime, "acc-wkbdtest")]);
         fixture.write_session_registry(9312, CLI_SESSION, mtime - 1);
         let ctx = fixture.context(vec![json!({ "id": "acc-wkbdtest" })], &absent_lookup);
         assert_eq!(
@@ -1188,17 +1083,6 @@ mod tests {
             None,
             "无法区分旧进程/新进程接管时不得猜账号"
         );
-        // 空历史也落在同一条保守丢弃路径上。
-        fixture.write_history(&[]);
-        assert_eq!(
-            attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
-                HookSource::Cli,
-                &ctx,
-                mtime + 1_000
-            ),
-            None
-        );
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
@@ -1206,12 +1090,7 @@ mod tests {
     #[test]
     fn missing_snapshot_evidence_is_dropped() {
         let fixture = Fixture::new();
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
-        fixture.write_history(&[(500, "acc-cli")]);
+        fixture.write_cli_state("acc-cli");
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         // 注册表目录不存在 + transcript 不存在 + session_id 缺失。
         let mut event = cli_quota_event(&fixture, CLI_SESSION);
@@ -1221,7 +1100,6 @@ mod tests {
         // state.json 缺失时同样丢弃（即使快照时刻可得）。
         let fixture = Fixture::new();
         fixture.write_session_registry(9312, CLI_SESSION, 500);
-        fixture.write_history(&[(500, "acc-cli")]);
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         assert_eq!(
             attribute(
@@ -1235,38 +1113,12 @@ mod tests {
         std::fs::remove_dir_all(&fixture.root).ok();
     }
 
-    /// 历史命中的账号已被删除 → 丢弃（与旧行为一致）。
+    /// 当前账号已被删除 → 丢弃（不得改判到任何别的账号）。
     #[test]
-    fn history_account_deleted_from_the_library_is_dropped() {
-        let fixture = Fixture::new();
-        fixture.write_session_registry(9312, CLI_SESSION, 500);
-        fixture.write_history(&[(500, "acc-deleted")]);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
-        let ctx = fixture.context(vec![cli_account()], &absent_lookup);
-        assert_eq!(
-            attribute(
-                &cli_quota_event(&fixture, CLI_SESSION),
-                HookSource::Cli,
-                &ctx,
-                10_000
-            ),
-            None
-        );
-        std::fs::remove_dir_all(&fixture.root).ok();
-
-        // 当前账号已删且 snap_at ≥ mtime：不得回落到历史里仍存在的旧账号。
+    fn deleted_current_account_is_dropped() {
         let fixture = Fixture::new();
         fixture.write_session_registry(60705, CLI_SESSION, NEW_PROCESS_STARTED_AT);
-        fixture.write_history(&[(SWITCHED_TO_ZHANGJIA_AT, "acc-zhangjia")]);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-deleted" }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-deleted");
         set_state_mtime(&fixture, SWITCHED_TO_WKBDTEST_AT);
         let ctx = fixture.context(vec![json!({ "id": "acc-zhangjia" })], &absent_lookup);
         assert_eq!(
@@ -1277,7 +1129,7 @@ mod tests {
                 NEW_PROCESS_STARTED_AT + 1_000
             ),
             None,
-            "mtime 权威命中已删账号时不得改用过期历史"
+            "当前账号不在账号库时丢弃，不得改判到账号库里仍存在的旧账号"
         );
         std::fs::remove_dir_all(&fixture.root).ok();
     }
@@ -1289,12 +1141,7 @@ mod tests {
         let transcript = fixture.cli_transcript(CLI_SESSION);
         std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         std::fs::write(&transcript, format!("{}\n", json!({ "timestamp": 20_000 }))).unwrap();
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
-        fixture.write_history(&[(500, "acc-cli")]);
+        fixture.write_cli_state("acc-cli");
         let ctx = fixture.context(vec![cli_account()], &absent_lookup);
         assert_eq!(
             attribute(
@@ -1314,13 +1161,10 @@ mod tests {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![json!({ "id": "acc-other" })], &lookup);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
         let session = "s-1";
-        fixture.seed_cli_attribution(session, "acc-cli");
+        fixture.write_session_registry(4242, session, 500);
         fixture.append(&[stop_payload(
             session,
             "hy3",
@@ -1411,13 +1255,10 @@ mod tests {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
         let session = "s-1";
-        fixture.seed_cli_attribution(session, "acc-cli");
+        fixture.write_session_registry(4242, session, 500);
         fixture.append(&[stop_payload(
             session,
             "hy3",
@@ -1439,13 +1280,10 @@ mod tests {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
-        std::fs::write(
-            fixture.cli_state(),
-            json!({ "activeAccountId": "acc-cli" }).to_string(),
-        )
-        .expect("状态文件");
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
         let session = "s-1";
-        fixture.seed_cli_attribution(session, "acc-cli");
+        fixture.write_session_registry(4242, session, 500);
         let payload = stop_payload(session, "hy3", &fixture.cli_transcript(session));
         // 先把文件撑到轮转阈值，再在末尾追一条事件。
         let filler = "x".repeat(COMPACT_AFTER_BYTES as usize);

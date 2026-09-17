@@ -94,8 +94,10 @@ pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cli/switch —— 只切换 CodeBuddy CLI，不重启 WorkBuddy。
 ///
-/// `close_running_cli`：账号页确认后的跨站切换会关闭正在运行的 CLI；
-/// 自动轮换不传，保持「下次会话生效」。
+/// 任何切换都会**先关闭正在运行的 CodeBuddy CLI 再写状态**：key 是进程级快照，
+/// 不关进程就会出现"新默认账号 + 旧进程仍持旧 key"的窗口。当前 CLI 会话因此会中断。
+///
+/// `close_running_cli` 入参**已废弃**（保留接受但忽略），仅为不破坏既有调用方。
 ///
 /// async + spawn_blocking：切换会用登录 shell 定位 node 并执行 apiKeyHelper
 /// 校验账号（子进程无超时），同步 command 会阻塞主线程造成 UI 卡顿。
@@ -107,11 +109,10 @@ pub async fn switch_codebuddy_cli_account(
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        codebuddy_cli::switch_active_account(&account_id, close_running_cli.unwrap_or(false))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let _ = close_running_cli;
+    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::switch_active_account(&account_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// GET /api/codebuddy-cn-ide/status —— CodeBuddy IDE 安装/运行/当前账号。
@@ -573,9 +574,14 @@ pub fn rotate_status() -> Value {
 }
 
 /// POST /api/rotate/run —— 手动触发一次轮换检查。
+///
+/// 返回体里的 `notify`（若因存活门控被推迟且未超当日预算）由宿主投递系统通知；
+/// 无头 server 只返回该字段，不投递。
 #[tauri::command]
-pub async fn run_rotate() -> Value {
-    rotate::run_rotate_cycle().await
+pub async fn run_rotate(app: tauri::AppHandle) -> Value {
+    let result = rotate::run_rotate_cycle().await;
+    crate::deliver_rotate_notify(&app, &result);
+    result
 }
 
 /// GET /api/rotate/logs —— 最近轮换日志。

@@ -218,12 +218,9 @@ async fn api_codebuddy_cli_install_helper() -> Response {
 
 async fn api_codebuddy_cli_switch(Json(body): Json<Value>) -> Response {
     let id = body.get("accountId").and_then(|v| v.as_str()).unwrap_or("");
-    let close_running_cli = body
-        .get("closeRunningCli")
-        .or_else(|| body.get("close_running_cli"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    match codebuddy_cli::switch_active_account(id, close_running_cli) {
+    // 入参 `closeRunningCli` 已废弃：后端一律先关闭正在运行的 CLI 再写状态，忽略该值。
+    // 无头模式不投递系统通知，切号结果（含关闭数量）照常返回给调用方。
+    match codebuddy_cli::switch_active_account(id) {
         Ok(result) => json_ok(result),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }

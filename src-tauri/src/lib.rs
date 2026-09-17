@@ -15,9 +15,25 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
+/// 轮换推迟提示：桌面端投递系统通知（应用在托盘/后台时同样可见）；
+/// 其它形态由 core 的日志与 `notify` 返回字段承载，宿主不投递。
+pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json::Value) {
+    #[cfg(desktop)]
+    {
+        if let Some(notify) = result.get("notify") {
+            tray::notify_rotate_deferred(app, notify);
+        }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, result);
+    }
+}
+
 /// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
+    let rotate_app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -68,7 +84,8 @@ fn spawn_background_loops(app: tauri::AppHandle) {
                 let now = modules::config::now_ms();
                 if now - last_rotate_at >= interval_minutes * 60_000 {
                     last_rotate_at = now;
-                    let _ = modules::rotate::run_rotate_cycle().await;
+                    let result = modules::rotate::run_rotate_cycle().await;
+                    deliver_rotate_notify(&rotate_app, &result);
                 }
             }
             let today = modules::checkin::date_str(None);

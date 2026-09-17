@@ -666,6 +666,80 @@ pub fn add_rotate_log(entry: &Value) {
 }
 
 // ---------------------------------------------------------------------------
+// 轮换推迟提示预算（`~/.wb-switch/auto_rotate_notify.json`）
+// ---------------------------------------------------------------------------
+
+/// 提示预算文件名（`store_dir()/auto_rotate_notify.json`）。
+const ROTATE_NOTIFY_FILE_NAME: &str = "auto_rotate_notify.json";
+
+/// 同一自然日内最多提示几次；超出只写轮换日志，不再打扰用户。
+pub const ROTATE_NOTIFY_DAILY_LIMIT: u32 = 5;
+
+static ROTATE_NOTIFY_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn auto_rotate_notify_file() -> PathBuf {
+    store_dir().join(ROTATE_NOTIFY_FILE_NAME)
+}
+
+/// 本地日期（`YYYY-MM-DD`）：提示预算的跨日重置口径（与签到日志同一套本地时间）。
+fn local_date(at_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 读当日已用次数：文件缺失 / 损坏 / 日期不是今天（跨日）一律按 0 计。
+fn rotate_notify_count_at(path: &Path, today: &str) -> u32 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return 0;
+    };
+    if value.get("date").and_then(Value::as_str) != Some(today) {
+        return 0;
+    }
+    value
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
+/// 领取一次「轮换推迟提示」配额：`true` = 可以投递（并且已经计数）。
+///
+/// 同自然日上限 [`ROTATE_NOTIFY_DAILY_LIMIT`]，跨日按本地日期清零；读取失败/损坏视为 0，
+/// 不阻塞轮换。预算文件写不进去时不投递——宁可少一条通知，也不要每轮都弹。
+pub fn try_consume_rotate_notify(at_ms: i64) -> bool {
+    let _guard = ROTATE_NOTIFY_LOCK.lock().unwrap();
+    let path = auto_rotate_notify_file();
+    try_consume_rotate_notify_at(&path, &local_date(at_ms))
+}
+
+fn try_consume_rotate_notify_at(path: &Path, today: &str) -> bool {
+    if today.is_empty() {
+        return false;
+    }
+    let used = rotate_notify_count_at(path, today);
+    if used >= ROTATE_NOTIFY_DAILY_LIMIT {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let content = serde_json::to_string_pretty(&json!({
+        "date": today,
+        "count": used + 1,
+    }))
+    .unwrap_or_default();
+    atomic_write(path, &content).is_ok()
+}
+
+// ---------------------------------------------------------------------------
 // 并发运行标志（替代 Python threading.Lock，Send 安全可跨 await）
 // ---------------------------------------------------------------------------
 
@@ -1431,6 +1505,63 @@ mod tests {
             Some(true)
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮换推迟提示预算：同日第 1..5 次放行、第 6 次拒绝；跨日重置；损坏回退 0。
+    #[test]
+    fn rotate_notify_budget_caps_per_local_day_and_resets_on_a_new_day() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-rotate-notify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ROTATE_NOTIFY_FILE_NAME);
+        let today = "2026-09-18";
+
+        // 文件不存在 → 从 0 开始，前 5 次都放行。
+        for expected_count in 1..=ROTATE_NOTIFY_DAILY_LIMIT {
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "第 {expected_count} 次应放行"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(expected_count));
+            assert_eq!(saved["date"], json!(today));
+        }
+        // 第 6 次：拒绝，且预算文件不再被改写（仍停在 5）。
+        assert!(!try_consume_rotate_notify_at(&path, today));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["count"], json!(ROTATE_NOTIFY_DAILY_LIMIT));
+
+        // 跨日：日期变化即清零，重新放行。
+        assert!(try_consume_rotate_notify_at(&path, "2026-09-19"));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["date"], json!("2026-09-19"));
+        assert_eq!(saved["count"], json!(1));
+
+        // 损坏 / 字段缺失 / 类型不符 → 按 0 计（不阻塞轮换）。
+        for broken in [
+            "not-json",
+            "{}",
+            r#"{"date":"2026-09-20","count":"many"}"#,
+            "[]",
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "损坏内容应按 0 计: {broken}"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(1), "损坏后从 1 重新起算: {broken}");
+            assert_eq!(saved["date"], json!(today));
+        }
+
+        // 空日期视为不可用（不写坏文件）。
+        std::fs::remove_file(&path).unwrap();
+        assert!(!try_consume_rotate_notify_at(&path, ""));
+        assert!(!path.exists());
+        assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
         std::fs::remove_dir_all(&dir).ok();
     }
 }
