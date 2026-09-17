@@ -231,6 +231,7 @@ export interface AutoRotateConfig {
   cooldown_minutes: number;
   min_gap_hours: number;
   min_urgency_hours: number;
+  /** 配置键兼容保留：轮换已改用「会话存活门控」，该值不再参与决策，设置页也不再展示。 */
   active_guard_minutes: number;
   min_remaining_credits: number;
 }

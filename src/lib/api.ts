@@ -209,6 +209,12 @@ export function installCodebuddyCliHelper(): Promise<CodeBuddyCliInstallResult> 
   return call("install_codebuddy_cli_helper");
 }
 
+/**
+ * 切换 CodeBuddy CLI 默认账号。
+ *
+ * @param closeRunningCli 已废弃：后端一律先关闭正在运行的 CLI 再写状态，该入参被忽略。
+ *   仅为兼容既有调用方保留（HTTP 路径仍会原样发送）。
+ */
 export function switchCodebuddyCliAccount(
   accountId: string,
   closeRunningCli = false,
@@ -546,7 +552,20 @@ export function getRotateStatus(): Promise<RotateStatus> {
   return call("rotate_status");
 }
 
-export function runRotate(): Promise<{ status: string; reason?: string; error?: string; to?: string }> {
+/**
+ * 手动触发一次轮换检查。
+ *
+ * `notify`（可选）：因存活门控被推迟、但除门控外本来会切换时由 core 组装好的提示内容。
+ * 桌面端由宿主（Rust）直接投递系统通知，这里只保留字段以描述完整返回契约；
+ * 无头 server 不投递，调用方按需自行处理。
+ */
+export function runRotate(): Promise<{
+  status: string;
+  reason?: string;
+  error?: string;
+  to?: string;
+  notify?: { title: string; body: string };
+}> {
   return call("run_rotate");
 }
 

@@ -639,14 +639,14 @@ export default function AccountsPage() {
   async function confirmSwitchCodebuddyCli() {
     const account = cliSwitchTarget;
     if (!account || codebuddyCliSwitchingId !== null) return;
-    const closeRunningCli = cliSwitchIsRegionChange;
     setCliSwitchTarget(null);
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
       description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
     });
     try {
-      const result = await api.switchCodebuddyCliAccount(account.id, closeRunningCli);
+      // 后端一律先关闭正在运行的 CLI 再写状态（`closeRunningCli` 入参已废弃）。
+      const result = await api.switchCodebuddyCliAccount(account.id);
       await refreshCodebuddyCliStatus();
       toast.success("CodeBuddy CLI 默认账号已更新", {
         id: toastId,
@@ -734,15 +734,9 @@ export default function AccountsPage() {
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
-  const cliSwitchIsRegionChange = Boolean(
-    cliSwitchTarget
-    && accountVariant(cliSwitchTarget) !== normalizeVariant(codebuddyCli?.activeAccountVariant),
-  );
   const cliSwitchAccountLabel = cliSwitchTarget
     ? cliSwitchTarget.nickname || cliSwitchTarget.email || cliSwitchTarget.id
     : "";
-  const cliSwitchTargetRegion = cliSwitchTarget ? variantLabel(accountVariant(cliSwitchTarget)) : "";
-  const cliSwitchCurrentRegion = variantLabel(normalizeVariant(codebuddyCli?.activeAccountVariant));
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
     : "未登录";
@@ -896,7 +890,7 @@ export default function AccountsPage() {
                     ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
                     : codebuddyCli.migrationRequired
                       ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token；切换或保活刷新后会自动更新。当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
+                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
                 : codebuddyCli.migrationRequired
                   ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
                   : codebuddyCli.configured
@@ -1160,17 +1154,8 @@ export default function AccountsPage() {
           <DialogHeader>
             <DialogTitle>切换 CodeBuddy CLI</DialogTitle>
             <DialogDescription>
-              {cliSwitchIsRegionChange ? (
-                <>
-                  将把默认账号设为「{cliSwitchAccountLabel}」，并从{cliSwitchCurrentRegion}切到{cliSwitchTargetRegion}。
-                  确认后会关闭正在运行的 CodeBuddy CLI，避免旧进程继续打旧站并覆盖站点缓存。当前会话会中断，之后请重新打开 CLI。
-                </>
-              ) : (
-                <>
-                  将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
-                  当前已打开的会话不会换号，重新加载会话或新开会话后生效。
-                </>
-              )}
+              将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
+              确认后会关闭正在运行的 CodeBuddy CLI 会话，当前会话会中断；重新打开 CLI 后新账号才会生效。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1178,7 +1163,7 @@ export default function AccountsPage() {
               取消
             </Button>
             <Button onClick={() => void confirmSwitchCodebuddyCli()}>
-              {cliSwitchIsRegionChange ? "关闭 CLI 并切换" : "切换"}
+              关闭 CLI 并切换
             </Button>
           </DialogFooter>
         </DialogContent>

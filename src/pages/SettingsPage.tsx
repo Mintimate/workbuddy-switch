@@ -469,17 +469,6 @@ function AutoRotateCard() {
                 onChange={(e) => setNum("min_urgency_hours", e.target.value)}
               />
             </SettingsFieldRow>
-            <SettingsFieldRow label="活跃保护" description="分钟" htmlFor="ar-guard" operational>
-              <Input
-                id="ar-guard"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                max={1440}
-                value={cfg.active_guard_minutes}
-                onChange={(e) => setNum("active_guard_minutes", e.target.value)}
-              />
-            </SettingsFieldRow>
             <SettingsFieldRow label="最小剩余积分" description="低于此值时不切换" htmlFor="ar-min" operational>
               <Input
                 id="ar-min"
@@ -491,7 +480,7 @@ function AutoRotateCard() {
               />
             </SettingsFieldRow>
             <p className="border-b border-border/60 px-4 py-3 text-[13px] leading-5 text-muted-foreground sm:px-5">
-              切换时机：目标账号剩余到期时间少于「紧迫阈值」且比当前账号早超过「差异阈值」，且最近「活跃保护」分钟内 CLI 无对话、目标剩余积分不低于「最小剩余积分」。
+              切换时机：目标账号剩余到期时间少于「紧迫阈值」且比当前账号早超过「差异阈值」，且目标剩余积分不低于「最小剩余积分」。检测到有 CodeBuddy CLI 会话在运行时，本次轮换会跳过并在当日最多提示 5 次；重启 CLI 后新账号才会生效。
             </p>
 
             <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
