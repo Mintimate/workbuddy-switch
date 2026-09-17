@@ -454,9 +454,11 @@ const MODEL_COLORS = [
   "var(--data-series-indigo)",
   "var(--data-series-sky)",
   "var(--data-series-lime)",
+  "var(--data-series-orange)",
+  "var(--data-series-pink)",
+  "var(--data-series-cyan)",
+  "var(--data-series-slate)",
 ];
-const MAX_MODELS = 5;
-const OTHER_MODEL = "其他";
 
 interface ModelChartPoint {
   date: string;
@@ -512,7 +514,7 @@ function CreditBarShape({
   );
 }
 
-/** 从官方 daily（全量按模型聚合）构建层叠数据；模型按总消耗取前 N，其余并入「其他」。 */
+/** 从官方 daily（全量按模型聚合）构建层叠数据；模型按总消耗降序全部保留。 */
 function buildStackedChart(
   daily: CreditStatsDailyPoint[],
 ): { models: string[]; points: ModelChartPoint[] } {
@@ -522,23 +524,18 @@ function buildStackedChart(
       modelTotals.set(model.model, (modelTotals.get(model.model) ?? 0) + model.credit);
     }
   }
-  const topModels = [...modelTotals.entries()]
+  const models = [...modelTotals.entries()]
     .sort((left, right) => right[1] - left[1])
-    .slice(0, MAX_MODELS)
     .map(([model]) => model);
 
   const points: ModelChartPoint[] = daily.map((point) => {
     const entry: ModelChartPoint = { date: point.date, total: point.usage };
     for (const model of point.models ?? []) {
-      const key = topModels.includes(model.model) ? model.model : OTHER_MODEL;
+      const key = model.model;
       entry[key] = (typeof entry[key] === "number" ? entry[key] : 0) + model.credit;
     }
     return entry;
   });
-  const models = [...topModels];
-  if (points.some((point) => point[OTHER_MODEL] !== undefined)) {
-    models.push(OTHER_MODEL);
-  }
   return { models, points };
 }
 
@@ -888,7 +885,7 @@ function ModelBreakdownRows({ models }: { models: CreditOfficialUsageModel[] }) 
 
   return (
     <div className="space-y-3">
-      {models.slice(0, 8).map((model) => {
+      {models.map((model) => {
         const ratio = totalCredit > 0 ? model.credit / totalCredit : totalRequests > 0 ? model.requestCount / totalRequests : 0;
         const percent = ratio * 100;
         const label = model.model === "—" ? "未知模型" : model.model;
@@ -1004,7 +1001,6 @@ function ModelBreakdown({
             <span className="font-medium text-foreground">合计 {formatCredits(totalCredit)} 积分</span>
           </div>
           <ModelBreakdownRows models={models} />
-          {models.length > 8 && <p className="mt-3 text-[11px] text-muted-foreground">已展示消耗最高的 8 个模型，其余模型仍计入上方合计。</p>}
         </CardContent>
       )}
       </Card>
