@@ -83,6 +83,10 @@ pub fn credit_usage_snapshots_file() -> PathBuf {
     store_dir().join("credit_usage_snapshots.json")
 }
 
+pub fn rate_limit_config_file() -> PathBuf {
+    store_dir().join("rate_limit_config.json")
+}
+
 pub fn official_usage_cache_file() -> PathBuf {
     store_dir().join("official_usage_cache.json")
 }
@@ -513,6 +517,53 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
     std::fs::create_dir_all(store_dir())?;
     let content = serde_json::to_string_pretty(cache).unwrap_or_default();
     atomic_write(&travel_cache_file(), &content)
+}
+
+// ---------------------------------------------------------------------------
+// 限额监听配置（hook 通路 + IDE 日志扫描的总开关）
+// ---------------------------------------------------------------------------
+
+/// 默认限额监听配置：默认开启（与改造前「账号页自动显示限额」的行为一致）。
+pub fn default_rate_limit_config() -> Value {
+    json!({ "enabled": true })
+}
+
+/// 读取指定的限额监听配置文件（缺失/损坏时合并默认值）。
+///
+/// 与 `load_rate_limit_config` 分离只为注入路径：单测不得触碰真实 `~/.wb-switch`。
+pub fn load_rate_limit_config_at(path: &Path) -> Value {
+    let mut cfg = default_rate_limit_config();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+            if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
+                cfg["enabled"] = json!(enabled);
+            }
+        }
+    }
+    cfg
+}
+
+/// 读取限额监听配置（缺失/损坏时合并默认值）。
+pub fn load_rate_limit_config() -> Value {
+    load_rate_limit_config_at(&rate_limit_config_file())
+}
+
+/// 保存限额监听配置到指定路径（只保留已知字段）。
+pub fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_rate_limit_config();
+    if let Some(enabled) = cfg.get("enabled").and_then(Value::as_bool) {
+        merged["enabled"] = json!(enabled);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 保存限额监听配置（只保留已知字段）。
+pub fn save_rate_limit_config(cfg: &Value) -> std::io::Result<()> {
+    save_rate_limit_config_at(&rate_limit_config_file(), cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,5 +1271,54 @@ mod tests {
         ));
         assert!(!is_route_missing(&json!({"code": 0, "data": {}})));
         assert!(!is_route_missing(&Value::Null));
+    }
+
+    /// 限额监听配置：默认开启、显式 false 生效、损坏/缺字段回默认，且只写已知字段。
+    #[test]
+    fn rate_limit_config_defaults_to_enabled_and_keeps_only_known_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 文件缺失 → 默认开启。
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式关闭 → 生效。
+        save_rate_limit_config_at(&path, &json!({"enabled": false, "extra": 1})).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert!(saved.get("extra").is_none(), "只保留已知字段: {saved}");
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 损坏内容 / 类型不符 → 回默认，不报错。
+        std::fs::write(&path, "not-json").unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        std::fs::write(&path, json!({"enabled": "no"}).to_string()).unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(rate_limit_config_file().ends_with("rate_limit_config.json"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
-    credit_usage, credits, export_import, limits, oauth, process, refresh, rotate, session, switch,
-    token_stats, travel, update, variant::WbVariant,
+    credit_usage, credits, export_import, limits, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    variant::WbVariant,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -99,6 +100,22 @@ pub fn router() -> Router {
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
         .route("/api/rate-limits", get(api_rate_limits))
+        .route(
+            "/api/rate-limits/hook-status",
+            get(api_rate_limit_hook_status),
+        )
+        .route(
+            "/api/rate-limits/install-hook",
+            post(api_install_rate_limit_hook),
+        )
+        .route(
+            "/api/rate-limits/uninstall-hook",
+            post(api_uninstall_rate_limit_hook),
+        )
+        .route(
+            "/api/rate-limits/config",
+            get(api_rate_limit_config).post(api_save_rate_limit_config),
+        )
         .route("/api/checkin", post(api_checkin))
         .route("/api/checkin/all", post(api_checkin_all))
         .route(
@@ -582,6 +599,67 @@ async fn api_rate_limits() -> Response {
             format!("扫描模型限额失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
+    }
+}
+
+/// hook 状态 + 运行期字段（最近一次 hook 事件时刻）。
+fn rate_limit_hook_status() -> Value {
+    let mut status = rate_limit_hook::hook_status();
+    status["lastEventAt"] = json!(rate_limit_events::last_event_at());
+    status
+}
+
+/// GET /api/rate-limits/hook-status —— hook 安装状态（脚本 + 三处客户端配置逐项结果）。
+async fn api_rate_limit_hook_status() -> Response {
+    match tokio::task::spawn_blocking(rate_limit_hook_status).await {
+        Ok(status) => json_ok(status),
+        Err(error) => json_err(
+            format!("查询限额 hook 状态失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份）。
+async fn api_install_rate_limit_hook() -> Response {
+    match tokio::task::spawn_blocking(|| {
+        let result = rate_limit_hook::install_hook();
+        // 扫描范围随安装结果变化（hook 健康时只扫 IDE 两源），缓存必须作废。
+        limits::invalidate_scan_cache();
+        result.map(|_| rate_limit_hook_status())
+    })
+    .await
+    {
+        Ok(Ok(status)) => json_ok(status),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+async fn api_uninstall_rate_limit_hook() -> Response {
+    match tokio::task::spawn_blocking(|| {
+        let result = rate_limit_hook::uninstall_hook();
+        limits::invalidate_scan_cache();
+        result.map(|_| rate_limit_hook_status())
+    })
+    .await
+    {
+        Ok(Ok(status)) => json_ok(status),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn api_rate_limit_config() -> Response {
+    json_ok(config::load_rate_limit_config())
+}
+
+async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
+    let submitted = body.get("config").unwrap_or(&body);
+    match config::save_rate_limit_config(submitted) {
+        Ok(()) => json_ok(config::load_rate_limit_config()),
+        Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
 

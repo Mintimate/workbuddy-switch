@@ -1,8 +1,15 @@
-//! 模型限额台账：从**本机日志**还原「哪个账号的哪个模型被限流、官方给出的恢复时刻」。
+//! 模型限额台账：从**本机日志**与**客户端 hook 信号**还原「哪个账号的哪个模型被限流、
+//! 官方给出的恢复时刻」。
+//!
+//! 两条通路合并（`get_rate_limits()`）：
+//! - **hook 通路**（`rate_limit_events.rs`）：CLI 与 WorkBuddy 两档位的 `Stop` / `FinalStop`
+//!   payload 里直接带限额文案与模型，实时归因、秒级可见；hook 已安装时这两档位不扫日志。
+//! - **日志扫描**（本模块）：两个 CodeBuddy IDE 永远走这条；hook 未安装 / 被移除时兜底覆盖
+//!   全部五源。扫描本身按 5 分钟节流并缓存，`scannedAt` 是最近一次真实扫描的时刻。
 //!
 //! 不新增任何网络请求，也不解析客户端 UI 文案。日志窗口固定为最近 2 天（WorkBuddy 两档位
-//! 与 CLI 是最近 2 个日期目录，两个 IDE 按文件 mtime 收窗）；重置时刻直接采用日志原文给出
-//! 的官方值，不自建限流窗口模型。
+//! 与 CLI 是最近 2 个日期目录，两个 IDE 按文件 mtime 收窗）；重置时刻直接采用日志原文 / payload
+//! 原文给出的官方值，不自建限流窗口模型。
 //!
 //! 五个来源各扫一遍（PRD D1：插件宿主共享根 `CodeBuddyExtension/Logs/CodeBuddyIDE/` 与 CN
 //! IDE 真身重复记录同一次 429，**不扫**）：
@@ -22,6 +29,8 @@
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 
 use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
@@ -50,15 +59,15 @@ const WINDOW_DAYS: usize = 2;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// CodeBuddy CLI 数据根目录名（三平台同构）。
-const CLI_DATA_DIR: &str = ".codebuddy";
+pub(crate) const CLI_DATA_DIR: &str = ".codebuddy";
 
 /// CodeBuddy CLI 轮换状态目录名（`rotate.rs` / `codebuddy_cli.rs` 的写入方）。
-const CLI_ROTATE_DIR: &str = ".codebuddy-rotate";
+pub(crate) const CLI_ROTATE_DIR: &str = ".codebuddy-rotate";
 
 /// 状态文件名（`rotate.rs` / `codebuddy_ide.rs` / `codebuddy_cn_ide.rs` 的写入方）。
 ///
 /// 与写入方保持同名：这里只读回落的 `activeAccountId`（账号库的 `id`，不是 uid）。
-const CLI_STATE_FILE: &str = "state.json";
+pub(crate) const CLI_STATE_FILE: &str = "state.json";
 const IDE_STATE_FILE: &str = "codebuddy_ide.json";
 const CN_IDE_STATE_FILE: &str = "codebuddy_cn_ide.json";
 
@@ -107,7 +116,9 @@ const LONG_LINE_SNIFF_BYTES: usize = 4 * 1024;
 const MERGE_WINDOW_MS: i64 = 15_000;
 
 /// 限额文案标记（粗筛与逐行解析共用）：中文（国内版）与英文（国际版）。
-const QUOTA_MARKERS: [&str; 2] = ["超出频率限制", "usage exceeds frequency limit"];
+///
+/// 同时是 hook 通路（`rate_limit_events.rs`）识别限额 payload 的唯一判据。
+pub(crate) const QUOTA_MARKERS: [&str; 2] = ["超出频率限制", "usage exceeds frequency limit"];
 
 /// 官方重置时刻的句式标记：`将在 <时间> UTC+8 重置` / `will reset at <时间> UTC+8`。
 const RESET_MARKERS: [&str; 2] = ["将在 ", "will reset at "];
@@ -187,13 +198,14 @@ impl Event {
     }
 }
 
-/// 账号归因后的条目：`(账号, 模型)` 聚合的输入。
-struct Resolved {
-    account_id: String,
-    model: Option<String>,
-    reset_at: i64,
-    first_seen_at: i64,
-    hit_count: u32,
+/// 账号归因后的条目：`(账号, 模型)` 聚合的输入；hook 通路（`rate_limit_events.rs`）也产出它。
+#[derive(Clone)]
+pub(crate) struct Resolved {
+    pub(crate) account_id: String,
+    pub(crate) model: Option<String>,
+    pub(crate) reset_at: i64,
+    pub(crate) first_seen_at: i64,
+    pub(crate) hit_count: u32,
 }
 
 /// 字节级粗筛：命中限额文案的文件才解码（整份文件逐行解码是本模块的主要开销）。
@@ -579,8 +591,9 @@ fn line_timestamp(line: &str, format: LogFormat) -> Option<i64> {
 /// 官方给出的重置时刻（毫秒）。原文形如 `将在 2026-09-17 17:59:27 UTC+8 重置` /
 /// `will reset at 2026-09-14 10:59:21 UTC+8,`。
 ///
-/// 直接采用原文值（含原文声明的时区偏移），不自建窗口模型。
-fn parse_reset_at(line: &str) -> Option<i64> {
+/// 直接采用原文值（含原文声明的时区偏移），不自建窗口模型。hook payload 的
+/// `last_assistant_message` 走同一个入口，保证两条通路的时刻口径一致。
+pub(crate) fn parse_reset_at(line: &str) -> Option<i64> {
     for marker in RESET_MARKERS {
         let Some(index) = line.find(marker) else {
             continue;
@@ -861,8 +874,9 @@ fn ide_json_model(line: &str) -> Option<String> {
 /// sessionId → 账号 id。
 ///
 /// 归因失败（`sessions` 表缺失、会话不在库、uid 未收录）时返回空映射，调用方据此丢弃
-/// 该事件——宁可少显示，不可显示错账号。
-fn account_by_session(
+/// 该事件——宁可少显示，不可显示错账号。hook 通路（`rate_limit_events.rs`）的
+/// WorkBuddy 兜底归因复用本函数。
+pub(crate) fn account_by_session(
     variant: WbVariant,
     session_ids: &BTreeSet<String>,
 ) -> HashMap<String, String> {
@@ -1081,39 +1095,92 @@ fn cli_state_path() -> PathBuf {
     home_dir().join(CLI_ROTATE_DIR).join(CLI_STATE_FILE)
 }
 
-/// 全部账号当前的模型限额状态（五个来源各扫一遍）。
+// ---------------------------------------------------------------------------
+// 扫描缓存与范围（hook 通路接入后：hook 健康时只扫 IDE 两源）
+// ---------------------------------------------------------------------------
+
+/// 日志扫描的最小间隔：与前端节流口径一致（hook 已安装时 IDE 日志仍按 5 分钟扫一次）。
 ///
-/// 不接收档位参数：扫描本身就是全局的，按档位调用会把同一份日志扫 N 遍。
-pub fn get_rate_limits() -> Value {
-    let scanned_at = now_ms();
-    let mut resolved = Vec::new();
-    // ① WorkBuddy 两档位：日期目录枚举 + `sessions` 表归因（现有行为不变）。
-    for variant in WbVariant::ALL {
-        let events = collect_events(
-            &variant.data_root().join(LOG_DIR_NAME),
-            LogFormat::WorkBuddy,
-            AuthMarker::None,
-        );
-        resolved.extend(resolve(variant, &events));
+/// 前端在「距上次扫描 ≥ 5 分钟」时才发起请求，后端这一层是不依赖前端行为的兜底：
+/// 事件驱动的拉取、页面反复开关都不会触发额外的全量扫描。
+const SCAN_MIN_INTERVAL_MS: i64 = 5 * 60 * 1000;
+
+struct ScanCache {
+    at: i64,
+    /// 本次缓存是否只覆盖 IDE 两源（hook 已安装时的常态）。
+    ide_only: bool,
+    entries: Vec<Resolved>,
+}
+
+static SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
+
+/// 装 / 卸 hook 后调用：扫描范围变了，缓存作废，下一次扫描按全量五源走一遍。
+///
+/// 全量一次是为了装 hook 的瞬间不丢已经显示出来的 CLI / WorkBuddy 限额（之后按 hook 通路实时更新）。
+static FORCE_FULL_SCAN: AtomicBool = AtomicBool::new(false);
+
+pub fn invalidate_scan_cache() {
+    FORCE_FULL_SCAN.store(true, Ordering::SeqCst);
+    *SCAN_CACHE.lock().unwrap() = None;
+}
+
+/// 取一次扫描结果（命中缓存则不重扫）。
+///
+/// `allow_scan = false`（限额监听被关闭）时不重扫，只用已有缓存——关闭开关后不得再读日志。
+fn cached_scan(ide_only: bool, now: i64, allow_scan: bool) -> (i64, Vec<Resolved>) {
+    let mut cache = SCAN_CACHE.lock().unwrap();
+    if let Some(cached) = cache.as_ref() {
+        // 全量缓存可以满足「只要 IDE」的请求（超集）；IDE 缓存不能满足全量请求。
+        let range_ok = cached.ide_only == ide_only || !cached.ide_only;
+        if (now - cached.at < SCAN_MIN_INTERVAL_MS && range_ok) || !allow_scan {
+            return (cached.at, cached.entries.clone());
+        }
     }
-    // ② CodeBuddy CLI：日志与 WorkBuddy 同格式（时间戳/事件 id/模型归因全部兼容），
-    // 但会话不在 WorkBuddy 的 `sessions` 表里，归因走日志内鉴权 uid + 轮换状态文件回落。
-    let uid_to_account = account_id_by_uid();
-    let cli = collect_events(
-        &cli_logs_root(),
-        LogFormat::WorkBuddy,
-        AuthMarker::AuthDoInitProbe,
-    );
-    resolved.extend(resolve_by_uid(
-        &cli,
-        &uid_to_account,
-        &ActiveAccount::load(&cli_state_path()),
-    ));
+    if !allow_scan {
+        return (0, Vec::new());
+    }
+    let entries = scan_sources(ide_only);
+    *cache = Some(ScanCache {
+        at: now,
+        ide_only,
+        entries: entries.clone(),
+    });
+    (now, entries)
+}
+
+/// 按范围扫描日志：`ide_only` 时只扫两个 IDE（CLI 与 WorkBuddy 由 hook 通路负责）。
+fn scan_sources(ide_only: bool) -> Vec<Resolved> {
+    let mut resolved = Vec::new();
+    if !ide_only {
+        // ① WorkBuddy 两档位：日期目录枚举 + `sessions` 表归因（现有行为不变）。
+        for variant in WbVariant::ALL {
+            let events = collect_events(
+                &variant.data_root().join(LOG_DIR_NAME),
+                LogFormat::WorkBuddy,
+                AuthMarker::None,
+            );
+            resolved.extend(resolve(variant, &events));
+        }
+        // ② CodeBuddy CLI：日志与 WorkBuddy 同格式（时间戳/事件 id/模型归因全部兼容），
+        // 但会话不在 WorkBuddy 的 `sessions` 表里，归因走日志内鉴权 uid + 轮换状态文件回落。
+        let uid_to_account = account_id_by_uid();
+        let cli = collect_events(
+            &cli_logs_root(),
+            LogFormat::WorkBuddy,
+            AuthMarker::AuthDoInitProbe,
+        );
+        resolved.extend(resolve_by_uid(
+            &cli,
+            &uid_to_account,
+            &ActiveAccount::load(&cli_state_path()),
+        ));
+    }
     // ③ 两个 CodeBuddy IDE：同一份 Ide 格式与同一套归因，只有日志根与状态文件不同。
     //
     // **不扫** `CodeBuddyExtension/Logs/CodeBuddyIDE/`：它是插件宿主的跨 App 共享日志根，
     // 与 CN IDE 真身重复记录同一次 429（同一 requestId、行时间差 3 ms），扫它会重复展示
     // 且档位归属不清（PRD D1）。
+    let uid_to_account = account_id_by_uid();
     for (flavor, state_file) in [
         (CodeBuddyIdeFlavor::Intl, IDE_STATE_FILE),
         (CodeBuddyIdeFlavor::Cn, CN_IDE_STATE_FILE),
@@ -1133,7 +1200,33 @@ pub fn get_rate_limits() -> Value {
             &ActiveAccount::load(&store_dir().join(state_file)),
         ));
     }
-    build_payload(resolved, scanned_at)
+    resolved
+}
+
+/// 全部账号当前的模型限额状态。
+///
+/// 两条通路合并：
+/// - **hook 通路**（CLI / WorkBuddy 两档位）：事件驱动、实时归因，由 `rate_limit_events` 持有；
+/// - **日志扫描**（两个 IDE + hook 未安装时的全部五源）：按 `SCAN_MIN_INTERVAL_MS` 节流，
+///   合并后的 `scannedAt` 是**最近一次真实扫描**的时刻（前端据此节流）。
+///
+/// 不接收档位参数：扫描本身就是全局的，按档位调用会把同一份日志扫 N 遍。
+pub fn get_rate_limits() -> Value {
+    let now = now_ms();
+    // 限额监听关闭时不再扫日志（hook 信号照常入账，由后端持有）。
+    let enabled = crate::modules::rate_limit_events::rate_limit_enabled();
+    // hook 已安装 → 只扫 IDE 两源；否则全量兜底。装/卸瞬间强制全量一次。
+    // 关闭开关时不得把「强制全量」标志消费掉：否则重新开启后会直接 ide_only，
+    // 装 hook 前已经显示的 CLI / WorkBuddy 限额会丢。
+    let full_scan_once = if enabled {
+        FORCE_FULL_SCAN.swap(false, Ordering::SeqCst)
+    } else {
+        FORCE_FULL_SCAN.load(Ordering::SeqCst)
+    };
+    let ide_only = crate::modules::rate_limit_hook::is_installed() && !full_scan_once;
+    let (scanned_at, mut resolved) = cached_scan(ide_only, now, enabled);
+    resolved.extend(crate::modules::rate_limit_events::hook_entries(now));
+    build_payload(resolved, if scanned_at > 0 { scanned_at } else { now })
 }
 
 #[cfg(test)]

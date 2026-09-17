@@ -185,6 +185,38 @@ export interface RateLimitsPayload {
   accounts: AccountRateLimits[];
 }
 
+/** 一处客户端 hook 配置的安装状态。 */
+export interface RateLimitHookTarget {
+  /** 备份标签（codebuddy / workbuddy / workbuddy-ai）。 */
+  label: string;
+  /** `settings.json` 路径。 */
+  path: string;
+  /** 配置文件是否存在。 */
+  exists: boolean;
+  /** 该配置里是否已注册本工具的 Stop / FinalStop。 */
+  installed: boolean;
+}
+
+/**
+ * 限额 hook 安装状态：脚本 + 三处客户端配置逐项结果。
+ *
+ * `installed` = 脚本存在且至少一处配置注册成功；`lastEventAt` 是最近一次由后端
+ * 入账的 hook 限额事件时刻（null = 从未收到）。
+ */
+export interface RateLimitHookStatus {
+  scriptPath: string;
+  scriptExists: boolean;
+  eventsPath: string;
+  installed: boolean;
+  lastEventAt?: number | null;
+  targets: RateLimitHookTarget[];
+}
+
+/** 限额监听开关（`~/.wb-switch/rate_limit_config.json`）。 */
+export interface RateLimitConfig {
+  enabled: boolean;
+}
+
 export interface AutoRotateConfig {
   enabled: boolean;
   check_interval_minutes: number;

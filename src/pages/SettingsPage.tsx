@@ -15,6 +15,8 @@ import type {
   CheckinConfig,
   CheckinLog,
   GithubConfig,
+  RateLimitConfig,
+  RateLimitHookStatus,
   RotateLog,
   RotateStatus,
   UpdateInfo,
@@ -935,13 +937,146 @@ function AppearanceCard() {
   );
 }
 
+/** 限额监听：总开关 + hook 接入状态（CLI / WorkBuddy 实时上报，IDE 仍走日志扫描）。 */
+function RateLimitCard() {
+  const [config, setConfig] = useState<RateLimitConfig | null>(null);
+  const [status, setStatus] = useState<RateLimitHookStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([api.getRateLimitConfig(), api.getRateLimitHookStatus()])
+      .then(([cfg, hook]) => {
+        if (cancelled) return;
+        setConfig(cfg);
+        setStatus(hook);
+      })
+      .catch((e) => {
+        if (!cancelled) setMsg({ type: "err", text: api.asError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function onToggle(enabled: boolean) {
+    if (!config || busy) return;
+    const previous = config;
+    setConfig({ enabled });
+    setBusy(true);
+    setMsg(null);
+    try {
+      setConfig(await api.saveRateLimitConfig({ enabled }));
+      setMsg({ type: "ok", text: enabled ? "限额监听已开启" : "限额监听已关闭" });
+    } catch (e) {
+      setConfig(previous);
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onInstall() {
+    if (busy) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      setStatus(await api.installRateLimitHook());
+      setMsg({
+        type: "ok",
+        text: "已接入限额监听：CodeBuddy CLI / WorkBuddy 的 429 会实时上报（原配置已备份，可随时卸载还原）",
+      });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onUninstall() {
+    if (busy) return;
+    setBusy(true);
+    setMsg(null);
+    try {
+      setStatus(await api.uninstallRateLimitHook());
+      setMsg({ type: "ok", text: "已卸载 hook：三处客户端配置恢复原状，限额改由日志扫描发现" });
+    } catch (e) {
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const installedCount = status?.targets.filter((target) => target.installed).length ?? 0;
+  const hookDescription = status
+    ? status.installed
+      ? `${installedCount} / ${status.targets.length} 个客户端已接入：429 当轮实时上报（秒级）；CodeBuddy IDE 无事件，仍按日志扫描`
+      : "未接入：限额仅靠定期扫描日志发现（最多滞后数分钟）"
+    : "加载中…";
+
+  return (
+    <SettingsGroup id="settings-rate-limit" title="限额监听">
+      <CardContent className="space-y-0 p-0">
+        <SettingsFieldRow
+          label="启用限额监听"
+          description="关闭后不扫描日志、账号卡片不显示限额标记；重新开启后恢复"
+          htmlFor="rl-enabled"
+          operational
+        >
+          <Switch
+            id="rl-enabled"
+            checked={config?.enabled ?? true}
+            disabled={busy || !config}
+            onCheckedChange={(v) => void onToggle(v)}
+            aria-label="启用限额监听"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          className="border-b-0"
+          label="接入客户端 hook"
+          description={hookDescription}
+          htmlFor="rl-hook"
+          operational
+        >
+          {status?.installed ? (
+            <Button
+              id="rl-hook"
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => void onUninstall()}
+            >
+              {busy ? <Loader2 className="animate-spin" /> : null}卸载 hook
+            </Button>
+          ) : (
+            <Button id="rl-hook" size="sm" disabled={busy || !status} onClick={() => void onInstall()}>
+              {busy ? <Loader2 className="animate-spin" /> : null}接入 hook
+            </Button>
+          )}
+        </SettingsFieldRow>
+
+        {msg && (
+          <Alert
+            variant={msg.type === "err" ? "destructive" : "default"}
+            className="!w-auto mx-4 my-4 sm:mx-5"
+          >
+            <AlertDescription>{msg.text}</AlertDescription>
+          </Alert>
+        )}
+      </CardContent>
+    </SettingsGroup>
+  );
+}
+
 /** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
       <header className="mb-10 sm:mb-12">
         <h1 className="text-2xl font-semibold tracking-tight">设置</h1>
-        <p className="mt-2 text-sm leading-6 text-muted-foreground">自动签到、权限检测与自动更新配置。</p>
+        <p className="mt-2 text-sm leading-6 text-muted-foreground">自动签到、限额监听、权限检测与自动更新配置。</p>
       </header>
 
       <div className="min-w-0 space-y-12">
@@ -949,6 +1084,7 @@ export default function SettingsPage() {
         <PermissionCheckCard />
         <AutoCheckinCard />
         <AutoRotateCard />
+        <RateLimitCard />
         {api.isDesktop() || api.isDemoMode() ? <StartupCard /> : null}
         {api.isWebui() && !api.isDemoMode() ? null : <UpdateCard />}
       </div>

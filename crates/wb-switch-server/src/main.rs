@@ -69,6 +69,10 @@ fn spawn_background_loops() {
             let _ = travel::run_travel_claim_cycle().await;
         }
     });
+
+    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`，入账后由前端下次拉取可见。
+    // webui 没有 Tauri 事件通道，因此不需要推送回调（桌面端见 src-tauri/src/lib.rs）。
+    wb_switch_core::modules::rate_limit_events::spawn_watcher(|| {});
 }
 
 /// CLI 档位参数：`--variant ai` / `--variant=ai`；缺省国内版。

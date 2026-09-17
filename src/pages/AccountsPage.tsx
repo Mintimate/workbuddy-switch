@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
   CalendarCheck,
@@ -64,10 +65,12 @@ import { useAccountsStore } from "@/stores/accounts";
  * 账号页两个轮询的间隔（都经 `useVisibleInterval` 门控，仅主窗口可见时执行）。
  *
  * - 旅行：后台派发/领取循环最快 15 分钟变一次状态，1 分钟用于及时反映"到期领取"后的显示；
- * - 限额：每次都是全量扫日志台账，1 分钟足够捕获新事件（图标消失由卡片本地按 resetAt 判定）。
+ * - 限额：CLI / WorkBuddy 由后端 hook 信号实时入账并推送（`rate-limits-updated`），
+ *   这里只兜底 IDE 日志扫描；后端按同一间隔节流扫描，前端再按 payload 的 `scannedAt`
+ *   判断「距上次扫描 ≥ 5 分钟」才发起，避免可见性切换/页面重挂载把扫描打散。
  */
 const TRAVEL_REFRESH_INTERVAL_MS = 60 * 1000;
-const RATE_LIMIT_REFRESH_INTERVAL_MS = 60 * 1000;
+const RATE_LIMIT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -179,8 +182,13 @@ export default function AccountsPage() {
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
-  /** 账号 id -> 当前受限的模型（数据源是本机日志台账，含两个档位） */
+  /** 账号 id -> 当前受限的模型（数据源 = 后端限额台账：hook 信号 + 日志扫描） */
   const [rateLimitMap, setRateLimitMap] = useState<Record<string, RateLimitEntry[]>>({});
+  /**
+   * 「限额监听」开关（设置页）：关闭后不扫描、不渲染限额 chip。
+   * `null` = 配置尚未读到，不得按默认 true 先扫一轮（关闭开关后进账号页会闪 chip / 误请求）。
+   */
+  const [rateLimitEnabled, setRateLimitEnabled] = useState<boolean | null>(null);
   const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
@@ -360,14 +368,27 @@ export default function AccountsPage() {
   );
 
   /**
-   * 模型限额台账（本机日志）：一次返回全部账号，这里转成「账号 id -> 受限模型」。
+   * 模型限额台账（后端合并两条通路）：一次返回全部账号，这里转成「账号 id -> 受限模型」。
    *
    * 容错：老版本后端没有该命令、或扫描失败时按「无受限模型」处理（清空映射），
    * 不弹错误、不影响账号页其它功能。
    */
-  async function loadRateLimits() {
+  const lastRateLimitScanRef = useRef(0);
+
+  async function loadRateLimits(options?: { force?: boolean }) {
+    if (rateLimitEnabled !== true) return;
+    const scannedAt = lastRateLimitScanRef.current;
+    if (
+      !options?.force &&
+      scannedAt > 0 &&
+      Date.now() - scannedAt < RATE_LIMIT_REFRESH_INTERVAL_MS
+    ) {
+      return;
+    }
     try {
       const payload = await api.getRateLimits();
+      // `scannedAt` 是后端最近一次真实日志扫描的时刻：下一次扫描要等它满 5 分钟。
+      lastRateLimitScanRef.current = payload.scannedAt || Date.now();
       const next: Record<string, RateLimitEntry[]> = {};
       for (const entry of payload.accounts ?? []) {
         if (entry.limited?.length) next[entry.accountId] = entry.limited;
@@ -378,9 +399,47 @@ export default function AccountsPage() {
     }
   }
 
-  // 约 60 秒重扫一次以捕获新事件；仅主窗口可见时轮询，隐藏时暂停。
+  const loadRateLimitsRef = useRef(loadRateLimits);
+  loadRateLimitsRef.current = loadRateLimits;
+
+  // 兜底轮询：页面可见且距上次扫描 ≥ 5 分钟时拉一次（IDE 日志扫描在后端按同一间隔节流）。
   // 图标何时消失由卡片本地按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
-  useVisibleInterval(() => void loadRateLimits(), RATE_LIMIT_REFRESH_INTERVAL_MS);
+  useVisibleInterval(
+    () => void loadRateLimits(),
+    RATE_LIMIT_REFRESH_INTERVAL_MS,
+    rateLimitEnabled === true,
+  );
+
+  // 后端入账 hook 事件（CLI / WorkBuddy 的 429 当轮）后推送 → 立即拉取，秒级更新。
+  // 这一路不看节流：新状态已经在后端，前端只做拉取。
+  useEffect(() => {
+    if (api.isWebui()) return;
+    let unlisten: (() => void) | undefined;
+    void listen("rate-limits-updated", () => {
+      void loadRateLimitsRef.current({ force: true });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  // 「限额监听」开关（设置页）：关闭后不再发起扫描；开关状态来自后端配置文件，
+  // 设置页改完返回账号页会重新挂载并读到新值。
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getRateLimitConfig()
+      .then((config) => {
+        if (!cancelled) setRateLimitEnabled(config.enabled);
+      })
+      .catch(() => {
+        // 旧版本后端没有该命令：按默认开启，不影响账号页其它功能。
+        if (!cancelled) setRateLimitEnabled(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
@@ -1003,7 +1062,7 @@ export default function AccountsPage() {
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
-                rateLimits={rateLimitMap[a.id]}
+                rateLimits={rateLimitEnabled ? rateLimitMap[a.id] : undefined}
                 credit={creditMap[a.id]}
                 creditLoading={creditLoadingMap[a.id]}
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}

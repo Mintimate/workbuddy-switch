@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, export_import, limits, oauth, process, refresh, rotate, session, switch, token_stats,
-    travel, update, variant::WbVariant,
+    credits, export_import, limits, oauth, process, rate_limit_events, rate_limit_hook, refresh,
+    rotate, session, switch, token_stats, travel, update, variant::WbVariant,
 };
 
 #[derive(Serialize)]
@@ -417,6 +417,61 @@ pub async fn get_rate_limits() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(limits::get_rate_limits)
         .await
         .map_err(|error| format!("扫描模型限额失败: {error}"))
+}
+
+/// GET /api/rate-limits/hook-status —— hook 安装状态（脚本 + 三处客户端配置逐项结果）。
+///
+/// 读三个 `settings.json` 与一个脚本文件，放 blocking 线程避免占用主线程。
+#[tauri::command]
+pub async fn get_rate_limit_hook_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(with_hook_runtime_fields)
+        .await
+        .map_err(|error| format!("查询限额 hook 状态失败: {error}"))
+}
+
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份）。
+#[tauri::command]
+pub async fn install_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::install_hook();
+        // 扫描范围随安装结果变化（hook 健康时只扫 IDE 两源），缓存必须作废。
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+#[tauri::command]
+pub async fn uninstall_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::uninstall_hook();
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// hook 状态 + 运行期字段（最近一次 hook 事件时刻）。
+fn with_hook_runtime_fields() -> Value {
+    let mut status = rate_limit_hook::hook_status();
+    status["lastEventAt"] = json!(rate_limit_events::last_event_at());
+    status
+}
+
+/// GET /api/rate-limits/config —— 限额监听开关。
+#[tauri::command]
+pub fn get_rate_limit_config() -> Value {
+    crate::modules::config::load_rate_limit_config()
+}
+
+/// POST /api/rate-limits/config —— 保存限额监听开关。
+#[tauri::command]
+pub fn save_rate_limit_config(config: Value) -> Result<Value, String> {
+    crate::modules::config::save_rate_limit_config(&config).map_err(|e| e.to_string())?;
+    Ok(crate::modules::config::load_rate_limit_config())
 }
 
 /// POST /api/checkin —— 单账号立即签到。

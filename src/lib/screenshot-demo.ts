@@ -1,7 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
+  GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -377,6 +377,24 @@ function rotateConfig(): AutoRotateConfig {
   return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
 }
 
+/** 限额 hook 演示状态：三处配置都显示为已安装。 */
+function rateLimitHookStatus(): RateLimitHookStatus {
+  const base = "/demo/.wb-switch";
+  return {
+    scriptPath: `${base}/hook.sh`,
+    scriptExists: true,
+    eventsPath: `${base}/hook-events.jsonl`,
+    installed: true,
+    lastEventAt: Date.now() - 4 * 60_000,
+    targets: ["codebuddy", "workbuddy", "workbuddy-ai"].map((label) => ({
+      label,
+      path: `/demo/.${label}/settings.json`,
+      exists: true,
+      installed: true,
+    })),
+  };
+}
+
 function checkinLogs(): CheckinLog[] {
   return hydratedAccounts().flatMap((account, accountIndex) => [0, 1, 2].map((daysAgo) => ({ ts: atLocalTime(daysAgo, 8, 6 + accountIndex * 9), accountId: account.id, email: account.nickname ?? account.email ?? account.id, result: accountIndex === 1 && daysAgo === 0 ? "already" : "success" })));
 }
@@ -564,6 +582,8 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
     case "get_rate_limits": return rateLimits();
+    case "get_rate_limit_hook_status": return rateLimitHookStatus();
+    case "get_rate_limit_config": return { enabled: true };
     case "get_auto_travel_config": return travelConfig();
     case "get_auto_rotate_config": return config;
     case "rotate_status": return rotateStatus;

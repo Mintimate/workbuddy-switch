@@ -6,6 +6,7 @@ mod instance_lock;
 mod tray;
 
 use std::time::Duration;
+use tauri::Emitter;
 use wb_switch_core::modules;
 
 const SCREENSHOT_DEMO_ENV: &str = "WB_SWITCH_SCREENSHOT_DEMO";
@@ -14,8 +15,9 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
-/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活。
-fn spawn_background_loops() {
+/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活；
+/// 限额 hook 信号每秒轮询一次（入账即通知前端）。
+fn spawn_background_loops(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
@@ -77,6 +79,13 @@ fn spawn_background_loops() {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
+
+    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`（CLI / WorkBuddy 的 429 当轮
+    // 由客户端 hook 追加），入账后通知前端立即拉取。轻量模式下窗口销毁但进程仍在，
+    // 状态由后端持有（见 `rate_limit_events.rs`）。
+    modules::rate_limit_events::spawn_watcher(move || {
+        let _ = app.emit("rate-limits-updated", serde_json::json!({}));
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -128,7 +137,7 @@ pub fn run() {
             }
             // README 截图模式只渲染前端虚构数据，禁止读取账号后执行签到、轮换或保活。
             if !is_screenshot_demo() {
-                spawn_background_loops();
+                spawn_background_loops(app.handle().clone());
             }
             Ok(())
         })
@@ -163,6 +172,11 @@ pub fn run() {
             commands::get_credit_statistics,
             commands::get_token_statistics,
             commands::get_rate_limits,
+            commands::get_rate_limit_hook_status,
+            commands::install_rate_limit_hook,
+            commands::uninstall_rate_limit_hook,
+            commands::get_rate_limit_config,
+            commands::save_rate_limit_config,
             commands::checkin,
             commands::checkin_all,
             commands::get_auto_checkin_config,

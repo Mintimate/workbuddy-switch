@@ -12,6 +12,8 @@ pub mod limits;
 pub mod oauth;
 pub mod official_usage;
 pub mod process;
+pub mod rate_limit_events;
+pub mod rate_limit_hook;
 pub mod refresh;
 pub mod rotate;
 pub mod session;
