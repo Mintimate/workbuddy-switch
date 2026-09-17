@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use crate::modules::account;
+use crate::modules::cli_switch_history;
 use crate::modules::config::{atomic_write, home_dir, now_ms};
 use crate::modules::process;
 use crate::modules::variant::WbVariant;
@@ -812,7 +813,7 @@ fn run_helper_command(command: &str) -> Result<Output, String> {
                     return Err(helper_validation_error(
                         "启动阶段",
                         "无法启动 Git Bash shell",
-                    ))
+                    ));
                 }
             }
         }
@@ -831,7 +832,7 @@ fn run_helper_command(command: &str) -> Result<Output, String> {
                     return Err(helper_validation_error(
                         "启动阶段",
                         "无法使用 Node.js 执行 helper",
-                    ))
+                    ));
                 }
             }
         }
@@ -1217,6 +1218,9 @@ pub fn set_active_account(account_id: &str) -> Result<Value, String> {
 
 /// 账号页手动切 CLI。`close_running_cli` 为 true 且发生国内/国际跨站时，
 /// 关闭正在运行的 CLI 进程，避免旧进程把国内站缓存写回去。
+///
+/// 切换成功后且账号值确实变化时，向 `cli_switch_history.jsonl` 追一条记录
+/// （限额归因据此还原「某时刻生效的账号」；写入失败只告警，不影响切换结果）。
 pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Result<Value, String> {
     if cfg!(windows) {
         ensure_no_process_env_override()?;
@@ -1250,11 +1254,23 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
     };
 
     let previous_state = std::fs::read_to_string(state_path()).ok();
+    let previous_active_id = previous_state
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|state| {
+            state
+                .get("activeAccountId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
+    let switched_at = now_ms();
     let mut state = load_state();
     let previous_variant = current_cli_variant(&accounts, &state);
     state["active"] = json!(index);
     state["activeAccountId"] = json!(canonical_id);
-    state["updatedAt"] = json!(now_ms());
+    state["updatedAt"] = json!(switched_at);
     std::fs::create_dir_all(rotate_dir()).map_err(|_| {
         if cfg!(windows) {
             auth_config_error("状态阶段", "无法创建 CLI 账号状态目录，请检查用户目录权限")
@@ -1292,6 +1308,19 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
         if let Err(error) = persist_cli_region_env(variant) {
             restore_file(&state_path(), previous_state.as_deref());
             return Err(error);
+        }
+    }
+
+    // 切换真正生效（校验通过、state 未被回滚）后才记历史：限额归因要用它回答
+    // 「某个进程启动时刻生效的是哪个账号」。失败只告警——切换已经完成，缺历史
+    // 只会让后续归因保守丢弃。
+    if previous_active_id.as_deref() != Some(canonical_id.as_str()) {
+        if let Err(error) = cli_switch_history::append(
+            &cli_switch_history::history_path(),
+            &canonical_id,
+            switched_at,
+        ) {
+            eprintln!("[cli-switch-history] 追加切换历史失败: {error}");
         }
     }
 
