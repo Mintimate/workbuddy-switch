@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
-    credit_usage, credits, export_import, oauth, process, refresh, rotate, session, switch,
+    credit_usage, credits, export_import, limits, oauth, process, refresh, rotate, session, switch,
     token_stats, travel, update, variant::WbVariant,
 };
 
@@ -98,6 +98,7 @@ pub fn router() -> Router {
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
         .route("/api/token-stats", get(api_token_statistics))
+        .route("/api/rate-limits", get(api_rate_limits))
         .route("/api/checkin", post(api_checkin))
         .route("/api/checkin/all", post(api_checkin_all))
         .route(
@@ -566,6 +567,19 @@ async fn api_token_statistics(RawQuery(query): RawQuery) -> Response {
         Ok(statistics) => json_ok(statistics),
         Err(error) => json_err(
             format!("扫描 Token 统计失败: {error}"),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+    }
+}
+
+/// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
+///
+/// 扫描本机日志文件，放 blocking 线程避免占用运行时线程；无受限模型时返回空数组。
+async fn api_rate_limits() -> Response {
+    match tokio::task::spawn_blocking(limits::get_rate_limits).await {
+        Ok(payload) => json_ok(payload),
+        Err(error) => json_err(
+            format!("扫描模型限额失败: {error}"),
             StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }

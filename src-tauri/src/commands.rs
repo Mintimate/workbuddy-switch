@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel,
-    update, variant::WbVariant,
+    credits, export_import, limits, oauth, process, refresh, rotate, session, switch, token_stats,
+    travel, update, variant::WbVariant,
 };
 
 #[derive(Serialize)]
@@ -406,6 +406,17 @@ pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || token_stats::get_statistics(days))
         .await
         .map_err(|error| format!("扫描 Token 统计失败: {error}"))
+}
+
+/// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
+///
+/// 不接收档位参数：扫描本身就是全局的（两档位各扫一遍）。扫描读取本机日志文件，
+/// 放 blocking 线程避免阻塞主线程；无受限模型时返回空数组，不是错误。
+#[tauri::command]
+pub async fn get_rate_limits() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(limits::get_rate_limits)
+        .await
+        .map_err(|error| format!("扫描模型限额失败: {error}"))
 }
 
 /// POST /api/checkin —— 单账号立即签到。
