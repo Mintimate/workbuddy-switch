@@ -979,6 +979,33 @@ function RateLimitCard() {
   }
 
   /**
+   * 「扫描 CodeBuddy IDE 日志」独立开关：只关两个 IDE 的日志来源（IDE 的 429 不触发任何
+   * 事件，日志是它唯一的数据源），CLI / WorkBuddy 的 hook 通路不受影响。
+   */
+  async function onToggleIdeLogs(scanIdeLogs: boolean) {
+    if (!config || busy) return;
+    const previous = config;
+    setConfig({ ...config, scanIdeLogs });
+    setBusy(true);
+    setMsg(null);
+    try {
+      // 与总开关一样整份提交：只带 scanIdeLogs 会把 enabled / hookOptOut 冲成默认值。
+      setConfig(await api.saveRateLimitConfig({ ...config, scanIdeLogs }));
+      setMsg({
+        type: "ok",
+        text: scanIdeLogs
+          ? "已开启 IDE 日志扫描"
+          : "已关闭 IDE 日志扫描：两个 CodeBuddy IDE 的限额不再显示",
+      });
+    } catch (e) {
+      setConfig(previous);
+      setMsg({ type: "err", text: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /**
    * 回读限额配置：装 / 卸 hook 无论成败都会写「接入 / 卸载」意图（部分目标失败也算），
    * 本地标记不能只靠乐观更新，否则随后拨总开关会把过期值写回磁盘。
    */
@@ -1029,11 +1056,16 @@ function RateLimitCard() {
 
   const existingTargets = status?.targets.filter((target) => target.exists) ?? [];
   const installedCount = existingTargets.filter((target) => target.installed).length;
+  // IDE 的限额只有日志一条来源：扫描开关关闭时文案不能再说「仍按日志扫描」。
+  const ideNote =
+    config?.scanIdeLogs === false
+      ? "CodeBuddy IDE 的日志扫描已关闭"
+      : "CodeBuddy IDE 无事件，仍按日志扫描";
   const hookDescription = status
     ? existingTargets.length === 0
-      ? "未检测到 CodeBuddy CLI / WorkBuddy 客户端：没有可接入的配置（CodeBuddy IDE 的限额仍按日志扫描）"
+      ? `未检测到 CodeBuddy CLI / WorkBuddy 客户端：没有可接入的配置（${ideNote}）`
       : status.installed
-        ? `${installedCount} / ${existingTargets.length} 个已安装客户端已接入：429 当轮实时上报（秒级）；CodeBuddy IDE 无事件，仍按日志扫描`
+        ? `${installedCount} / ${existingTargets.length} 个已安装客户端已接入：429 当轮实时上报（秒级）；${ideNote}`
         : config?.hookOptOut
           ? "已卸载：不会再自动接入，限额改由日志扫描发现；点「接入 hook」可恢复实时上报"
           : "未接入：限额仅靠定期扫描日志发现（最多滞后数分钟）"
@@ -1054,6 +1086,21 @@ function RateLimitCard() {
             disabled={busy || !config}
             onCheckedChange={(v) => void onToggle(v)}
             aria-label="启用限额监听"
+          />
+        </SettingsFieldRow>
+
+        <SettingsFieldRow
+          label="扫描 CodeBuddy IDE 日志"
+          description="IDE 的限额只有日志一条来源，关掉后不再显示；CodeBuddy CLI / WorkBuddy 的实时上报不受影响"
+          htmlFor="rl-ide-scan"
+          operational
+        >
+          <Switch
+            id="rl-ide-scan"
+            checked={config?.scanIdeLogs ?? true}
+            disabled={busy || !config}
+            onCheckedChange={(v) => void onToggleIdeLogs(v)}
+            aria-label="扫描 CodeBuddy IDE 日志"
           />
         </SettingsFieldRow>
 

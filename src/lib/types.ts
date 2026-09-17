@@ -217,6 +217,12 @@ export interface RateLimitConfig {
   enabled: boolean;
   /** 用户点过「卸载 hook」→ 启动时不再自动接入；重新点「接入 hook」清除。 */
   hookOptOut: boolean;
+  /**
+   * 是否扫描两个 CodeBuddy IDE 的日志（默认 true）。
+   * IDE 的 429 不触发任何 hook 事件，日志是它唯一的数据源；关闭只影响 IDE 两源，
+   * CLI / WorkBuddy 的 hook 实时上报与未接 hook 时的日志兜底不变。
+   */
+  scanIdeLogs: boolean;
 }
 
 export interface AutoRotateConfig {

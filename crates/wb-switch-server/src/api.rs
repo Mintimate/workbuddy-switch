@@ -657,9 +657,12 @@ async fn api_rate_limit_config() -> Response {
     json_ok(config::load_rate_limit_config())
 }
 
+/// POST /api/rate-limits/config —— 保存限额监听配置。
+///
+/// 与桌面端同语义：`scanIdeLogs` 变化时清扫描缓存（只清缓存、不强制全量）。
 async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
-    match config::save_rate_limit_config(submitted) {
+    match limits::save_rate_limit_config(submitted) {
         Ok(()) => json_ok(config::load_rate_limit_config()),
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }

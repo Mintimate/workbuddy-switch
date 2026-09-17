@@ -526,8 +526,10 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
 /// 默认限额监听配置：默认开启（与改造前「账号页自动显示限额」的行为一致）。
 ///
 /// `hookOptOut` = 用户点过「卸载 hook」→ 不再自动接入；默认 `false`（默认接入）。
+/// `scanIdeLogs` = 是否扫描两个 CodeBuddy IDE 的日志；默认 `true`（IDE 的 429 不触发事件，
+/// 日志是它唯一的数据源）。关闭只影响 IDE 两源，CLI / WorkBuddy 的 hook 通路与兜底扫描不变。
 pub fn default_rate_limit_config() -> Value {
-    json!({ "enabled": true, "hookOptOut": false })
+    json!({ "enabled": true, "hookOptOut": false, "scanIdeLogs": true })
 }
 
 /// 读取指定的限额监听配置文件（缺失/损坏时合并默认值）。
@@ -537,7 +539,7 @@ pub fn load_rate_limit_config_at(path: &Path) -> Value {
     let mut cfg = default_rate_limit_config();
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-            for key in ["enabled", "hookOptOut"] {
+            for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
                 if let Some(value) = map.get(key).and_then(Value::as_bool) {
                     cfg[key] = json!(value);
                 }
@@ -555,7 +557,7 @@ pub fn load_rate_limit_config() -> Value {
 /// 保存限额监听配置到指定路径（只保留已知字段）。
 pub fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
     let mut merged = default_rate_limit_config();
-    for key in ["enabled", "hookOptOut"] {
+    for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
         if let Some(value) = cfg.get(key).and_then(Value::as_bool) {
             merged[key] = json!(value);
         }
@@ -575,11 +577,6 @@ pub fn set_rate_limit_hook_opt_out_at(path: &Path, opt_out: bool) -> std::io::Re
     cfg["hookOptOut"] = json!(opt_out);
     save_rate_limit_config_at(path, &cfg)?;
     Ok(load_rate_limit_config_at(path))
-}
-
-/// 保存限额监听配置（只保留已知字段）。
-pub fn save_rate_limit_config(cfg: &Value) -> std::io::Result<()> {
-    save_rate_limit_config_at(&rate_limit_config_file(), cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -1299,29 +1296,51 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rate_limit_config.json");
 
-        // 文件缺失 → 默认开启、未卸载过。
+        // 文件缺失 → 默认开启、未卸载过、IDE 日志扫描开启。
         let defaults = load_rate_limit_config_at(&path);
         assert_eq!(defaults.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(
             defaults.get("hookOptOut").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            defaults.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
+        );
 
         // 显式关闭 → 生效。
-        save_rate_limit_config_at(&path, &json!({"enabled": false, "extra": 1})).unwrap();
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "scanIdeLogs": false, "extra": 1}),
+        )
+        .unwrap();
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            saved.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "scanIdeLogs 显式 false 必须落盘"
+        );
         assert!(saved.get("extra").is_none(), "只保留已知字段: {saved}");
         assert_eq!(
             saved.as_object().unwrap().len(),
-            2,
-            "只有 enabled + hookOptOut"
+            3,
+            "只有 enabled + hookOptOut + scanIdeLogs"
         );
         assert_eq!(
             load_rate_limit_config_at(&path)
-                .get("enabled")
+                .get("scanIdeLogs")
                 .and_then(Value::as_bool),
-            Some(false)
+            Some(false),
+            "读回仍是显式 false（不被默认值冲掉）"
+        );
+
+        // 显式 true 与显式 false 都如实往返（默认值不覆盖显式值）。
+        save_rate_limit_config_at(&path, &json!({"scanIdeLogs": true})).unwrap();
+        let round_trip = load_rate_limit_config_at(&path);
+        assert_eq!(
+            round_trip.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
         );
 
         // 损坏内容 / 类型不符 → 回默认，不报错。
@@ -1329,6 +1348,12 @@ mod tests {
         assert_eq!(
             load_rate_limit_config_at(&path)
                 .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("scanIdeLogs")
                 .and_then(Value::as_bool),
             Some(true)
         );
@@ -1356,7 +1381,7 @@ mod tests {
         // 只保留已知字段：多余键不落盘。
         save_rate_limit_config_at(
             &path,
-            &json!({"enabled": false, "hookOptOut": true, "unknown": "x"}),
+            &json!({"enabled": false, "hookOptOut": true, "scanIdeLogs": false, "unknown": "x"}),
         )
         .unwrap();
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -1364,7 +1389,7 @@ mod tests {
         assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
         assert!(saved.get("unknown").is_none(), "只保留已知字段: {saved}");
 
-        // 单字段改写：置 true / 置 false 都不动 `enabled`。
+        // 单字段改写：置 true / 置 false 都不动 `enabled` 与 `scanIdeLogs`。
         let after_opt_out = set_rate_limit_hook_opt_out_at(&path, true).unwrap();
         assert_eq!(
             after_opt_out.get("hookOptOut").and_then(Value::as_bool),
@@ -1375,12 +1400,21 @@ mod tests {
             Some(false),
             "改写 hookOptOut 不得重置限额监听开关"
         );
+        assert_eq!(
+            after_opt_out.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置 IDE 日志扫描开关"
+        );
         let cleared = set_rate_limit_hook_opt_out_at(&path, false).unwrap();
         assert_eq!(
             cleared.get("hookOptOut").and_then(Value::as_bool),
             Some(false)
         );
         assert_eq!(cleared.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            cleared.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false)
+        );
         // 配置缺失时也能写入（首次卸载 / 首次接入）。
         let fresh = dir.join("fresh.json");
         assert_eq!(

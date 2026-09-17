@@ -471,9 +471,12 @@ pub fn get_rate_limit_config() -> Value {
 }
 
 /// POST /api/rate-limits/config —— 保存限额监听开关。
+///
+/// 走 `limits::save_rate_limit_config`：`scanIdeLogs` 变化时同步清扫描缓存（只清缓存，
+/// 不强制全量），否则关掉 IDE 扫描后下一次还会按旧缓存把两个 IDE 扫一遍。
 #[tauri::command]
 pub fn save_rate_limit_config(config: Value) -> Result<Value, String> {
-    crate::modules::config::save_rate_limit_config(&config).map_err(|e| e.to_string())?;
+    limits::save_rate_limit_config(&config).map_err(|e| e.to_string())?;
     Ok(crate::modules::config::load_rate_limit_config())
 }
 
