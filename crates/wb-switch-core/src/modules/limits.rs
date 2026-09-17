@@ -36,15 +36,17 @@ use crate::modules::vscode_cn_inject::{codebuddy_ide_data_dir, CodeBuddyIdeFlavo
 /// 日志根目录名（档位/IDE 数据根下）。
 const LOG_DIR_NAME: &str = "logs";
 
-/// 扫描窗口：WorkBuddy 两档位与 CLI 取最近 2 个日期目录；两个 IDE 取文件 mtime 在最近
-/// 2 天内的日志。
+/// 扫描窗口：五个来源一致，取文件 mtime 在最近 2 天内的日志（固定，不做可配置）。
+///
+/// 判据用 mtime 而非目录名/会话名：日志文件当天创建后会写到**次日凌晨**（本机实测
+/// `2026-09-15/` 的两个文件写到 9/16 07:59），按「最近 N 个目录」会漏掉跨天那批记录。
 ///
 /// 本机实测（release）五个来源全量扫描约 115 ms：CLI 最重（候选 43MB / 7 文件，约 66 ms，
 /// 因为 CLI 的业务日志是完整会话记录）、CN IDE 约 12 ms、WorkBuddy 两档位合计约 7 ms。
 /// 仍远快于前端 60s 轮询间隔，因此**不建**增量索引或本地缓存层。
 const WINDOW_DAYS: usize = 2;
 
-/// 一天的毫秒数（IDE 的 mtime 收窗用）。
+/// 一天的毫秒数（mtime 收窗用）。
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// CodeBuddy CLI 数据根目录名（三平台同构）。
@@ -223,31 +225,44 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-/// 档位日志根下最近的日期目录（`logs/YYYY-MM-DD/`），新到旧。
+/// 窗口内的 WorkBuddy 格式日志文件（两档位与 CLI 共用；日期目录下可能还有
+/// `sdk/conversations/` 一层）。
 ///
-/// 只认日期形态的目录名：`logs/` 下还有 `sdk`、`migration`、`Crash-Log` 等非日期目录。
-/// 目录缺失（如国际版某天没写日志）直接跳过，不是错误。
-fn recent_log_dirs(logs_root: &Path) -> Vec<PathBuf> {
+/// 两层过滤：
+/// - 只认日期形态的目录名：`logs/` 下还有 `sdk`、`migration`、`Crash-Log`、`memwatch`
+///   等非日期目录，整体忽略；
+/// - 目录内**没有任何** mtime 在窗口内的 `.log` 时整目录跳过。
+///
+/// 判据是文件 mtime 而非目录名：日志文件当天创建后会写到**次日凌晨**（本机实测
+/// `2026-09-15/` 的两个文件写到 9/16 07:59），按「最近 N 个目录」会漏掉跨天那批记录。
+/// 目录名只用于排除非日志目录，不参与窗口判定。
+fn windowed_log_files(logs_root: &Path, cutoff_ms: i64) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(logs_root) else {
         return Vec::new();
     };
-    let mut dated: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?.to_string();
-            NaiveDate::parse_from_str(&name, "%Y-%m-%d")
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let is_dated = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| NaiveDate::parse_from_str(name, "%Y-%m-%d").is_ok());
+        if !is_dated {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        log_files(&path, &mut candidates);
+        files.extend(candidates.into_iter().filter(|file| {
+            std::fs::metadata(file)
                 .ok()
-                .map(|_| (name, path))
-        })
-        .collect();
-    // 目录名是 ISO 日期，字典序即时间序。
-    dated.sort_by(|left, right| right.0.cmp(&left.0));
-    dated.truncate(WINDOW_DAYS);
-    dated.into_iter().map(|(_, path)| path).collect()
+                .and_then(|metadata| modified_ms(&metadata))
+                .is_some_and(|modified| modified >= cutoff_ms)
+        }));
+    }
+    files
 }
 
 /// 递归收集候选日志文件（日期目录下可能还有 `sdk/conversations/` 一层）。
@@ -422,17 +437,12 @@ fn scan_file(path: &Path, format: LogFormat, auth: AuthMarker, hits: &mut Vec<Hi
 
 /// 枚举 → 粗筛 → 解析 → 去重，返回某个来源的限额事件。
 fn collect_events(root: &Path, format: LogFormat, auth: AuthMarker) -> Vec<Event> {
+    let cutoff_ms = now_ms() - WINDOW_DAYS as i64 * DAY_MS;
     let files = match format {
-        // 日期目录（`logs/YYYY-MM-DD/`，可能还有 `sdk/conversations/` 一层）。
-        LogFormat::WorkBuddy => {
-            let mut files = Vec::new();
-            for directory in recent_log_dirs(root) {
-                log_files(&directory, &mut files);
-            }
-            files
-        }
+        // 日期目录形态校验 + 文件 mtime 收窗（目录名不参与窗口判定）。
+        LogFormat::WorkBuddy => windowed_log_files(root, cutoff_ms),
         // IDE 会话目录下按插件目录过滤 + 文件 mtime 收窗。
-        LogFormat::Ide => ide_log_files(root, now_ms() - WINDOW_DAYS as i64 * DAY_MS),
+        LogFormat::Ide => ide_log_files(root, cutoff_ms),
     };
     let mut hits = Vec::new();
     for file in files {
@@ -1180,6 +1190,17 @@ mod tests {
         ))
     }
 
+    /// 把文件 mtime 设为 N 天前（收窗测试用；`File::set_modified` 需要可写句柄）。
+    fn set_days_old_mtime(path: &Path, days: u64) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("打开文件以设置 mtime")
+            .set_modified(old)
+            .expect("设置文件 mtime");
+    }
+
     /// 现有两档位（WorkBuddy 格式、无鉴权行）的解析入口。
     fn workbuddy_hits(text: &str) -> Vec<Hit> {
         scan_text(text, LogFormat::WorkBuddy, AuthMarker::None)
@@ -1618,21 +1639,40 @@ mod tests {
         assert_eq!(events[1].session_id.as_deref(), Some("session-c"));
     }
 
+    /// 收窗判据是文件 mtime 而非目录名：目录名很旧但文件在窗口内（跨天追加）必须纳入，
+    /// 目录名很新但文件在窗口外必须排除；非日期目录整体忽略。
     #[test]
-    fn window_keeps_the_two_newest_date_directories_and_tolerates_missing_ones() {
+    fn window_selects_files_by_mtime_not_directory_name_and_tolerates_missing_roots() {
         let root = temp_dir("window");
-        for name in ["2026-09-11", "2026-09-16", "2026-09-17"] {
-            std::fs::create_dir_all(root.join(name)).expect("日期目录");
-        }
-        // `logs/` 下的非日期目录必须被忽略。
-        std::fs::create_dir_all(root.join("migration")).expect("非日期目录");
-        let names: Vec<String> = recent_log_dirs(&root)
+        // 目录名很旧、文件刚写：真机「9/15 目录写到 9/16 07:59」的形态，必须纳入。
+        let cross_day = root.join("2020-01-01");
+        std::fs::create_dir_all(&cross_day).expect("跨天目录");
+        std::fs::write(cross_day.join("cross-day.log"), "x").expect("跨天日志");
+        // 目录名很新、文件 mtime 在窗口外：必须排除。
+        let old_file = root.join("2099-12-31").join("old.log");
+        std::fs::create_dir_all(old_file.parent().expect("父目录")).expect("未来目录");
+        std::fs::write(&old_file, "x").expect("旧日志");
+        set_days_old_mtime(&old_file, 30);
+        // 非日期目录整体忽略（即使里面有窗口内的 .log）。
+        let plain = root.join("memwatch");
+        std::fs::create_dir_all(&plain).expect("非日期目录");
+        std::fs::write(plain.join("mem.log"), "x").expect("非日期目录内日志");
+
+        let cutoff = now_ms() - WINDOW_DAYS as i64 * DAY_MS;
+        let names: BTreeSet<String> = windowed_log_files(&root, cutoff)
             .iter()
             .filter_map(|path| Some(path.file_name()?.to_string_lossy().to_string()))
             .collect();
-        assert_eq!(names, ["2026-09-17", "2026-09-16"]);
+        assert_eq!(
+            names,
+            BTreeSet::from(["cross-day.log".to_string()]),
+            "旧目录里的新文件要收，新目录里的旧文件要排除，非日期目录整体忽略"
+        );
+        // 目录名不参与判定：cutoff 推到未来 → 空集；拉到 0 → 两个日期目录下的文件都收。
+        assert!(windowed_log_files(&root, now_ms() + DAY_MS).is_empty());
+        assert_eq!(windowed_log_files(&root, 0).len(), 2);
         assert!(
-            recent_log_dirs(&root.join("missing")).is_empty(),
+            windowed_log_files(&root.join("missing"), 0).is_empty(),
             "档位日志根缺失时返回空集，不是错误"
         );
         assert!(collect_events(
