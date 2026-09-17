@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactElement, type ReactNode } from "react";
 import { ArrowUpCircle, CircleCheck, ExternalLink, Loader2, RefreshCw, Save } from "lucide-react";
+import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -353,6 +354,11 @@ function AutoRotateCard() {
     setMsg(null);
     try {
       const res = await api.runRotate();
+      // webui 没有事件通道：手动检查的推迟提示只能从返回值里取（桌面端由
+      // `rotate-deferred` 事件统一弹出，避免同一件事弹两次）。
+      if (api.isWebui() && res.notify?.body) {
+        toast.warning("自动轮换已推迟", { description: res.notify.body, duration: 10_000 });
+      }
       setMsg({
         type: res.status === "error" ? "err" : "ok",
         text:

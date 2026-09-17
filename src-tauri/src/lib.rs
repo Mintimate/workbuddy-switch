@@ -15,12 +15,17 @@ pub(crate) fn is_screenshot_demo() -> bool {
     std::env::var(SCREENSHOT_DEMO_ENV).as_deref() == Ok("1")
 }
 
-/// 轮换推迟提示：桌面端投递系统通知（应用在托盘/后台时同样可见）；
+/// 轮换推迟提示：桌面端先向前端推 `rotate-deferred`（应用内提示，窗口开着就能看到），
+/// 再尽力投递系统通知（应用在托盘/后台时可见）。
+///
+/// 应用内提示不依赖系统通知权限：插件在开发态会把通知登记到「终端」名下，且投递失败
+/// 无法观测（`show()` 恒返回 Ok），所以两者都发、以前者为准。
 /// 其它形态由 core 的日志与 `notify` 返回字段承载，宿主不投递。
 pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json::Value) {
     #[cfg(desktop)]
     {
         if let Some(notify) = result.get("notify") {
+            let _ = app.emit("rotate-deferred", notify.clone());
             tray::notify_rotate_deferred(app, notify);
         }
     }
