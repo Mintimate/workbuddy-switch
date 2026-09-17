@@ -43,6 +43,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
+import { useVisibleInterval } from "@/lib/use-visible-interval";
 import {
   DEFAULT_VARIANT,
   accountVariant,
@@ -58,6 +59,15 @@ import {
 import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
+
+/**
+ * 账号页两个轮询的间隔（都经 `useVisibleInterval` 门控，仅主窗口可见时执行）。
+ *
+ * - 旅行：后台派发/领取循环最快 15 分钟变一次状态，1 分钟用于及时反映"到期领取"后的显示；
+ * - 限额：每次都是全量扫日志台账，1 分钟足够捕获新事件（图标消失由卡片本地按 resetAt 判定）。
+ */
+const TRAVEL_REFRESH_INTERVAL_MS = 60 * 1000;
+const RATE_LIMIT_REFRESH_INTERVAL_MS = 60 * 1000;
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -336,21 +346,18 @@ export default function AccountsPage() {
     }
   }
 
-  // 当前档位账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 当前档位账号列表变化后并行查询旅行状态；之后按 TRAVEL_REFRESH_INTERVAL_MS 周期刷新，
+  // 以反映后台派发/领取循环带来的状态变化。仅主窗口可见时轮询，隐藏时暂停。
   // 成长中心仅国内版开放，国际版不发请求也不展示标签。
-  useEffect(() => {
-    if (!travelAvailable || !visibleAccounts.length) return;
-    let cancelled = false;
-    const ids = visibleAccounts.map((account) => account.id);
-    void loadTravelMap(ids, () => cancelled);
-    const timer = window.setInterval(() => {
-      void loadTravelMap(ids, () => cancelled);
-    }, 60_000);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [travelAvailable, visibleAccounts]);
+  const travelAccountIds = useMemo(
+    () => visibleAccounts.map((account) => account.id),
+    [visibleAccounts],
+  );
+  useVisibleInterval(
+    () => void loadTravelMap(travelAccountIds),
+    TRAVEL_REFRESH_INTERVAL_MS,
+    travelAvailable && travelAccountIds.length > 0,
+  );
 
   /**
    * 模型限额台账（本机日志）：一次返回全部账号，这里转成「账号 id -> 受限模型」。
@@ -371,13 +378,9 @@ export default function AccountsPage() {
     }
   }
 
-  // 与账号页既有刷新节奏一致，约 60 秒重扫一次以捕获新事件；图标何时消失由卡片本地
-  // 按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
-  useEffect(() => {
-    void loadRateLimits();
-    const timer = window.setInterval(() => void loadRateLimits(), 60_000);
-    return () => window.clearInterval(timer);
-  }, []);
+  // 约 60 秒重扫一次以捕获新事件；仅主窗口可见时轮询，隐藏时暂停。
+  // 图标何时消失由卡片本地按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
+  useVisibleInterval(() => void loadRateLimits(), RATE_LIMIT_REFRESH_INTERVAL_MS);
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
