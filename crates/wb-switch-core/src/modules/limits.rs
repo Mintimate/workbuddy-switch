@@ -1,34 +1,102 @@
 //! 模型限额台账：从**本机日志**还原「哪个账号的哪个模型被限流、官方给出的恢复时刻」。
 //!
-//! 不新增任何网络请求，也不解析客户端 UI 文案。窗口固定为最近 2 个日期目录；重置时刻
-//! 直接采用日志原文给出的官方值，不自建限流窗口模型。
+//! 不新增任何网络请求，也不解析客户端 UI 文案。日志窗口固定为最近 2 天（WorkBuddy 两档位
+//! 与 CLI 是最近 2 个日期目录，两个 IDE 按文件 mtime 收窗）；重置时刻直接采用日志原文给出
+//! 的官方值，不自建限流窗口模型。
 //!
-//! 两档位各扫一遍（`~/.workbuddy/logs`、`~/.workbuddy-ai/logs`），一次返回全部账号的
-//! 当前受限状态——扫描本身就是全局的，按账号调用会把同一份日志扫 N 遍。
+//! 五个来源各扫一遍（PRD D1：插件宿主共享根 `CodeBuddyExtension/Logs/CodeBuddyIDE/` 与 CN
+//! IDE 真身重复记录同一次 429，**不扫**）：
 //!
-//! 数据流：日期目录枚举 → 字节级粗筛 → 命中才逐行解码 → 事件与模型解析 → 两步去重 →
+//! | 来源 | 日志根 | 格式 | 枚举 | 归因 |
+//! |---|---|---|---|---|
+//! | WorkBuddy 国内版 / 国际版 | `~/.workbuddy*/logs` | `WorkBuddy` | 日期目录 | `sessions` 表 |
+//! | CodeBuddy CLI | `~/.codebuddy/logs` | `WorkBuddy` | 日期目录 | 日志内鉴权 uid → 轮换状态文件 |
+//! | CodeBuddy IDE | `<data_dir>/logs` | `Ide` | 会话目录 + mtime | 日志内鉴权 uid → IDE 状态文件 |
+//! | CodeBuddy CN IDE | `<data_dir>/logs` | `Ide` | 会话目录 + mtime | 同上 |
+//!
+//! 一次返回全部账号的当前受限状态——扫描本身就是全局的，按账号调用会把同一份日志扫 N 遍。
+//!
+//! 数据流：目录枚举 → 字节级粗筛 → 命中才逐行解码 → 事件与模型解析 → 两步去重 →
 //! 账号归因 → 按 (账号, 模型) 聚合 → 过滤掉已过官方重置时刻的条目。
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone};
 use serde_json::{json, Value};
 
 use crate::modules::account;
-use crate::modules::config::now_ms;
+use crate::modules::config::{home_dir, now_ms, store_dir};
 use crate::modules::session::{open_db, table_exists, workbuddy_db_path};
 use crate::modules::variant::WbVariant;
+use crate::modules::vscode_cn_inject::{codebuddy_ide_data_dir, CodeBuddyIdeFlavor};
 
-/// 日志根目录名（档位数据根下）。
+/// 日志根目录名（档位/IDE 数据根下）。
 const LOG_DIR_NAME: &str = "logs";
 
-/// 扫描窗口：最近 2 个日期目录（固定，不做可配置）。
+/// 扫描窗口：WorkBuddy 两档位与 CLI 取最近 2 个日期目录；两个 IDE 取文件 mtime 在最近
+/// 2 天内的日志。
 ///
-/// 本机实测 2 天窗口下逐行解码 0.29s、字节级粗筛 0.05s（50 文件 / 67MB），
-/// 因此**不建**增量索引或本地缓存层。
+/// 本机实测（release）五个来源全量扫描约 115 ms：CLI 最重（候选 43MB / 7 文件，约 66 ms，
+/// 因为 CLI 的业务日志是完整会话记录）、CN IDE 约 12 ms、WorkBuddy 两档位合计约 7 ms。
+/// 仍远快于前端 60s 轮询间隔，因此**不建**增量索引或本地缓存层。
 const WINDOW_DAYS: usize = 2;
+
+/// 一天的毫秒数（IDE 的 mtime 收窗用）。
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// CodeBuddy CLI 数据根目录名（三平台同构）。
+const CLI_DATA_DIR: &str = ".codebuddy";
+
+/// CodeBuddy CLI 轮换状态目录名（`rotate.rs` / `codebuddy_cli.rs` 的写入方）。
+const CLI_ROTATE_DIR: &str = ".codebuddy-rotate";
+
+/// 状态文件名（`rotate.rs` / `codebuddy_ide.rs` / `codebuddy_cn_ide.rs` 的写入方）。
+///
+/// 与写入方保持同名：这里只读回落的 `activeAccountId`（账号库的 `id`，不是 uid）。
+const CLI_STATE_FILE: &str = "state.json";
+const IDE_STATE_FILE: &str = "codebuddy_ide.json";
+const CN_IDE_STATE_FILE: &str = "codebuddy_cn_ide.json";
+
+/// IDE 插件在 `exthost/` 下的日志目录名（两个 IDE 一致）。
+///
+/// 这是**唯一稳定**的过滤条件：文件名不固定（CN 侧 `腾讯云代码助手.log`，含 `.1.log` 轮转；
+/// 国际版侧还出现过 `Tencent Cloud CodeBuddy.log`），不加该过滤会把候选集从 18MB 涨到 43MB。
+const IDE_LOG_DIR_NAME: &str = "Tencent-Cloud.coding-copilot";
+
+/// CLI 启动鉴权行标记：`[FirstScreen] [AuthDoInitProbe] stage=… uid=<uuid>`。
+const CLI_AUTH_MARKER: &str = "[AuthDoInitProbe]";
+
+/// IDE 会话鉴权行标记：`[PulseServiceLifecycle] Auth session changed: …, uid=<uuid>`。
+const IDE_AUTH_MARKER: &str = "[PulseServiceLifecycle] Auth session changed:";
+
+/// IDE 会话级模型标记：`[ModelSelection] conversationId=<conv32>, mode=…, modelId=<m>`
+/// 与 `[AcpAgent:<conv32>] … modelId=<m>` 共用同一个字段名（见 `ide_model_id`）。
+const IDE_MODEL_FIELD: &str = "modelId=";
+
+/// IDE 模型字段上的未知哨兵值：`auto` 是「会话尚未选定模型」（`[AcpAgent:…] Model cache
+/// synced … source=new-session` 会出现），`undefined` / `null` 是 JS 侧字段缺失的写法。
+/// 都按未知处理——卡片绝不能显示 `auto` / `undefined`。
+const IDE_MODEL_UNKNOWN: [&str; 3] = ["auto", "undefined", "null"];
+
+/// IDE 模型兜底行标记：`[handleAuthError] modelId=<m>, …`（只在调用失败时出现）。
+const IDE_AUTH_ERROR_MARKER: &str = "[handleAuthError]";
+
+/// IDE 会话 id 的方括号 tag：`[AcpAgent:<conv32>]` / `[AcpConnection:<conv32>]`。
+const IDE_ACP_AGENT_TAG: &str = "AcpAgent:";
+const IDE_ACP_CONNECTION_TAG: &str = "AcpConnection:";
+
+/// IDE 行首时间格式（本地时间，定长 23 字节）：`2026-09-17 10:28:26.730`。
+const IDE_TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.3f";
+const IDE_TS_LEN: usize = 23;
+
+/// 超长行的字段嗅探窗口（字节）。
+///
+/// IDE 的 `Agent execution failed` 行含完整请求体（本机实测 117 KB，研究报告另有 350 KB
+/// 样本）：只对行首/行尾各一个定长窗口做字段嗅探，不对整行做全量正则或 JSON 反序列化。
+const LONG_LINE_SNIFF_BYTES: usize = 4 * 1024;
 
 /// 同一事件的重置时刻相同时，发生时刻相差 ≤ 该值即视为同一次事件。
 ///
@@ -58,12 +126,35 @@ const BUSINESS_TS_FORMAT: &str = "%m/%d/%Y, %I:%M:%S %p%.3f";
 // 扫描
 // ---------------------------------------------------------------------------
 
+/// 日志格式族：决定「行首时间戳 / 事件 id / 模型归因」三处适配。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogFormat {
+    /// `[9/15/2026, 6:19:48 PM.755] … (requestId/sessionId)`：WorkBuddy 两档位与 CodeBuddy CLI。
+    WorkBuddy,
+    /// `2026-09-17 10:28:26.730 [info] …`：两个 CodeBuddy IDE。
+    Ide,
+}
+
+/// 鉴权行标记：顺序扫描时据此维护「事件前最近一次 uid」，是新来源唯一的时态可靠账号线索。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMarker {
+    /// WorkBuddy 两档位：日志里没有账号 uid，归因走 `sessions` 表。
+    None,
+    /// CodeBuddy CLI：`[AuthDoInitProbe] stage=… uid=<uuid>`。
+    AuthDoInitProbe,
+    /// 两个 CodeBuddy IDE：`[PulseServiceLifecycle] Auth session changed: … uid=<uuid>`。
+    AuthSessionChanged,
+}
+
 /// 去重前的原始命中行。
 struct Hit {
+    /// 事件 id：WorkBuddy/CLI 是 `sessionId`，IDE 是 `conversationId`。
     session_id: Option<String>,
     model: Option<String>,
     reset_at: i64,
     occurred_at: i64,
+    /// 该事件前最近一次鉴权行的账号 uid（WorkBuddy 两档位不采集）。
+    uid: Option<String>,
 }
 
 /// 去重后的一次限额事件。
@@ -73,16 +164,21 @@ struct Event {
     reset_at: i64,
     first_seen_at: i64,
     hit_count: u32,
+    uid: Option<String>,
 }
 
 impl Event {
-    /// 合并同一次事件的重复书写：模型保留任一有归因的值，首次出现时刻取最早，命中行数累加。
+    /// 合并同一次事件的重复书写：模型/会话 id/uid 保留任一有值的，首次出现时刻取最早，
+    /// 命中行数累加。
     fn merge(&mut self, other: Event) {
         if self.model.is_none() {
             self.model = other.model;
         }
         if self.session_id.is_none() {
             self.session_id = other.session_id;
+        }
+        if self.uid.is_none() {
+            self.uid = other.uid;
         }
         self.first_seen_at = self.first_seen_at.min(other.first_seen_at);
         self.hit_count += other.hit_count;
@@ -171,67 +267,147 @@ fn log_files(root: &Path, output: &mut Vec<PathBuf>) {
 
 /// 逐行解析限额事件（文件已由粗筛确认命中）。
 ///
-/// 顺序扫描是关键：命中限额行时，`session_models` 里恰好是「该会话在被限**之前**最近一次
-/// 选用的模型」，因此不会归因成被限之后才切换到的模型。
-fn scan_text(text: &str) -> Vec<Hit> {
+/// 顺序扫描是关键：命中限额行时，`session_models` / `conversation_models` 里恰好是「该会话
+/// 在被限**之前**最近一次选用的模型」，`current_uid` 同理是「事件前最近一次鉴权账号」，
+/// 因此不会归因成被限之后才切换到的模型或账号。
+fn scan_text(text: &str, format: LogFormat, auth: AuthMarker) -> Vec<Hit> {
     let mut hits = Vec::new();
     let mut session_models: HashMap<String, String> = HashMap::new();
     let mut request_models: HashMap<String, String> = HashMap::new();
     let mut classifier_session: Option<String> = None;
+    let mut conversation_models: HashMap<String, String> = HashMap::new();
+    let mut auth_error_model: Option<String> = None;
+    let mut current_uid: Option<String> = None;
     for line in text.lines() {
-        if let Some(model) = model_after(line, RESOLVED_MODEL_MARKER) {
-            if let Some(session) = field_after(line, "sessionId=") {
-                session_models.insert(session.to_string(), model.to_string());
-            }
+        if let Some(uid) = auth_uid(line, auth) {
+            current_uid = Some(uid.to_string());
         }
-        if let Some(request) = field_after(line, "requestId=") {
-            if let Some(model) = request_model(line) {
-                request_models.insert(request.to_string(), model.to_string());
+        match format {
+            LogFormat::WorkBuddy => {
+                if let Some(model) = model_after(line, RESOLVED_MODEL_MARKER) {
+                    if let Some(session) = field_after(line, "sessionId=") {
+                        session_models.insert(session.to_string(), model.to_string());
+                    }
+                }
+                if let Some(request) = field_after(line, "requestId=") {
+                    if let Some(model) = field_model(line, "model=") {
+                        request_models.insert(request.to_string(), model.to_string());
+                    }
+                }
+                if line.contains(CLASSIFIER_MARKER) && line.contains(CLASSIFIER_CATEGORY) {
+                    if let Some(session) = field_after(line, "sessionId=") {
+                        classifier_session = Some(session.to_string());
+                    }
+                }
             }
-        }
-        if line.contains(CLASSIFIER_MARKER) && line.contains(CLASSIFIER_CATEGORY) {
-            if let Some(session) = field_after(line, "sessionId=") {
-                classifier_session = Some(session.to_string());
+            LogFormat::Ide => {
+                // 会话级模型映射：`[ModelSelection] conversationId=…, modelId=…` 与
+                // `[AcpAgent:<conv>] … modelId=…`。`modelId=auto` 视为未知（不覆盖已有值）。
+                if line.contains(IDE_MODEL_FIELD) {
+                    if let Some(model) = ide_model_id(line) {
+                        if let Some(conversation) = ide_session_id(line) {
+                            conversation_models.insert(conversation.to_string(), model.to_string());
+                        }
+                    }
+                }
+                // 文件级兜底：`[handleAuthError]` 只在调用失败时出现，因此该值不会跨会话陈旧。
+                if line.contains(IDE_AUTH_ERROR_MARKER) {
+                    if let Some(model) = ide_model_id(line) {
+                        auth_error_model = Some(model.to_string());
+                    }
+                }
             }
         }
         if !QUOTA_MARKERS.iter().any(|marker| line.contains(marker)) {
             continue;
         }
+        // `Agent execution failed` 的响应头里有本次请求的账号 uid，是鉴权行缺失时的同级
+        // 补充。只对用 uid 归因的来源有意义（WorkBuddy 两档位走 `sessions` 表，不采集 uid）；
+        // 该行可能含完整请求体，因此只做定长窗口嗅探。
+        if auth != AuthMarker::None && current_uid.is_none() {
+            current_uid = json_field(line, "x-user-id").map(str::to_string);
+        }
         let Some(reset_at) = parse_reset_at(line) else {
             continue;
         };
         // 没有发生时刻就无法参与去重：宁可丢这一行，也不猜一个时间。
-        let Some(occurred_at) = line_timestamp(line) else {
+        let Some(occurred_at) = line_timestamp(line, format) else {
             continue;
         };
-        let (request_id, session_id) = match request_pair(line) {
-            Some((request, session)) => (Some(request), Some(session)),
-            None => (None, None),
+        let (session_id, model) = match format {
+            LogFormat::WorkBuddy => workbuddy_attribution(
+                line,
+                &request_models,
+                &session_models,
+                classifier_session.as_deref(),
+            ),
+            LogFormat::Ide => {
+                ide_attribution(line, &conversation_models, auth_error_model.as_deref())
+            }
         };
-        let session_id = session_id
-            .or_else(|| field_after(line, "sessionId=").map(str::to_string))
-            .or_else(|| classifier_session.clone());
-        // 模型归因三级回退：requestId → 该会话最近一次 model= → 未知（不猜）。
-        let model = request_id
-            .as_deref()
-            .and_then(|request| request_models.get(request))
-            .or_else(|| {
-                session_id
-                    .as_deref()
-                    .and_then(|session| session_models.get(session))
-            })
-            .cloned();
         hits.push(Hit {
             session_id,
             model,
             reset_at,
             occurred_at,
+            uid: current_uid.clone(),
         });
     }
     hits
 }
 
-fn scan_file(path: &Path, hits: &mut Vec<Hit>) {
+/// WorkBuddy 格式（含 CLI）的事件 id 与模型归因。
+///
+/// 事件 id 取行尾 `(requestId/sessionId)`，回退 `sessionId=`、分类行；模型走
+/// `requestId → model`（`[ModelProvider] Sending request`）→ 该会话最近一次
+/// `resolved model=` → 未知（不猜）。
+fn workbuddy_attribution(
+    line: &str,
+    request_models: &HashMap<String, String>,
+    session_models: &HashMap<String, String>,
+    classifier_session: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let (request_id, session_id) = match request_pair(line) {
+        Some((request, session)) => (Some(request), Some(session)),
+        None => (None, None),
+    };
+    let session_id = session_id
+        .or_else(|| field_after(line, "sessionId=").map(str::to_string))
+        .or_else(|| classifier_session.map(str::to_string));
+    let model = request_id
+        .as_deref()
+        .and_then(|request| request_models.get(request))
+        .or_else(|| {
+            session_id
+                .as_deref()
+                .and_then(|session| session_models.get(session))
+        })
+        .cloned();
+    (session_id, model)
+}
+
+/// IDE 格式的事件 id 与模型归因。
+///
+/// 事件 id 是 `conversationId`（三级提取）；模型走 `conversationId → modelId`（会话级，
+/// 实测限额行前 814 ms 命中）→ 本行 `modelId=` → 本行 JSON `"model"`（报错行内，
+/// 是本次请求自己的模型）→ 文件级 `[handleAuthError] modelId=` → 未知（不猜）。
+fn ide_attribution(
+    line: &str,
+    conversation_models: &HashMap<String, String>,
+    auth_error_model: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let session_id = ide_conversation_id(line).map(str::to_string);
+    let model = session_id
+        .as_deref()
+        .and_then(|conversation| conversation_models.get(conversation))
+        .cloned()
+        .or_else(|| ide_model_id(line).map(str::to_string))
+        .or_else(|| ide_json_model(line))
+        .or_else(|| auth_error_model.map(str::to_string));
+    (session_id, model)
+}
+
+fn scan_file(path: &Path, format: LogFormat, auth: AuthMarker, hits: &mut Vec<Hit>) {
     let Ok(bytes) = std::fs::read(path) else {
         return;
     };
@@ -241,25 +417,83 @@ fn scan_file(path: &Path, hits: &mut Vec<Hit>) {
     {
         return;
     }
-    hits.extend(scan_text(&String::from_utf8_lossy(&bytes)));
+    hits.extend(scan_text(&String::from_utf8_lossy(&bytes), format, auth));
 }
 
-/// 枚举 → 粗筛 → 解析 → 去重，返回某个档位的限额事件。
-fn collect_events(logs_root: &Path) -> Vec<Event> {
-    let mut files = Vec::new();
-    for directory in recent_log_dirs(logs_root) {
-        log_files(&directory, &mut files);
-    }
+/// 枚举 → 粗筛 → 解析 → 去重，返回某个来源的限额事件。
+fn collect_events(root: &Path, format: LogFormat, auth: AuthMarker) -> Vec<Event> {
+    let files = match format {
+        // 日期目录（`logs/YYYY-MM-DD/`，可能还有 `sdk/conversations/` 一层）。
+        LogFormat::WorkBuddy => {
+            let mut files = Vec::new();
+            for directory in recent_log_dirs(root) {
+                log_files(&directory, &mut files);
+            }
+            files
+        }
+        // IDE 会话目录下按插件目录过滤 + 文件 mtime 收窗。
+        LogFormat::Ide => ide_log_files(root, now_ms() - WINDOW_DAYS as i64 * DAY_MS),
+    };
     let mut hits = Vec::new();
     for file in files {
-        scan_file(&file, &mut hits);
+        scan_file(&file, format, auth, &mut hits);
     }
     dedupe(hits)
 }
 
-/// 两步去重：① `(会话 id, 重置时刻)` 相同即同一次事件；② 重置时刻相同且发生时刻相差
-/// ≤ `MERGE_WINDOW_MS` 的记录再合并一次（业务日志与 SDK 日志各写一份，且两边的会话 id
-/// 未必都取得到）。
+/// 两个 IDE 的候选日志文件：
+/// `<root>/<YYYYMMDDTHHMMSS>/window<N>/exthost/Tencent-Cloud.coding-copilot/` 下的**所有
+/// 常规文件**（不限文件名/扩展名），只保留 `mtime ≥ cutoff_ms` 的。
+///
+/// 两个关键决策（研究报告 §B1）：
+/// - 会话目录名是**会话启动时间**，不是内容日期，且旧会话目录仍会被追加写入（本机那次 429
+///   就落在第 3 新的会话目录里）。按目录名收窗会漏事件，必须按文件 mtime。
+/// - 文件名不写死：CN 侧 `腾讯云代码助手.log`（含 `.1.log` 轮转），国际版侧还出现过
+///   `Tencent Cloud CodeBuddy.log`；父目录名才是稳定的过滤条件。
+fn ide_log_files(root: &Path, cutoff_ms: i64) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    // 日志根缺失（该 IDE 未安装/未使用）返回空集，不是错误。
+    let Ok(sessions) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for session in sessions.flatten() {
+        let session_dir = session.path();
+        if !session_dir.is_dir() {
+            continue;
+        }
+        let Ok(windows) = std::fs::read_dir(&session_dir) else {
+            continue;
+        };
+        for window in windows.flatten() {
+            let directory = window.path().join("exthost").join(IDE_LOG_DIR_NAME);
+            let Ok(entries) = std::fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_file() {
+                    continue;
+                }
+                if modified_ms(&metadata).is_some_and(|modified| modified >= cutoff_ms) {
+                    files.push(entry.path());
+                }
+            }
+        }
+    }
+    files
+}
+
+/// 文件最后修改时刻（毫秒）；取不到即视为不在窗口内（宁可漏，不报错）。
+fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+    let since_epoch = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_millis()).ok()
+}
+
+/// 两步去重：① `(事件 id, 重置时刻)` 相同即同一次事件；② 重置时刻相同且发生时刻相差
+/// ≤ `MERGE_WINDOW_MS` 的记录再合并一次（业务日志与 SDK 日志各写一份，IDE 侧一次事件写
+/// 8 行且只有部分行带事件 id，且两边的 id 未必都取得到）。
 fn dedupe(hits: Vec<Hit>) -> Vec<Event> {
     let mut groups: BTreeMap<(Option<String>, i64), Event> = BTreeMap::new();
     for hit in hits {
@@ -270,6 +504,7 @@ fn dedupe(hits: Vec<Hit>) -> Vec<Event> {
             reset_at: hit.reset_at,
             first_seen_at: hit.occurred_at,
             hit_count: 1,
+            uid: hit.uid,
         };
         match groups.entry(key) {
             Entry::Occupied(mut entry) => entry.get_mut().merge(event),
@@ -302,17 +537,28 @@ fn dedupe(hits: Vec<Hit>) -> Vec<Event> {
 // 行解析
 // ---------------------------------------------------------------------------
 
-/// 取行首时间戳（毫秒）。业务日志是本地时间，SDK 日志是 UTC（`2026-09-16T16:20:31.523Z`），
-/// 两者都折算到同一绝对时间轴后再比较。
-fn line_timestamp(line: &str) -> Option<i64> {
+/// 取行首时间戳（毫秒）。
+///
+/// WorkBuddy 格式：业务日志是本地时间，SDK 日志是 UTC（`2026-09-16T16:20:31.523Z`），
+/// 两者都折算到同一绝对时间轴后再比较。IDE 格式：行首 `2026-09-17 10:28:26.730` 定长
+/// 23 字节，本地时间、无时区标记。
+fn line_timestamp(line: &str, format: LogFormat) -> Option<i64> {
     let trimmed = line.trim_start();
-    let head = trimmed.split_whitespace().next().unwrap_or_default();
-    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(head) {
-        return Some(parsed.timestamp_millis());
-    }
-    let rest = trimmed.strip_prefix('[')?;
-    let end = rest.find(']')?;
-    let naive = NaiveDateTime::parse_from_str(rest[..end].trim(), BUSINESS_TS_FORMAT).ok()?;
+    let naive = match format {
+        LogFormat::WorkBuddy => {
+            let head = trimmed.split_whitespace().next().unwrap_or_default();
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(head) {
+                return Some(parsed.timestamp_millis());
+            }
+            let rest = trimmed.strip_prefix('[')?;
+            let end = rest.find(']')?;
+            NaiveDateTime::parse_from_str(rest[..end].trim(), BUSINESS_TS_FORMAT).ok()?
+        }
+        LogFormat::Ide => {
+            let head = std::str::from_utf8(trimmed.as_bytes().get(..IDE_TS_LEN)?).ok()?;
+            NaiveDateTime::parse_from_str(head, IDE_TS_FORMAT).ok()?
+        }
+    };
     // DST 回拨的那一小时是歧义的：取较早的一次，而不是丢掉这一行。
     Local
         .from_local_datetime(&naive)
@@ -439,20 +685,163 @@ fn model_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
     (!value.is_empty()).then_some(value)
 }
 
-/// 取 `requestId → model` 映射里这一行给出的模型名。
+/// 取字段边界上的 `<key>` 字段值（`model=` 与 IDE 的 `modelId=` 共用）。
 ///
-/// 只认字段边界上的 `model=`：`[ModelProvider] Sending request: agent=cli,
-/// model=<model>, requestId=<id>` 命中，而 `requestOptions.model=` 不命中。
-fn request_model(line: &str) -> Option<&str> {
+/// 只认字段边界上的 key：`[ModelProvider] Sending request: agent=cli, model=<model>,
+/// requestId=<id>` 命中，而 `requestOptions.model=` 不命中。
+fn field_model<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let mut search = 0;
-    while let Some(offset) = line[search..].find("model=") {
+    while let Some(offset) = line[search..].find(key) {
         let index = search + offset;
         if index == 0 || !is_field_char(line.as_bytes()[index - 1]) {
-            return model_after(&line[index..], "model=");
+            return model_after(&line[index..], key);
         }
-        search = index + "model=".len();
+        search = index + key.len();
     }
     None
+}
+
+/// 取 IDE 行的 `modelId=` 字段（哨兵值见 `IDE_MODEL_UNKNOWN`）。
+fn ide_model_id(line: &str) -> Option<&str> {
+    let value = field_model(line, IDE_MODEL_FIELD)?;
+    (!IDE_MODEL_UNKNOWN.contains(&value)).then_some(value)
+}
+
+/// 鉴权行给出的账号 uid（顺序扫描时维护「事件前最近一次」）。
+///
+/// `uid=none` 是「无会话 / 未登录」的哨兵值，必须忽略。
+fn auth_uid(line: &str, auth: AuthMarker) -> Option<&str> {
+    let marker = match auth {
+        AuthMarker::None => return None,
+        AuthMarker::AuthDoInitProbe => CLI_AUTH_MARKER,
+        AuthMarker::AuthSessionChanged => IDE_AUTH_MARKER,
+    };
+    if !line.contains(marker) {
+        return None;
+    }
+    let uid = field_after(line, "uid=")?;
+    (!uid.eq_ignore_ascii_case("none")).then_some(uid)
+}
+
+/// 取行首定长窗口（对齐到字符边界，不切碎多字节字符）。
+fn head_window(line: &str) -> &str {
+    let mut end = line.len().min(LONG_LINE_SNIFF_BYTES);
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// 取行尾定长窗口（对齐到字符边界）。
+fn tail_window(line: &str) -> &str {
+    let mut start = line.len().saturating_sub(LONG_LINE_SNIFF_BYTES);
+    while start < line.len() && !line.is_char_boundary(start) {
+        start += 1;
+    }
+    &line[start..]
+}
+
+/// 取 JSON 形态的字符串字段 `"<key>":"<value>"`。
+///
+/// IDE 的 `Agent execution failed` 行可能含完整请求体（本机实测 117 KB，研究报告另有
+/// 350 KB 样本），因此短行整行嗅探、超长行只看行首与行尾两个定长窗口
+/// （`requestBodyValues` 在行首、`responseHeaders` / `responseBody` 在行尾），
+/// 不对整行做全量正则或 JSON 反序列化。
+fn json_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    if line.len() <= LONG_LINE_SNIFF_BYTES {
+        return json_field_in(line, key);
+    }
+    json_field_in(head_window(line), key).or_else(|| json_field_in(tail_window(line), key))
+}
+
+/// 在给定文本里取 `"<key>":"<value>"`（两侧引号即字段边界，故 `"modelId"` 不会误命中 `model`）。
+///
+/// 兼容两种书写：未转义的 `"<key>":"<value>"` 与嵌在字符串里的转义形式
+/// `\"<key>\":\"<value>\"`（IDE 的 `responseBody: "…"` 这类行），转义形式只是引号前多一个
+/// 反斜杠。
+///
+/// 值必须以**闭合引号**结束才采纳：超长行只嗅探定长窗口，窗口边界可能正好落在值的中间，
+/// 掐头去尾的半个模型名／半个 uid 一个都不能用（取不到就按「未知」处理，绝不猜）。
+fn json_field_in<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = text.as_bytes();
+    let mut search = 0;
+    while let Some(offset) = text[search..].find(key) {
+        let index = search + offset;
+        search = index + key.len();
+        // 键的左侧必须是引号（转义形式下引号前还有一个反斜杠，与本次判断无关）。
+        if index == 0 || bytes[index - 1] != b'"' {
+            continue;
+        }
+        // 依次吃掉：键的右引号 → 冒号 → 值的左引号（两处都可能带转义反斜杠）。
+        let mut cursor = index + key.len();
+        if bytes.get(cursor) == Some(&b'\\') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'"') || bytes.get(cursor + 1) != Some(&b':') {
+            continue;
+        }
+        cursor += 2;
+        if bytes.get(cursor) == Some(&b'\\') {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'"') {
+            continue;
+        }
+        let Some((value, _)) = text[cursor + 1..].split_once('"') else {
+            continue;
+        };
+        // 转义形式下值的闭合引号写作 `\"`：那个反斜杠是转义记号，不属于值本身。
+        let value = value.strip_suffix('\\').unwrap_or(value).trim();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// 取方括号 tag 里的会话 id：`[AcpAgent:<conv32>]` / `[AcpConnection:<conv32>]`。
+///
+/// 只认会话 id 形态：`[BaseAgent:craft]` 之类的 agent tag 必须忽略。
+fn bracket_tag_after<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let mut search = 0;
+    while let Some(offset) = line[search..].find(tag) {
+        let index = search + offset;
+        let value = line[index + tag.len()..].split(']').next()?.trim();
+        if is_ide_session_id(value) {
+            return Some(value);
+        }
+        search = index + tag.len();
+    }
+    None
+}
+
+/// IDE 会话 id 形态：32 位 hex（`conversationId`）或 36 位带连字符 uuid（兼容旧形态）。
+fn is_ide_session_id(value: &str) -> bool {
+    is_hex_id(value, 32) || is_hex_id(value, 36)
+}
+
+/// IDE 的会话 id（不含 JSON 形式）：`conversationId=<conv32>` → `[AcpAgent:<conv32>]`
+/// → `[AcpConnection:<conv32>]`。
+///
+/// 用于「顺序扫描时把 `modelId=` 记到哪个会话」——`[handleAuthError]` 这类行没有会话 id，
+/// 只作为文件级兜底。
+fn ide_session_id(line: &str) -> Option<&str> {
+    field_after(line, "conversationId=")
+        .filter(|value| is_ide_session_id(value))
+        .or_else(|| bracket_tag_after(line, IDE_ACP_AGENT_TAG))
+        .or_else(|| bracket_tag_after(line, IDE_ACP_CONNECTION_TAG))
+}
+
+/// IDE 的事件 id：会话 id，再回退报错行里的 JSON 形式 `"conversationId":"<conv32>"`。
+fn ide_conversation_id(line: &str) -> Option<&str> {
+    ide_session_id(line)
+        .or_else(|| json_field(line, "conversationId").filter(|value| is_ide_session_id(value)))
+}
+
+/// 报错行内的 JSON 模型字段 `"model":"<value>"`（哨兵值同 `IDE_MODEL_UNKNOWN`）。
+fn ide_json_model(line: &str) -> Option<String> {
+    let value = json_field(line, "model")?;
+    (!IDE_MODEL_UNKNOWN.contains(&value)).then(|| value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +928,84 @@ fn resolve(variant: WbVariant, events: &[Event]) -> Vec<Resolved> {
         .collect()
 }
 
+/// 来源状态文件里的「当前生效账号」。
+///
+/// `activeAccountId` 是**账号库的 `id`，不是 uid**（三个状态文件均如此）。
+struct ActiveAccount {
+    account_id: Option<String>,
+    updated_at: Option<i64>,
+}
+
+impl ActiveAccount {
+    /// 读该来源的状态文件；文件缺失/损坏时回落不可用（返回空，不是错误）。
+    fn load(path: &Path) -> Self {
+        let state = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .unwrap_or_else(|| json!({}));
+        Self {
+            account_id: state
+                .get("activeAccountId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            updated_at: state.get("updatedAt").and_then(Value::as_i64),
+        }
+    }
+
+    /// 该状态文件能否作为这一事件的归因依据。
+    ///
+    /// 必须 `updatedAt ≤ 事件时刻`：IDE 的 `detect_current_account()` 匹配成功时也会回写状态
+    /// 文件（`codebuddy_ide.rs` / `codebuddy_cn_ide.rs`），使 `updatedAt` 晚于事件却并非账号
+    /// 切换。缺 `updatedAt` 时无从证实「当时生效的是谁」，同样不用。
+    fn account_for(&self, first_seen_at: i64) -> Option<&str> {
+        let account_id = self.account_id.as_deref()?;
+        (self.updated_at? <= first_seen_at).then_some(account_id)
+    }
+}
+
+/// 账号库 `uid → 账号 id` 映射（CLI 与两个 IDE 的日志内鉴权 uid 归因用）。
+///
+/// 不按档位过滤：CLI 跨两档位共用同一套账号库，IDE 侧写入的账号也未必与日志来源档位一致；
+/// uid 在账号库内唯一（导入即按 uid 去重），过滤只会漏、不会错。
+fn account_id_by_uid() -> HashMap<String, String> {
+    account::load_accounts()
+        .iter()
+        .filter_map(|acc| Some((account::get_str(acc, "uid")?, account::get_str(acc, "id")?)))
+        .collect()
+}
+
+/// 新来源（CLI / 两个 IDE）的账号归因。
+///
+/// ① 事件 uid → 账号库 `uid → id`（日志内鉴权行，时态正确）；② 回落该来源状态文件的
+/// `activeAccountId`（带 `updatedAt ≤ 事件时刻` 门控）；③ 都不满足 → 丢弃该事件，
+/// 不错归给任何账号。
+fn resolve_by_uid(
+    events: &[Event],
+    uid_to_account: &HashMap<String, String>,
+    fallback: &ActiveAccount,
+) -> Vec<Resolved> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let account_id = event
+                .uid
+                .as_deref()
+                .and_then(|uid| uid_to_account.get(uid))
+                .map(String::as_str)
+                .or_else(|| fallback.account_for(event.first_seen_at))?;
+            Some(Resolved {
+                account_id: account_id.to_string(),
+                model: event.model.clone(),
+                reset_at: event.reset_at,
+                first_seen_at: event.first_seen_at,
+                hit_count: event.hit_count,
+            })
+        })
+        .collect()
+}
+
 /// 聚合与过滤：per (账号, 模型) 取 `resetAt` 最大的一条（同模型多次限流以最新一次为准），
 /// 只保留官方重置时刻尚未到达的条目。
 ///
@@ -594,15 +1061,67 @@ fn build_payload(resolved: Vec<Resolved>, scanned_at: i64) -> Value {
     })
 }
 
-/// 全部账号当前的模型限额状态（两档位各扫一遍）。
+/// CodeBuddy CLI 日志根（`~/.codebuddy/logs`；三平台同构，`home_dir()` 已跨平台）。
+fn cli_logs_root() -> PathBuf {
+    home_dir().join(CLI_DATA_DIR).join(LOG_DIR_NAME)
+}
+
+/// CodeBuddy CLI 轮换状态文件（`~/.codebuddy-rotate/state.json`）。
+fn cli_state_path() -> PathBuf {
+    home_dir().join(CLI_ROTATE_DIR).join(CLI_STATE_FILE)
+}
+
+/// 全部账号当前的模型限额状态（五个来源各扫一遍）。
 ///
 /// 不接收档位参数：扫描本身就是全局的，按档位调用会把同一份日志扫 N 遍。
 pub fn get_rate_limits() -> Value {
     let scanned_at = now_ms();
     let mut resolved = Vec::new();
+    // ① WorkBuddy 两档位：日期目录枚举 + `sessions` 表归因（现有行为不变）。
     for variant in WbVariant::ALL {
-        let events = collect_events(&variant.data_root().join(LOG_DIR_NAME));
+        let events = collect_events(
+            &variant.data_root().join(LOG_DIR_NAME),
+            LogFormat::WorkBuddy,
+            AuthMarker::None,
+        );
         resolved.extend(resolve(variant, &events));
+    }
+    // ② CodeBuddy CLI：日志与 WorkBuddy 同格式（时间戳/事件 id/模型归因全部兼容），
+    // 但会话不在 WorkBuddy 的 `sessions` 表里，归因走日志内鉴权 uid + 轮换状态文件回落。
+    let uid_to_account = account_id_by_uid();
+    let cli = collect_events(
+        &cli_logs_root(),
+        LogFormat::WorkBuddy,
+        AuthMarker::AuthDoInitProbe,
+    );
+    resolved.extend(resolve_by_uid(
+        &cli,
+        &uid_to_account,
+        &ActiveAccount::load(&cli_state_path()),
+    ));
+    // ③ 两个 CodeBuddy IDE：同一份 Ide 格式与同一套归因，只有日志根与状态文件不同。
+    //
+    // **不扫** `CodeBuddyExtension/Logs/CodeBuddyIDE/`：它是插件宿主的跨 App 共享日志根，
+    // 与 CN IDE 真身重复记录同一次 429（同一 requestId、行时间差 3 ms），扫它会重复展示
+    // 且档位归属不清（PRD D1）。
+    for (flavor, state_file) in [
+        (CodeBuddyIdeFlavor::Intl, IDE_STATE_FILE),
+        (CodeBuddyIdeFlavor::Cn, CN_IDE_STATE_FILE),
+    ] {
+        // 该 IDE 的数据目录不可定位（平台不支持）时跳过，不是错误。
+        let Some(data_dir) = codebuddy_ide_data_dir(flavor) else {
+            continue;
+        };
+        let events = collect_events(
+            &data_dir.join(LOG_DIR_NAME),
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        );
+        resolved.extend(resolve_by_uid(
+            &events,
+            &uid_to_account,
+            &ActiveAccount::load(&store_dir().join(state_file)),
+        ));
     }
     build_payload(resolved, scanned_at)
 }
@@ -661,6 +1180,122 @@ mod tests {
         ))
     }
 
+    /// 现有两档位（WorkBuddy 格式、无鉴权行）的解析入口。
+    fn workbuddy_hits(text: &str) -> Vec<Hit> {
+        scan_text(text, LogFormat::WorkBuddy, AuthMarker::None)
+    }
+
+    // -----------------------------------------------------------------------
+    // CodeBuddy CLI 与两个 IDE 的样本（行骨架取自本机真实日志，id/uid 已替换）
+    // -----------------------------------------------------------------------
+
+    /// IDE 会话 id（`conversationId`，32 位 hex）。
+    const IDE_CONV: &str = "b3cca2525ba544debd0abc63ca69f8b9";
+    /// 另一次会话（验证模型归因按会话隔离）。
+    const IDE_OTHER_CONV: &str = "a12075d16ada4fbba38047b0d879db2b";
+    const IDE_REQUEST: &str = "0ffa4f2d001e4aee92e1cd6ce6a709c2";
+    const IDE_TRACE: &str = "8e090575f6032a82163c94dc3d65e9ba";
+    const IDE_MODEL: &str = "deepseek-v4.1-flash";
+    const UID_A: &str = "f0ae9eeb-8476-4ef5-9a3e-1d6339d545da";
+    const UID_B: &str = "2e649415-05c1-4c8a-8736-6b8e3aac0f9a";
+
+    /// IDE 限额文案（与研究样本逐字一致）。
+    const IDE_QUOTA: &str = "您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置，您也可以切换其他模型继续使用。";
+
+    /// IDE 行首时间格式（本地时间，无方括号）。
+    fn ide_line(timestamp: &str, body: &str) -> String {
+        format!("{timestamp} [error] {body}")
+    }
+
+    fn ide_auth_line(uid: &str) -> String {
+        format!(
+            "2026-09-17 10:26:01.772 [info] [PulseServiceLifecycle] Auth session changed: hasSession=true, initialized=true, uid={uid}"
+        )
+    }
+
+    fn cli_auth_line(timestamp: &str, uid: &str) -> String {
+        business_line(
+            timestamp,
+            &format!(
+                "[AuthenticationManager]  [FirstScreen] [AuthDoInitProbe] stage=fastPathBeforeEmit totalMs=591 sinceLastMs=0 uid={uid} hasAccessToken=true"
+            ),
+        )
+    }
+
+    /// 本机真实事件的行集合：一次 429 写 8 行带文案 + 1 行 `[handleAuthError]`。
+    fn ide_event_lines(conversation: &str, uid: &str) -> String {
+        let quota = IDE_QUOTA;
+        let notify_step_error = ide_line(
+            "2026-09-17 10:28:26.730",
+            &format!(
+                "[BaseAgent:craft] [{IDE_REQUEST}]  notifyStepError responseBody: \"{{\\\"code\\\":6004,\\\"msg\\\":\\\"{quota}\\\",\\\"requestId\\\":\\\"{IDE_REQUEST}\\\"}}\""
+            ),
+        );
+        // 超长行：请求体已截断，但 `"model":`（行首）与 `"x-user-id"`（行尾）保留原位置。
+        let agent_execution_failed = ide_line(
+            "2026-09-17 10:28:26.741",
+            &format!(
+                "[AgentReporter] [{IDE_TRACE}]  Agent execution failed: {{\"name\":\"AI_APICallError\",\"url\":\"https://copilot.tencent.com/v2/chat/completions\",\"requestBodyValues\":{{\"model\":\"{IDE_MODEL}\"}},\"statusCode\":429,\"responseHeaders\":{{\"x-request-id\":\"{IDE_REQUEST}\",\"x-user-id\":\"{uid}\"}},\"responseBody\":\"{{\\\"code\\\":6004,\\\"msg\\\":\\\"{quota}\\\"}}\",\"message\":\"{quota}\",\"code\":6004}}"
+            ),
+        );
+        let lines = [
+            notify_step_error,
+            agent_execution_failed,
+            ide_line(
+                "2026-09-17 10:28:26.746",
+                &format!("[CraftInvokableAgent] [{IDE_TRACE}]  Execution failed: {quota}"),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.746",
+                &format!("[CraftInvokableAgent] [{IDE_TRACE}]  Agent call failed: {quota}"),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.748",
+                &format!("[handleAuthError] modelId={IDE_MODEL}, baseUrl=undefined, officialEndpoint=https://copilot.tencent.com, isCustomAuthFailure=false"),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.749",
+                &format!(
+                    "[ResultHandler.handleError]  errorMessage {{\"requestId\":\"acp-{conversation}-1789612105908\",\"complete\":true,\"error\":{{\"code\":6004,\"message\":\"{quota}\",\"traceId\":\"{IDE_TRACE}\",\"model\":\"{IDE_MODEL}\"}},\"isEnd\":true,\"conversationId\":\"{conversation}\"}}"
+                ),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.751",
+                &format!("[AcpAgent:{conversation}] Session error: {quota}"),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.751",
+                &format!(
+                    "[AgentSessionManager] executeAsync FAILED: conversationId={conversation}, errorCode=6004, traceId={IDE_TRACE}, message={quota}"
+                ),
+            ),
+            ide_line(
+                "2026-09-17 10:28:26.751",
+                &format!(
+                    "[[acp-conn]] [AgentCraftError: {quota}]  [AcpConnection:{conversation}] Error handling request:"
+                ),
+            ),
+        ];
+        lines.join("\n")
+    }
+
+    fn ide_model_selection_line(conversation: &str, model: &str) -> String {
+        ide_line(
+            "2026-09-17 10:28:25.919",
+            &format!(
+                "[ModelSelection] conversationId={conversation}, mode=craft, modelId={model}, source=user-selected"
+            ),
+        )
+    }
+
+    /// IDE 限额文案行（只有文案与事件 id，不含模型线索）。
+    fn ide_quota_line(timestamp: &str, conversation: &str) -> String {
+        ide_line(
+            timestamp,
+            &format!("[AcpAgent:{conversation}] Session error: {IDE_QUOTA}"),
+        )
+    }
+
     #[test]
     fn byte_filter_matches_multibyte_and_ascii_markers() {
         assert!(contains(cn_quota().as_bytes(), QUOTA_MARKERS[0].as_bytes()));
@@ -712,14 +1347,23 @@ mod tests {
             .earliest()
             .expect("测试时间必须存在");
         assert_eq!(
-            line_timestamp(&business_line("9/17/2026, 12:20:31 AM.232", "[Info] x")),
+            line_timestamp(
+                &business_line("9/17/2026, 12:20:31 AM.232", "[Info] x"),
+                LogFormat::WorkBuddy,
+            ),
             Some(local.timestamp_millis() + 232)
         );
         assert_eq!(
-            line_timestamp("2026-09-16T16:20:31.523Z runtime.applyStopReason {}"),
+            line_timestamp(
+                "2026-09-16T16:20:31.523Z runtime.applyStopReason {}",
+                LogFormat::WorkBuddy,
+            ),
             Some(SDK_OCCURRED_AT)
         );
-        assert_eq!(line_timestamp("no timestamp here"), None);
+        assert_eq!(
+            line_timestamp("no timestamp here", LogFormat::WorkBuddy),
+            None
+        );
     }
 
     #[test]
@@ -758,7 +1402,7 @@ mod tests {
             business_line("9/17/2026, 12:20:31 AM.232", &cn_quota()),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&with_request));
+        let events = dedupe(workbuddy_hits(&with_request));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model.as_deref(), Some("deepseek-v4.1-flash"));
 
@@ -771,12 +1415,12 @@ mod tests {
             business_line("9/17/2026, 12:20:31 AM.232", &cn_quota()),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&with_session));
+        let events = dedupe(workbuddy_hits(&with_session));
         assert_eq!(events[0].model.as_deref(), Some("hy3"));
 
         // ③ 都取不到 → None（前端显示「未知模型」，绝不猜）。
         let without_model = business_line("9/17/2026, 12:20:31 AM.232", &cn_quota());
-        let events = dedupe(scan_text(&without_model));
+        let events = dedupe(workbuddy_hits(&without_model));
         assert_eq!(events[0].model, None);
     }
 
@@ -799,7 +1443,7 @@ mod tests {
             ),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text));
+        let events = dedupe(workbuddy_hits(&text));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].model.as_deref(), Some("deepseek-v4.1-flash"));
     }
@@ -818,7 +1462,7 @@ mod tests {
             business_line("9/17/2026, 12:20:31 AM.232", &cn_quota()),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text));
+        let events = dedupe(workbuddy_hits(&text));
         assert_eq!(
             events[0].model, None,
             "带点号的 `requestOptions.model=` 不是请求模型字段"
@@ -840,7 +1484,7 @@ mod tests {
             ),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text));
+        let events = dedupe(workbuddy_hits(&text));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id.as_deref(), Some(CN_SESSION));
     }
@@ -855,7 +1499,7 @@ mod tests {
             business_line("9/14/2026, 10:59:21 AM.523", &en_quota()),
         ]
         .join("\n");
-        let events = dedupe(scan_text(&text));
+        let events = dedupe(workbuddy_hits(&text));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].reset_at, EN_RESET_AT);
         assert_eq!(events[0].model.as_deref(), Some("kimi-k3-1"));
@@ -928,7 +1572,7 @@ mod tests {
             .expect("写入 SDK 日志");
         }
 
-        let events = collect_events(&root);
+        let events = collect_events(&root, LogFormat::WorkBuddy, AuthMarker::None);
         assert_eq!(events.len(), 2, "14 条限额行必须聚合为 2 次事件");
         assert_eq!(events[0].hit_count, 7);
         assert_eq!(events[1].hit_count, 7);
@@ -951,6 +1595,7 @@ mod tests {
             model: model.map(str::to_string),
             reset_at: CN_RESET_AT,
             occurred_at,
+            uid: None,
         };
         let events = dedupe(vec![
             // ① 步：同一会话的重复书写先合并。
@@ -990,7 +1635,12 @@ mod tests {
             recent_log_dirs(&root.join("missing")).is_empty(),
             "档位日志根缺失时返回空集，不是错误"
         );
-        assert!(collect_events(&root.join("missing")).is_empty());
+        assert!(collect_events(
+            &root.join("missing"),
+            LogFormat::WorkBuddy,
+            AuthMarker::None
+        )
+        .is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1066,5 +1716,496 @@ mod tests {
         assert_eq!(limited.len(), 1, "同 (账号, 模型) 只保留一条");
         assert_eq!(limited[0]["resetAt"], now + 3_600_000);
         assert_eq!(limited[0]["hitCount"], 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // CodeBuddy CLI
+    // -----------------------------------------------------------------------
+
+    /// CLI 的事件账号取「该事件前最近一次鉴权行」的 uid：切换账号后不串号、也不回溯。
+    #[test]
+    fn cli_uid_comes_from_the_last_auth_line_before_the_event() {
+        let text = [
+            cli_auth_line("9/15/2026, 2:07:59 PM.057", UID_A),
+            business_line(
+                "9/15/2026, 2:08:10 PM.000",
+                &cn_quota_with(CN_SESSION, CN_REQUEST, "2026-09-15 15:55:40"),
+            ),
+            // 切换账号：之后的事件必须归到新账号。
+            cli_auth_line("9/15/2026, 2:09:00 PM.000", UID_B),
+            business_line(
+                "9/15/2026, 2:09:10 PM.000",
+                &cn_quota_with(EN_SESSION, EN_REQUEST, "2026-09-15 16:55:40"),
+            ),
+        ]
+        .join("\n");
+        let hits = scan_text(&text, LogFormat::WorkBuddy, AuthMarker::AuthDoInitProbe);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].uid.as_deref(), Some(UID_A));
+        assert_eq!(hits[1].uid.as_deref(), Some(UID_B));
+
+        // 鉴权行在事件之后：不得回溯使用。
+        let later = [
+            business_line("9/15/2026, 2:08:10 PM.000", &cn_quota()),
+            cli_auth_line("9/15/2026, 2:08:20 PM.000", UID_A),
+        ]
+        .join("\n");
+        let hits = scan_text(&later, LogFormat::WorkBuddy, AuthMarker::AuthDoInitProbe);
+        assert_eq!(hits[0].uid, None, "事件后的 uid 行不得回溯归因");
+
+        // WorkBuddy 两档位不采集 uid（归因仍走 sessions 表）。
+        let hits = workbuddy_hits(&later);
+        assert_eq!(hits[0].uid, None);
+    }
+
+    /// `uid=none` 是「无会话 / 未登录」的哨兵值（CLI 与 IDE 都会写），必须忽略。
+    #[test]
+    fn auth_lines_with_uid_none_are_ignored() {
+        let cli = [
+            cli_auth_line("9/15/2026, 2:07:59 PM.057", "none"),
+            business_line("9/15/2026, 2:08:10 PM.000", &cn_quota()),
+        ]
+        .join("\n");
+        let hits = scan_text(&cli, LogFormat::WorkBuddy, AuthMarker::AuthDoInitProbe);
+        assert_eq!(hits[0].uid, None);
+
+        let ide = [
+            ide_auth_line("none"),
+            ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
+        ]
+        .join("\n");
+        let hits = scan_text(&ide, LogFormat::Ide, AuthMarker::AuthSessionChanged);
+        assert_eq!(hits[0].uid, None);
+    }
+
+    /// CLI 日志目录复用日期目录枚举 + 递归收 `.log`（含 `sdk/conversations/` 一层）。
+    #[test]
+    fn cli_source_reuses_the_date_directory_enumeration() {
+        let root = temp_dir("cli");
+        let day = root.join("2026-09-15");
+        let sdk = day.join("sdk").join("conversations");
+        std::fs::create_dir_all(&sdk).expect("SDK 日志目录");
+        std::fs::write(
+            day.join("session.log"),
+            [
+                cli_auth_line("9/15/2026, 2:07:59 PM.057", UID_A),
+                business_line("9/15/2026, 2:08:10 AM.000", &cn_quota()),
+            ]
+            .join("\n"),
+        )
+        .expect("业务日志");
+        // SDK 侧对同一事件再写一份（同一会话 id）。
+        std::fs::write(
+            sdk.join("session.log"),
+            business_line("9/15/2026, 2:08:10 AM.500", &cn_quota()),
+        )
+        .expect("SDK 日志");
+
+        let events = collect_events(&root, LogFormat::WorkBuddy, AuthMarker::AuthDoInitProbe);
+        assert_eq!(events.len(), 1, "业务日志与 SDK 冗余书写聚合为 1 条");
+        assert_eq!(events[0].hit_count, 2);
+        assert_eq!(events[0].reset_at, CN_RESET_AT);
+        assert_eq!(events[0].uid.as_deref(), Some(UID_A));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// CLI 的日志根与状态文件都挂在用户主目录下（跨平台由 `home_dir()` 兜住）。
+    #[test]
+    fn cli_source_paths_live_under_the_home_directory() {
+        assert!(cli_logs_root().ends_with(Path::new(CLI_DATA_DIR).join(LOG_DIR_NAME)));
+        assert!(cli_state_path().ends_with(Path::new(CLI_ROTATE_DIR).join(CLI_STATE_FILE)));
+    }
+
+    // -----------------------------------------------------------------------
+    // CodeBuddy IDE / CodeBuddy CN IDE
+    // -----------------------------------------------------------------------
+
+    /// IDE 行首时间戳是 23 字节定长前缀（本地时间，保留毫秒）；不是该形态就不猜时间。
+    #[test]
+    fn ide_timestamp_is_a_23_byte_local_prefix() {
+        let at = Local
+            .with_ymd_and_hms(2026, 9, 17, 10, 28, 26)
+            .earliest()
+            .expect("测试时间必须存在");
+        let line = ide_quota_line("2026-09-17 10:28:26.730", IDE_CONV);
+        assert_eq!(
+            line_timestamp(&line, LogFormat::Ide),
+            Some(at.timestamp_millis() + 730)
+        );
+        assert_eq!(
+            line_timestamp("2026-09-17 10:28:26", LogFormat::Ide),
+            None,
+            "不足 23 字节的行首不得猜时间"
+        );
+    }
+
+    /// 一次 429 的 8 行书写聚合为 1 条，且会话 id / 模型 / 重置时刻 / uid 全部正确。
+    #[test]
+    fn ide_event_lines_collapse_into_one_event_with_conversation_and_model() {
+        let text = [
+            ide_auth_line(UID_A),
+            ide_model_selection_line(IDE_CONV, IDE_MODEL),
+            ide_event_lines(IDE_CONV, UID_A),
+        ]
+        .join("\n");
+        let events = dedupe(scan_text(
+            &text,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events.len(), 1, "8 行带限额文案只是一次事件");
+        assert_eq!(events[0].hit_count, 8);
+        assert_eq!(events[0].session_id.as_deref(), Some(IDE_CONV));
+        assert_eq!(events[0].model.as_deref(), Some(IDE_MODEL));
+        assert_eq!(events[0].reset_at, CN_RESET_AT);
+        assert_eq!(events[0].uid.as_deref(), Some(UID_A));
+        // 发生时刻取最早的限额行（10:28:26.730）。
+        let at = Local
+            .with_ymd_and_hms(2026, 9, 17, 10, 28, 26)
+            .earliest()
+            .expect("测试时间必须存在");
+        assert_eq!(events[0].first_seen_at, at.timestamp_millis() + 730);
+    }
+
+    /// 模型归因按会话隔离，且只取「事件之前」最近一次选用的模型。
+    #[test]
+    fn ide_model_is_attributed_per_conversation_and_before_the_event() {
+        // 别的会话选过模型：不得归给本会话。
+        let other = [
+            ide_auth_line(UID_A),
+            ide_model_selection_line(IDE_OTHER_CONV, "glm-5.2"),
+            ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
+        ]
+        .join("\n");
+        let events = dedupe(scan_text(
+            &other,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events[0].session_id.as_deref(), Some(IDE_CONV));
+        assert_eq!(events[0].model, None, "不得把别的会话的模型归给本会话");
+
+        // 被限之后用户切了模型：不得归因成切换后的模型。
+        let switched = [
+            ide_model_selection_line(IDE_CONV, IDE_MODEL),
+            ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
+            ide_line(
+                "2026-09-17 10:30:00.000",
+                &format!(
+                    "[AcpAgent:{IDE_CONV}] Model cache synced: mode=craft, modelId=glm-5.2, source=user-selected"
+                ),
+            ),
+        ]
+        .join("\n");
+        let events = dedupe(scan_text(
+            &switched,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events[0].model.as_deref(), Some(IDE_MODEL));
+    }
+
+    /// `modelId=auto` / `undefined` / `null`（会话尚未选定模型或字段缺失）按未知处理。
+    #[test]
+    fn ide_unknown_model_sentinels_are_treated_as_unknown() {
+        for sentinel in IDE_MODEL_UNKNOWN {
+            let text = [
+                ide_model_selection_line(IDE_CONV, sentinel),
+                ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
+            ]
+            .join("\n");
+            let events = dedupe(scan_text(
+                &text,
+                LogFormat::Ide,
+                AuthMarker::AuthSessionChanged,
+            ));
+            assert_eq!(events[0].model, None, "`{sentinel}` 不得作为模型名展示");
+        }
+        // `[handleAuthError] modelId=undefined` 作为文件级兜底时同样不得展示。
+        let text = [
+            ide_line(
+                "2026-09-17 10:28:26.748",
+                "[handleAuthError] modelId=undefined, baseUrl=undefined, officialEndpoint=https://copilot.tencent.com",
+            ),
+            ide_quota_line("2026-09-17 10:28:26.751", IDE_CONV),
+        ]
+        .join("\n");
+        let events = dedupe(scan_text(
+            &text,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events[0].model, None);
+    }
+
+    /// 鉴权行缺失时，由事件行内的 `x-user-id` 补位（同一事件的其余行随之归到该账号）。
+    #[test]
+    fn x_user_id_fills_the_uid_when_no_auth_line_exists() {
+        let text = ide_event_lines(IDE_CONV, UID_A);
+        let events = dedupe(scan_text(
+            &text,
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged,
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid.as_deref(), Some(UID_A));
+    }
+
+    /// 约 350 KB 的 `Agent execution failed` 行（含完整请求体）：只在定长窗口内嗅探字段。
+    #[test]
+    fn ide_long_error_line_is_sniffed_within_bounded_windows() {
+        let filler = "x".repeat(350 * 1024);
+        let line = format!(
+            "2026-09-17 10:28:26.741 [error] [AgentReporter] [{IDE_TRACE}]  Agent execution failed: {{\"name\":\"AI_APICallError\",\"requestBodyValues\":{{\"model\":\"{IDE_MODEL}\",\"messages\":[{{\"content\":\"{filler}\"}}]}},\"statusCode\":429,\"responseHeaders\":{{\"x-user-id\":\"{UID_A}\"}},\"responseBody\":\"{{\\\"msg\\\":\\\"{IDE_QUOTA}\\\"}}\",\"code\":6004}}"
+        );
+        assert!(line.len() > 350 * 1024);
+
+        let hits = scan_text(&line, LogFormat::Ide, AuthMarker::AuthSessionChanged);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].uid.as_deref(),
+            Some(UID_A),
+            "行尾窗口内的 x-user-id"
+        );
+        assert_eq!(
+            hits[0].model.as_deref(),
+            Some(IDE_MODEL),
+            "行首窗口内的 model"
+        );
+        assert_eq!(hits[0].reset_at, CN_RESET_AT);
+    }
+
+    /// JSON 形态的事件 id 覆盖两种书写：未转义的 `"conversationId":"…"`（本机 `ResultHandler`
+    /// 行）与嵌在字符串里的转义形式 `\"conversationId\":\"…\"`（`responseBody: "…"` 这类行）。
+    #[test]
+    fn ide_conversation_id_covers_quoted_json_in_both_escapes() {
+        let plain = ide_line(
+            "2026-09-17 10:28:26.749",
+            &format!(
+                "[ResultHandler.handleError]  errorMessage {{\"isEnd\":true,\"conversationId\":\"{IDE_CONV}\"}}"
+            ),
+        );
+        assert_eq!(ide_conversation_id(&plain), Some(IDE_CONV));
+
+        let escaped = ide_line(
+            "2026-09-17 10:28:26.749",
+            &format!(
+                "[BaseAgent:craft] responseBody: \"{{\\\"code\\\":6004,\\\"conversationId\\\":\\\"{IDE_CONV}\\\"}}\""
+            ),
+        );
+        assert_eq!(ide_conversation_id(&escaped), Some(IDE_CONV));
+    }
+
+    /// 载荷被截断（值没有闭合引号）时不得把半个值当成结果：宁可「未知模型」，也不能展示
+    /// 掐头去尾的模型名。定长窗口的边界同理——`"modelId"` 之类相似键也不得误命中。
+    #[test]
+    fn json_sniffing_rejects_values_without_a_closing_quote() {
+        assert_eq!(json_field("{\"model\":\"deepseek-v4.1-fl", "model"), None);
+        assert_eq!(json_field("{\"modelId\":\"auto\"}", "model"), None);
+
+        // `"model":"` 落在行尾窗口里、值被写出方截断（超长行）。补齐闭合引号后才可用。
+        let mut line = String::from("2026-09-17 10:28:26.741 [error] [AgentReporter]  ");
+        line.push_str(IDE_QUOTA);
+        line.push_str(&"y".repeat(LONG_LINE_SNIFF_BYTES));
+        line.push_str("\"model\":\"deepseek-v4.1-fl");
+        assert!(line.len() > LONG_LINE_SNIFF_BYTES);
+        assert_eq!(json_field(&line, "model"), None);
+        assert_eq!(ide_json_model(&line), None);
+
+        let hits = scan_text(&line, LogFormat::Ide, AuthMarker::AuthSessionChanged);
+        assert_eq!(hits.len(), 1, "截断的行仍是一次限额命中");
+        assert_eq!(hits[0].model, None, "截断的半个模型名不得作为模型展示");
+    }
+
+    /// IDE 枚举：只认 `exthost/Tencent-Cloud.coding-copilot/` 下的文件（不限文件名），
+    /// 并按**文件 mtime** 收窗——会话目录名是启动时间，按目录名收窗会漏事件。
+    #[test]
+    fn ide_enumeration_filters_by_plugin_dir_and_file_mtime() {
+        let root = temp_dir("ide-enum");
+        // 会话目录名是「旧的启动时间」，但文件是刚刚写的：真机那次 429 正是这种情形。
+        let window = root.join("20260916T193500").join("window9");
+        let copilot = window.join("exthost").join(IDE_LOG_DIR_NAME);
+        std::fs::create_dir_all(&copilot).expect("插件日志目录");
+        // 三种文件名（含 `.1.log` 轮转与国际版命名）都必须收——文件名不写死。
+        let names = [
+            "腾讯云代码助手.log",
+            "腾讯云代码助手.1.log",
+            "Tencent Cloud CodeBuddy.log",
+        ];
+        for name in names {
+            std::fs::write(copilot.join(name), IDE_QUOTA).expect("插件日志");
+        }
+        // 插件目录之外的同级日志（渲染进程 / exthost 主日志）不得收。
+        std::fs::write(window.join("renderer.log"), IDE_QUOTA).expect("渲染进程日志");
+        std::fs::write(window.join("exthost").join("exthost.log"), IDE_QUOTA)
+            .expect("exthost 主日志");
+
+        let files = ide_log_files(&root, now_ms() - WINDOW_DAYS as i64 * DAY_MS);
+        let found: BTreeSet<String> = files
+            .iter()
+            .filter_map(|path| Some(path.file_name()?.to_string_lossy().to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            names.map(str::to_string).into_iter().collect(),
+            "只收插件目录下的文件，且不限文件名/扩展名"
+        );
+
+        // mtime 收窗：窗口起点在未来 → 一个都不收（证明是按文件 mtime，而不是目录名）。
+        assert!(ide_log_files(&root, now_ms() + DAY_MS).is_empty());
+        // 日志根缺失（该 IDE 未安装/未使用）不报错。
+        assert!(ide_log_files(&root.join("missing"), 0).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// IDE 来源端到端（枚举 → 粗筛 → 解析 → 去重），空根/无候选文件都不报错。
+    #[test]
+    fn ide_source_collects_events_and_tolerates_empty_roots() {
+        let root = temp_dir("ide-source");
+        let copilot = root
+            .join("20260917T102952")
+            .join("window3")
+            .join("exthost")
+            .join(IDE_LOG_DIR_NAME);
+        std::fs::create_dir_all(&copilot).expect("插件日志目录");
+        std::fs::write(
+            copilot.join("腾讯云代码助手.log"),
+            [
+                ide_auth_line(UID_A),
+                ide_model_selection_line(IDE_CONV, IDE_MODEL),
+                ide_event_lines(IDE_CONV, UID_A),
+            ]
+            .join("\n"),
+        )
+        .expect("插件日志");
+
+        let events = collect_events(&root, LogFormat::Ide, AuthMarker::AuthSessionChanged);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].hit_count, 8);
+        assert_eq!(events[0].session_id.as_deref(), Some(IDE_CONV));
+        assert!(collect_events(
+            &root.join("missing"),
+            LogFormat::Ide,
+            AuthMarker::AuthSessionChanged
+        )
+        .is_empty());
+
+        let empty = temp_dir("ide-empty");
+        std::fs::create_dir_all(&empty).expect("空目录");
+        assert!(collect_events(&empty, LogFormat::Ide, AuthMarker::AuthSessionChanged).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// 两个 IDE 的日志根各自指向自己的数据目录（平台分支在 `codebuddy_ide_data_dir` 内）。
+    #[test]
+    fn the_two_ide_sources_use_distinct_data_roots() {
+        let (Some(intl), Some(cn)) = (
+            codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Intl),
+            codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Cn),
+        ) else {
+            // 该平台定位不到配置目录时不适用（与运行时代码同样跳过）。
+            return;
+        };
+        assert_ne!(intl, cn);
+        assert_eq!(
+            intl.file_name().and_then(|name| name.to_str()),
+            Some("CodeBuddy")
+        );
+        assert_eq!(
+            cn.file_name().and_then(|name| name.to_str()),
+            Some("CodeBuddy CN")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 新来源的账号归因（uid 优先，状态文件带 updatedAt 门控回落）
+    // -----------------------------------------------------------------------
+
+    fn event_without_uid(first_seen_at: i64) -> Event {
+        Event {
+            session_id: None,
+            model: None,
+            reset_at: CN_RESET_AT,
+            first_seen_at,
+            hit_count: 1,
+            uid: None,
+        }
+    }
+
+    /// 回落门控：只有 `updatedAt ≤ 事件时刻` 才可信；缺失/过晚/损坏一律丢弃（不误归）。
+    #[test]
+    fn fallback_state_file_only_counts_when_updated_before_the_event() {
+        let dir = temp_dir("fallback");
+        std::fs::create_dir_all(&dir).expect("临时目录");
+        let path = dir.join(CLI_STATE_FILE);
+        let events = [event_without_uid(1_500)];
+        let no_uid = HashMap::new();
+
+        // ① uid 不可用 + 状态文件缺失 → 丢弃。
+        assert!(resolve_by_uid(&events, &no_uid, &ActiveAccount::load(&path)).is_empty());
+
+        // ② `updatedAt` 晚于事件 → 不可信：IDE 的 detect 会回写状态，但那不是账号切换。
+        std::fs::write(
+            &path,
+            json!({ "activeAccountId": "acc-1", "updatedAt": 2_000 }).to_string(),
+        )
+        .expect("状态文件");
+        assert!(resolve_by_uid(&events, &no_uid, &ActiveAccount::load(&path)).is_empty());
+
+        // ③ `updatedAt` 早于事件 → 该时刻生效的账号可用。
+        std::fs::write(
+            &path,
+            json!({ "activeAccountId": "acc-1", "updatedAt": 1_000 }).to_string(),
+        )
+        .expect("状态文件");
+        let resolved = resolve_by_uid(&events, &no_uid, &ActiveAccount::load(&path));
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].account_id, "acc-1");
+
+        // ④ 缺 `updatedAt`（老状态文件）→ 无从证实「当时是谁」，丢弃。
+        std::fs::write(&path, json!({ "activeAccountId": "acc-1" }).to_string()).expect("状态文件");
+        assert!(resolve_by_uid(&events, &no_uid, &ActiveAccount::load(&path)).is_empty());
+
+        // ⑤ 内容损坏 → 回落不可用，不报错。
+        std::fs::write(&path, "{ not json").expect("状态文件");
+        assert!(resolve_by_uid(&events, &no_uid, &ActiveAccount::load(&path)).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 日志内 uid 命中账号库时优先于状态文件回落（AC8：不按「当前 activeAccountId」误归）。
+    #[test]
+    fn uid_match_wins_over_the_state_file_fallback() {
+        let dir = temp_dir("uid-wins");
+        std::fs::create_dir_all(&dir).expect("临时目录");
+        let path = dir.join(IDE_STATE_FILE);
+        std::fs::write(
+            &path,
+            json!({ "activeAccountId": "acc-stale", "updatedAt": 1 }).to_string(),
+        )
+        .expect("状态文件");
+
+        let uid_to_account = HashMap::from([(UID_A.to_string(), "acc-uid".to_string())]);
+        let mut event = event_without_uid(1_500);
+        event.uid = Some(UID_A.to_string());
+        let resolved = resolve_by_uid(&[event], &uid_to_account, &ActiveAccount::load(&path));
+        assert_eq!(resolved[0].account_id, "acc-uid");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 归因不到的 uid（账号库没有该账号）不得误配给任何账号。
+    #[test]
+    fn unknown_uid_is_dropped_without_a_fallback() {
+        let mut event = event_without_uid(1_500);
+        event.uid = Some(UID_A.to_string());
+        let resolved = resolve_by_uid(
+            &[event],
+            &HashMap::from([(UID_B.to_string(), "acc-b".to_string())]),
+            &ActiveAccount {
+                account_id: None,
+                updated_at: None,
+            },
+        );
+        assert!(resolved.is_empty());
     }
 }
