@@ -524,8 +524,10 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// 默认限额监听配置：默认开启（与改造前「账号页自动显示限额」的行为一致）。
+///
+/// `hookOptOut` = 用户点过「卸载 hook」→ 不再自动接入；默认 `false`（默认接入）。
 pub fn default_rate_limit_config() -> Value {
-    json!({ "enabled": true })
+    json!({ "enabled": true, "hookOptOut": false })
 }
 
 /// 读取指定的限额监听配置文件（缺失/损坏时合并默认值）。
@@ -535,8 +537,10 @@ pub fn load_rate_limit_config_at(path: &Path) -> Value {
     let mut cfg = default_rate_limit_config();
     if let Ok(text) = std::fs::read_to_string(path) {
         if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-            if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
-                cfg["enabled"] = json!(enabled);
+            for key in ["enabled", "hookOptOut"] {
+                if let Some(value) = map.get(key).and_then(Value::as_bool) {
+                    cfg[key] = json!(value);
+                }
             }
         }
     }
@@ -551,14 +555,26 @@ pub fn load_rate_limit_config() -> Value {
 /// 保存限额监听配置到指定路径（只保留已知字段）。
 pub fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
     let mut merged = default_rate_limit_config();
-    if let Some(enabled) = cfg.get("enabled").and_then(Value::as_bool) {
-        merged["enabled"] = json!(enabled);
+    for key in ["enabled", "hookOptOut"] {
+        if let Some(value) = cfg.get(key).and_then(Value::as_bool) {
+            merged[key] = json!(value);
+        }
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
     atomic_write(path, &content)
+}
+
+/// 只改写 `hookOptOut`（保留 `enabled` 等既有字段），返回写入后的完整配置。
+///
+/// 用户点「卸载 hook」置 `true`、「接入 hook」置 `false`；两处都不改动别的开关状态。
+pub fn set_rate_limit_hook_opt_out_at(path: &Path, opt_out: bool) -> std::io::Result<Value> {
+    let mut cfg = load_rate_limit_config_at(path);
+    cfg["hookOptOut"] = json!(opt_out);
+    save_rate_limit_config_at(path, &cfg)?;
+    Ok(load_rate_limit_config_at(path))
 }
 
 /// 保存限额监听配置（只保留已知字段）。
@@ -1283,12 +1299,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rate_limit_config.json");
 
-        // 文件缺失 → 默认开启。
+        // 文件缺失 → 默认开启、未卸载过。
+        let defaults = load_rate_limit_config_at(&path);
+        assert_eq!(defaults.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(
-            load_rate_limit_config_at(&path)
-                .get("enabled")
-                .and_then(Value::as_bool),
-            Some(true)
+            defaults.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
         );
 
         // 显式关闭 → 生效。
@@ -1296,6 +1312,11 @@ mod tests {
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
         assert!(saved.get("extra").is_none(), "只保留已知字段: {saved}");
+        assert_eq!(
+            saved.as_object().unwrap().len(),
+            2,
+            "只有 enabled + hookOptOut"
+        );
         assert_eq!(
             load_rate_limit_config_at(&path)
                 .get("enabled")
@@ -1319,6 +1340,63 @@ mod tests {
             Some(true)
         );
         assert!(rate_limit_config_file().ends_with("rate_limit_config.json"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `hookOptOut` 与 `enabled` 并列：只保留已知字段，且单字段改写不动另一个开关。
+    #[test]
+    fn rate_limit_hook_opt_out_survives_known_field_merge() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-opt-out-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 只保留已知字段：多余键不落盘。
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "hookOptOut": true, "unknown": "x"}),
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("hookOptOut").and_then(Value::as_bool), Some(true));
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert!(saved.get("unknown").is_none(), "只保留已知字段: {saved}");
+
+        // 单字段改写：置 true / 置 false 都不动 `enabled`。
+        let after_opt_out = set_rate_limit_hook_opt_out_at(&path, true).unwrap();
+        assert_eq!(
+            after_opt_out.get("hookOptOut").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            after_opt_out.get("enabled").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置限额监听开关"
+        );
+        let cleared = set_rate_limit_hook_opt_out_at(&path, false).unwrap();
+        assert_eq!(
+            cleared.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(cleared.get("enabled").and_then(Value::as_bool), Some(false));
+        // 配置缺失时也能写入（首次卸载 / 首次接入）。
+        let fresh = dir.join("fresh.json");
+        assert_eq!(
+            set_rate_limit_hook_opt_out_at(&fresh, true)
+                .unwrap()
+                .get("hookOptOut")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&fresh)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

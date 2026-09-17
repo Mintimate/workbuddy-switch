@@ -429,12 +429,12 @@ pub async fn get_rate_limit_hook_status() -> Result<Value, String> {
         .map_err(|error| format!("查询限额 hook 状态失败: {error}"))
 }
 
-/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份）。
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份；同时清除「卸载过」标记）。
 #[tauri::command]
 pub async fn install_rate_limit_hook() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let result = rate_limit_hook::install_hook();
-        // 扫描范围随安装结果变化（hook 健康时只扫 IDE 两源），缓存必须作废。
+        // 扫描范围随安装结果变化（只对未注册的来源扫日志），缓存必须作废。
         limits::invalidate_scan_cache();
         result.map(|_| with_hook_runtime_fields())
     })
@@ -443,6 +443,9 @@ pub async fn install_rate_limit_hook() -> Result<Value, String> {
 }
 
 /// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+///
+/// 卸载即用户拒绝自动接入：`install_hook` / `hookOptOut` 的置位在 core 里与安装逻辑同处，
+/// 两个宿主（桌面端 / webui）共用同一语义。
 #[tauri::command]
 pub async fn uninstall_rate_limit_hook() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(|| {

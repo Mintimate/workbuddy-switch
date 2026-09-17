@@ -191,7 +191,7 @@ export interface RateLimitHookTarget {
   label: string;
   /** `settings.json` 路径。 */
   path: string;
-  /** 配置文件是否存在。 */
+  /** 该客户端数据根目录是否存在（唯一的存在性判据；不存在则不参与安装）。 */
   exists: boolean;
   /** 该配置里是否已注册本工具的 Stop / FinalStop。 */
   installed: boolean;
@@ -215,6 +215,8 @@ export interface RateLimitHookStatus {
 /** 限额监听开关（`~/.wb-switch/rate_limit_config.json`）。 */
 export interface RateLimitConfig {
   enabled: boolean;
+  /** 用户点过「卸载 hook」→ 启动时不再自动接入；重新点「接入 hook」清除。 */
+  hookOptOut: boolean;
 }
 
 export interface AutoRotateConfig {

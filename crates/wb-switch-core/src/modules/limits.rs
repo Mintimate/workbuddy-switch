@@ -3,9 +3,12 @@
 //!
 //! 两条通路合并（`get_rate_limits()`）：
 //! - **hook 通路**（`rate_limit_events.rs`）：CLI 与 WorkBuddy 两档位的 `Stop` / `FinalStop`
-//!   payload 里直接带限额文案与模型，实时归因、秒级可见；hook 已安装时这两档位不扫日志。
-//! - **日志扫描**（本模块）：两个 CodeBuddy IDE 永远走这条；hook 未安装 / 被移除时兜底覆盖
-//!   全部五源。扫描本身按 5 分钟节流并缓存，`scannedAt` 是最近一次真实扫描的时刻。
+//!   payload 里直接带限额文案与模型，实时归因、秒级可见；这些来源已接 hook 时不扫日志。
+//! - **日志扫描**（本模块）：两个 CodeBuddy IDE 永远走这条；CLI / WorkBuddy 只在**该处没接上
+//!   hook**（未安装 / 条目被删 / 配置写坏）时按来源逐个回退。扫描按 5 分钟节流并缓存，
+//!   `scannedAt` 是最近一次真实扫描的时刻。
+//!
+//! 扫描范围逐来源判定：**客户端数据根不存在**（本机没装）的来源既不安装 hook 也不扫日志。
 //!
 //! 不新增任何网络请求，也不解析客户端 UI 文案。日志窗口固定为最近 2 天（WorkBuddy 两档位
 //! 与 CLI 是最近 2 个日期目录，两个 IDE 按文件 mtime 收窗）；重置时刻直接采用日志原文 / payload
@@ -38,6 +41,7 @@ use serde_json::{json, Value};
 
 use crate::modules::account;
 use crate::modules::config::{home_dir, now_ms, store_dir};
+use crate::modules::rate_limit_hook::{hook_marker, needs_log_scan, SETTINGS_FILE_NAME};
 use crate::modules::session::{open_db, table_exists, workbuddy_db_path};
 use crate::modules::variant::WbVariant;
 use crate::modules::vscode_cn_inject::{codebuddy_ide_data_dir, CodeBuddyIdeFlavor};
@@ -1096,7 +1100,7 @@ fn cli_state_path() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// 扫描缓存与范围（hook 通路接入后：hook 健康时只扫 IDE 两源）
+// 扫描缓存与范围（hook 通路接入后：逐来源判定）
 // ---------------------------------------------------------------------------
 
 /// 日志扫描的最小间隔：与前端节流口径一致（hook 已安装时 IDE 日志仍按 5 分钟扫一次）。
@@ -1105,11 +1109,127 @@ fn cli_state_path() -> PathBuf {
 /// 事件驱动的拉取、页面反复开关都不会触发额外的全量扫描。
 const SCAN_MIN_INTERVAL_MS: i64 = 5 * 60 * 1000;
 
+/// 一个日志来源（扫描范围的最小单位）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ScanSource {
+    /// WorkBuddy 客户端（两档位各算一个来源）。
+    WorkBuddy(WbVariant),
+    /// CodeBuddy CLI（与两个 IDE **共用** `~/.codebuddy/settings.json`）。
+    Cli,
+    /// CodeBuddy IDE 的一个形态（429 不触发任何事件，数据根存在即扫）。
+    Ide(CodeBuddyIdeFlavor),
+}
+
+impl ScanSource {
+    /// 位图里的位序（与 `ScanScope::ALL` 对应）。
+    fn bit(self) -> u8 {
+        match self {
+            Self::WorkBuddy(WbVariant::Cn) => 0,
+            Self::WorkBuddy(WbVariant::Ai) => 1,
+            Self::Cli => 2,
+            Self::Ide(CodeBuddyIdeFlavor::Intl) => 3,
+            Self::Ide(CodeBuddyIdeFlavor::Cn) => 4,
+        }
+    }
+}
+
+/// 一次请求要扫的来源集合（位图）。
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+struct ScanScope(u8);
+
+impl ScanScope {
+    /// 一个来源都不扫。
+    const NONE: Self = Self(0);
+    /// 全量五源：装 / 卸 hook 的瞬间强制扫一遍，避免丢掉已经显示出来的限额。
+    const ALL: Self = Self(0b1_1111);
+
+    fn insert(&mut self, source: ScanSource) {
+        self.0 |= 1 << source.bit();
+    }
+
+    fn contains(self, source: ScanSource) -> bool {
+        self.0 & (1 << source.bit()) != 0
+    }
+
+    /// `self` 是否覆盖 `other`（缓存命中判据：缓存范围必须是请求范围的超集）。
+    fn covers(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+/// 扫描范围判定的输入路径（显式传入：单测注入 tempdir，不触碰真实配置）。
+struct ScanRoots {
+    /// 需要按「数据根存在 且 该处未注册 hook」判定的来源：CLI 与 WorkBuddy 两档位。
+    hook_sources: Vec<(ScanSource, PathBuf, PathBuf)>,
+    /// 只判「数据根存在」的来源：两个 IDE。
+    ide_sources: Vec<(ScanSource, PathBuf)>,
+    /// 本工具 hook 脚本的绝对路径（配置里的 marker）。
+    marker: String,
+}
+
+impl ScanRoots {
+    fn real() -> Self {
+        let mut hook_sources = Vec::new();
+        for variant in WbVariant::ALL {
+            let root = variant.data_root();
+            hook_sources.push((
+                ScanSource::WorkBuddy(variant),
+                root.clone(),
+                root.join(SETTINGS_FILE_NAME),
+            ));
+        }
+        let cli_root = home_dir().join(CLI_DATA_DIR);
+        hook_sources.push((
+            ScanSource::Cli,
+            cli_root.clone(),
+            cli_root.join(SETTINGS_FILE_NAME),
+        ));
+        let ide_sources = [CodeBuddyIdeFlavor::Intl, CodeBuddyIdeFlavor::Cn]
+            .into_iter()
+            .filter_map(|flavor| {
+                codebuddy_ide_data_dir(flavor).map(|dir| (ScanSource::Ide(flavor), dir))
+            })
+            .collect();
+        Self {
+            hook_sources,
+            ide_sources,
+            marker: hook_marker(),
+        }
+    }
+}
+
+/// 逐来源扫描范围：
+///
+/// - CLI / WorkBuddy(x)：数据根存在 **且** 该处配置未注册本工具 hook —— 某处注册失败
+///   （非法 JSON / 用户手删条目）时只有那一处回退日志扫描，其余来源继续走事件通路；
+/// - IDE(x)：数据根存在即扫（IDE 的 429 不触发任何事件，永远走日志扫描）。
+fn scan_scope(roots: &ScanRoots) -> ScanScope {
+    let mut scope = ScanScope::NONE;
+    for (source, data_root, settings) in &roots.hook_sources {
+        if needs_log_scan(data_root, settings, &roots.marker) {
+            scope.insert(*source);
+        }
+    }
+    for (source, data_root) in &roots.ide_sources {
+        if data_root.is_dir() {
+            scope.insert(*source);
+        }
+    }
+    scope
+}
+
 struct ScanCache {
     at: i64,
-    /// 本次缓存是否只覆盖 IDE 两源（hook 已安装时的常态）。
-    ide_only: bool,
+    /// 本次缓存覆盖的来源范围。
+    scope: ScanScope,
     entries: Vec<Resolved>,
+}
+
+impl ScanCache {
+    /// 缓存能否满足请求：范围是请求的超集（全量缓存满足子范围请求）。
+    fn covers(&self, requested: ScanScope, now: i64) -> bool {
+        now - self.at < SCAN_MIN_INTERVAL_MS && self.scope.covers(requested)
+    }
 }
 
 static SCAN_CACHE: Mutex<Option<ScanCache>> = Mutex::new(None);
@@ -1126,43 +1246,45 @@ pub fn invalidate_scan_cache() {
 
 /// 取一次扫描结果（命中缓存则不重扫）。
 ///
-/// `allow_scan = false`（限额监听被关闭）时不重扫，只用已有缓存——关闭开关后不得再读日志。
-fn cached_scan(ide_only: bool, now: i64, allow_scan: bool) -> (i64, Vec<Resolved>) {
+/// 命中要求缓存范围 ⊇ 请求范围；`allow_scan = false`（限额监听被关闭）时不重扫，
+/// 只用已有缓存——关闭开关后不得再读日志。
+fn cached_scan(requested: ScanScope, now: i64, allow_scan: bool) -> (i64, Vec<Resolved>) {
     let mut cache = SCAN_CACHE.lock().unwrap();
     if let Some(cached) = cache.as_ref() {
-        // 全量缓存可以满足「只要 IDE」的请求（超集）；IDE 缓存不能满足全量请求。
-        let range_ok = cached.ide_only == ide_only || !cached.ide_only;
-        if (now - cached.at < SCAN_MIN_INTERVAL_MS && range_ok) || !allow_scan {
+        if cached.covers(requested, now) || !allow_scan {
             return (cached.at, cached.entries.clone());
         }
     }
     if !allow_scan {
         return (0, Vec::new());
     }
-    let entries = scan_sources(ide_only);
+    let entries = scan_sources(requested);
     *cache = Some(ScanCache {
         at: now,
-        ide_only,
+        scope: requested,
         entries: entries.clone(),
     });
     (now, entries)
 }
 
-/// 按范围扫描日志：`ide_only` 时只扫两个 IDE（CLI 与 WorkBuddy 由 hook 通路负责）。
-fn scan_sources(ide_only: bool) -> Vec<Resolved> {
+/// 按范围扫描日志：只扫 `scope` 里的来源（已注册 hook 的来源由事件通路负责）。
+fn scan_sources(scope: ScanScope) -> Vec<Resolved> {
     let mut resolved = Vec::new();
-    if !ide_only {
-        // ① WorkBuddy 两档位：日期目录枚举 + `sessions` 表归因（现有行为不变）。
-        for variant in WbVariant::ALL {
-            let events = collect_events(
-                &variant.data_root().join(LOG_DIR_NAME),
-                LogFormat::WorkBuddy,
-                AuthMarker::None,
-            );
-            resolved.extend(resolve(variant, &events));
+    // ① WorkBuddy 两档位：日期目录枚举 + `sessions` 表归因（现有行为不变）。
+    for variant in WbVariant::ALL {
+        if !scope.contains(ScanSource::WorkBuddy(variant)) {
+            continue;
         }
-        // ② CodeBuddy CLI：日志与 WorkBuddy 同格式（时间戳/事件 id/模型归因全部兼容），
-        // 但会话不在 WorkBuddy 的 `sessions` 表里，归因走日志内鉴权 uid + 轮换状态文件回落。
+        let events = collect_events(
+            &variant.data_root().join(LOG_DIR_NAME),
+            LogFormat::WorkBuddy,
+            AuthMarker::None,
+        );
+        resolved.extend(resolve(variant, &events));
+    }
+    // ② CodeBuddy CLI：日志与 WorkBuddy 同格式（时间戳/事件 id/模型归因全部兼容），
+    // 但会话不在 WorkBuddy 的 `sessions` 表里，归因走日志内鉴权 uid + 轮换状态文件回落。
+    if scope.contains(ScanSource::Cli) {
         let uid_to_account = account_id_by_uid();
         let cli = collect_events(
             &cli_logs_root(),
@@ -1180,11 +1302,14 @@ fn scan_sources(ide_only: bool) -> Vec<Resolved> {
     // **不扫** `CodeBuddyExtension/Logs/CodeBuddyIDE/`：它是插件宿主的跨 App 共享日志根，
     // 与 CN IDE 真身重复记录同一次 429（同一 requestId、行时间差 3 ms），扫它会重复展示
     // 且档位归属不清（PRD D1）。
-    let uid_to_account = account_id_by_uid();
+    let mut ide_uid_to_account: Option<HashMap<String, String>> = None;
     for (flavor, state_file) in [
         (CodeBuddyIdeFlavor::Intl, IDE_STATE_FILE),
         (CodeBuddyIdeFlavor::Cn, CN_IDE_STATE_FILE),
     ] {
+        if !scope.contains(ScanSource::Ide(flavor)) {
+            continue;
+        }
         // 该 IDE 的数据目录不可定位（平台不支持）时跳过，不是错误。
         let Some(data_dir) = codebuddy_ide_data_dir(flavor) else {
             continue;
@@ -1194,9 +1319,10 @@ fn scan_sources(ide_only: bool) -> Vec<Resolved> {
             LogFormat::Ide,
             AuthMarker::AuthSessionChanged,
         );
+        let uid_to_account = ide_uid_to_account.get_or_insert_with(account_id_by_uid);
         resolved.extend(resolve_by_uid(
             &events,
-            &uid_to_account,
+            uid_to_account,
             &ActiveAccount::load(&store_dir().join(state_file)),
         ));
     }
@@ -1207,24 +1333,29 @@ fn scan_sources(ide_only: bool) -> Vec<Resolved> {
 ///
 /// 两条通路合并：
 /// - **hook 通路**（CLI / WorkBuddy 两档位）：事件驱动、实时归因，由 `rate_limit_events` 持有；
-/// - **日志扫描**（两个 IDE + hook 未安装时的全部五源）：按 `SCAN_MIN_INTERVAL_MS` 节流，
-///   合并后的 `scannedAt` 是**最近一次真实扫描**的时刻（前端据此节流）。
+/// - **日志扫描**（两个 IDE 永远走这条；CLI / WorkBuddy 只在「该处未注册 hook」时回退扫描）：
+///   按 `SCAN_MIN_INTERVAL_MS` 节流，合并后的 `scannedAt` 是**最近一次真实扫描**的时刻
+///   （前端据此节流）。
 ///
 /// 不接收档位参数：扫描本身就是全局的，按档位调用会把同一份日志扫 N 遍。
 pub fn get_rate_limits() -> Value {
     let now = now_ms();
     // 限额监听关闭时不再扫日志（hook 信号照常入账，由后端持有）。
     let enabled = crate::modules::rate_limit_events::rate_limit_enabled();
-    // hook 已安装 → 只扫 IDE 两源；否则全量兜底。装/卸瞬间强制全量一次。
-    // 关闭开关时不得把「强制全量」标志消费掉：否则重新开启后会直接 ide_only，
-    // 装 hook 前已经显示的 CLI / WorkBuddy 限额会丢。
+    // 逐来源判定：不存在的客户端不参与扫描；已注册 hook 的来源交给事件通路。
+    // 装 / 卸 hook 的瞬间强制全量一次。关闭开关时不得把「强制全量」标志消费掉：
+    // 否则重新开启后会直接按当前范围扫，装 hook 前已经显示的 CLI / WorkBuddy 限额会丢。
     let full_scan_once = if enabled {
         FORCE_FULL_SCAN.swap(false, Ordering::SeqCst)
     } else {
         FORCE_FULL_SCAN.load(Ordering::SeqCst)
     };
-    let ide_only = crate::modules::rate_limit_hook::is_installed() && !full_scan_once;
-    let (scanned_at, mut resolved) = cached_scan(ide_only, now, enabled);
+    let scope = if full_scan_once {
+        ScanScope::ALL
+    } else {
+        scan_scope(&ScanRoots::real())
+    };
+    let (scanned_at, mut resolved) = cached_scan(scope, now, enabled);
     resolved.extend(crate::modules::rate_limit_events::hook_entries(now));
     build_payload(resolved, if scanned_at > 0 { scanned_at } else { now })
 }
@@ -2340,5 +2471,147 @@ mod tests {
             },
         );
         assert!(resolved.is_empty());
+    }
+
+    /// 扫描范围是位图：缓存命中要求「缓存范围 ⊇ 请求范围」，且受 5 分钟节流约束。
+    #[test]
+    fn scan_scope_and_cache_require_a_superset() {
+        let mut cli = ScanScope::NONE;
+        cli.insert(ScanSource::Cli);
+        let mut ides = ScanScope::NONE;
+        ides.insert(ScanSource::Ide(CodeBuddyIdeFlavor::Intl));
+        ides.insert(ScanSource::Ide(CodeBuddyIdeFlavor::Cn));
+
+        assert!(ScanScope::NONE.covers(ScanScope::NONE));
+        assert!(!ScanScope::NONE.covers(cli));
+        assert!(ScanScope::ALL.covers(ides));
+        assert!(!ides.covers(ScanScope::ALL));
+        assert!(!ides.covers(cli));
+        // 位图按来源独立：插入 IDE 不影响 CLI。
+        assert!(ides.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+        assert!(!ides.contains(ScanSource::WorkBuddy(WbVariant::Ai)));
+
+        let now = 1_000_000;
+        let cache = ScanCache {
+            at: now,
+            scope: ScanScope::ALL,
+            entries: Vec::new(),
+        };
+        assert!(
+            cache.covers(ides, now + SCAN_MIN_INTERVAL_MS - 1),
+            "未过期且范围是超集 → 命中（装 hook 后只扫 IDE 的请求由全量缓存满足）"
+        );
+        assert!(
+            !cache.covers(ides, now + SCAN_MIN_INTERVAL_MS),
+            "过期缓存不命中"
+        );
+        let narrow = ScanCache {
+            at: now,
+            scope: ides,
+            entries: Vec::new(),
+        };
+        assert!(
+            !narrow.covers(ScanScope::ALL, now),
+            "范围不足（子集）不命中，必须重扫"
+        );
+        assert!(narrow.covers(ides, now), "同一范围命中");
+    }
+
+    /// 逐来源判定扫描范围（注入 tempdir 路径，不触碰真实配置）：
+    ///
+    /// - 数据根不存在 → 不扫（也不因其缺失而报错）；
+    /// - 数据根存在且该处未注册 hook → 扫（某处注册失败只有那一处回退）；
+    /// - 数据根存在且已注册 hook → 不扫（交给事件通路）；
+    /// - IDE 数据根存在 → 永远扫（IDE 的 429 不触发任何事件）。
+    #[test]
+    fn scan_scope_is_decided_per_source() {
+        let dir = temp_dir("scan-scope");
+        let marker = dir.join(".wb-switch").join("hook.sh");
+        let marker = marker.to_string_lossy().to_string();
+        let registered = json!({
+            "hooks": {
+                "Stop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh '{marker}'") }] }],
+                "FinalStop": [{ "matcher": "", "hooks": [{ "type": "command", "command": format!("sh '{marker}'") }] }],
+            }
+        })
+        .to_string();
+
+        let cli_root = dir.join(".codebuddy");
+        let wb_cn = dir.join(".workbuddy");
+        let wb_ai = dir.join(".workbuddy-ai");
+        let ide_intl = dir.join("CodeBuddy");
+        let ide_cn = dir.join("CodeBuddy CN");
+        // 已安装：CLI（已注册）、WorkBuddy 国内版（配置里**没有** marker）、两个 IDE。
+        std::fs::create_dir_all(&cli_root).expect("CLI 数据根");
+        std::fs::write(cli_root.join(SETTINGS_FILE_NAME), &registered).expect("CLI 配置");
+        std::fs::create_dir_all(&wb_cn).expect("WorkBuddy 数据根");
+        std::fs::write(wb_cn.join(SETTINGS_FILE_NAME), "{}").expect("WorkBuddy 配置");
+        std::fs::create_dir_all(&ide_intl).expect("IDE 数据根");
+        std::fs::create_dir_all(&ide_cn).expect("CN IDE 数据根");
+
+        let roots = ScanRoots {
+            hook_sources: vec![
+                (
+                    ScanSource::WorkBuddy(WbVariant::Cn),
+                    wb_cn.clone(),
+                    wb_cn.join(SETTINGS_FILE_NAME),
+                ),
+                (
+                    ScanSource::WorkBuddy(WbVariant::Ai),
+                    wb_ai.clone(),
+                    wb_ai.join(SETTINGS_FILE_NAME),
+                ),
+                (
+                    ScanSource::Cli,
+                    cli_root.clone(),
+                    cli_root.join(SETTINGS_FILE_NAME),
+                ),
+            ],
+            ide_sources: vec![
+                (ScanSource::Ide(CodeBuddyIdeFlavor::Intl), ide_intl.clone()),
+                (ScanSource::Ide(CodeBuddyIdeFlavor::Cn), ide_cn.clone()),
+            ],
+            marker: marker.clone(),
+        };
+
+        let scope = scan_scope(&roots);
+        assert!(
+            !scope.contains(ScanSource::Cli),
+            "已注册 hook 的来源不扫日志"
+        );
+        assert!(
+            scope.contains(ScanSource::WorkBuddy(WbVariant::Cn)),
+            "未注册的来源回退日志扫描"
+        );
+        assert!(
+            !scope.contains(ScanSource::WorkBuddy(WbVariant::Ai)),
+            "不存在的数据根不参与扫描，也不因其缺失报错"
+        );
+        assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
+        assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+
+        // 用户手删了 CLI 的条目 → 只有 CLI 回退扫描，其余来源不受影响。
+        std::fs::write(cli_root.join(SETTINGS_FILE_NAME), "{}").expect("手删条目");
+        let scope = scan_scope(&roots);
+        assert!(
+            scope.contains(ScanSource::Cli),
+            "条目被删的来源必须回退扫描"
+        );
+        assert!(scope.contains(ScanSource::WorkBuddy(WbVariant::Cn)));
+
+        // 某处配置写坏（非法 JSON）按「未注册」处理 → 该来源回退扫描。
+        std::fs::write(cli_root.join(SETTINGS_FILE_NAME), "{ not json").expect("写坏配置");
+        assert!(scan_scope(&roots).contains(ScanSource::Cli));
+
+        // 注册齐全 + 数据根都在 → 只剩两个 IDE。
+        std::fs::write(cli_root.join(SETTINGS_FILE_NAME), &registered).expect("重新注册");
+        std::fs::write(wb_cn.join(SETTINGS_FILE_NAME), &registered).expect("注册 WorkBuddy");
+        let scope = scan_scope(&roots);
+        assert!(!scope.contains(ScanSource::Cli));
+        assert!(!scope.contains(ScanSource::WorkBuddy(WbVariant::Cn)));
+        assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Intl)));
+        assert!(scope.contains(ScanSource::Ide(CodeBuddyIdeFlavor::Cn)));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -16,7 +16,7 @@ pub(crate) fn is_screenshot_demo() -> bool {
 }
 
 /// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活；
-/// 限额 hook 信号每秒轮询一次（入账即通知前端）。
+/// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
@@ -85,6 +85,15 @@ fn spawn_background_loops(app: tauri::AppHandle) {
     // 状态由后端持有（见 `rate_limit_events.rs`）。
     modules::rate_limit_events::spawn_watcher(move || {
         let _ = app.emit("rate-limits-updated", serde_json::json!({}));
+    });
+
+    // 默认接入：后台线程自动安装 hook（幂等、非阻塞、失败静默）。
+    // 前置条件（开关开启 / 用户没卸载过 / 存在客户端 / 未装全）由 core 判定；
+    // 装上了就作废扫描缓存——扫描范围从全量收窄到「未注册的来源」。
+    std::thread::spawn(|| {
+        if modules::rate_limit_hook::auto_install_on_startup() {
+            modules::limits::invalidate_scan_cache();
+        }
     });
 }
 

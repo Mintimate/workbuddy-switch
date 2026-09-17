@@ -963,11 +963,12 @@ function RateLimitCard() {
   async function onToggle(enabled: boolean) {
     if (!config || busy) return;
     const previous = config;
-    setConfig({ enabled });
+    setConfig({ ...config, enabled });
     setBusy(true);
     setMsg(null);
     try {
-      setConfig(await api.saveRateLimitConfig({ enabled }));
+      // 整个配置一起提交：只带 enabled 会把「卸载过」标记冲掉，重启后 hook 又被自动装回。
+      setConfig(await api.saveRateLimitConfig({ ...config, enabled }));
       setMsg({ type: "ok", text: enabled ? "限额监听已开启" : "限额监听已关闭" });
     } catch (e) {
       setConfig(previous);
@@ -975,6 +976,19 @@ function RateLimitCard() {
     } finally {
       setBusy(false);
     }
+  }
+
+  /**
+   * 回读限额配置：装 / 卸 hook 无论成败都会写「接入 / 卸载」意图（部分目标失败也算），
+   * 本地标记不能只靠乐观更新，否则随后拨总开关会把过期值写回磁盘。
+   */
+  function refreshHookConfig() {
+    return api
+      .getRateLimitConfig()
+      .then(setConfig)
+      .catch(() => {
+        /* 读不到就保持本地值，下次进设置页会重新拉 */
+      });
   }
 
   async function onInstall() {
@@ -991,6 +1005,7 @@ function RateLimitCard() {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
       setBusy(false);
+      void refreshHookConfig();
     }
   }
 
@@ -1000,19 +1015,28 @@ function RateLimitCard() {
     setMsg(null);
     try {
       setStatus(await api.uninstallRateLimitHook());
-      setMsg({ type: "ok", text: "已卸载 hook：三处客户端配置恢复原状，限额改由日志扫描发现" });
+      setMsg({
+        type: "ok",
+        text: "已卸载 hook：客户端配置恢复原状，之后不会再自动接入（限额改由日志扫描发现，可随时点「接入 hook」恢复）",
+      });
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
       setBusy(false);
+      void refreshHookConfig();
     }
   }
 
-  const installedCount = status?.targets.filter((target) => target.installed).length ?? 0;
+  const existingTargets = status?.targets.filter((target) => target.exists) ?? [];
+  const installedCount = existingTargets.filter((target) => target.installed).length;
   const hookDescription = status
-    ? status.installed
-      ? `${installedCount} / ${status.targets.length} 个客户端已接入：429 当轮实时上报（秒级）；CodeBuddy IDE 无事件，仍按日志扫描`
-      : "未接入：限额仅靠定期扫描日志发现（最多滞后数分钟）"
+    ? existingTargets.length === 0
+      ? "未检测到 CodeBuddy CLI / WorkBuddy 客户端：没有可接入的配置（CodeBuddy IDE 的限额仍按日志扫描）"
+      : status.installed
+        ? `${installedCount} / ${existingTargets.length} 个已安装客户端已接入：429 当轮实时上报（秒级）；CodeBuddy IDE 无事件，仍按日志扫描`
+        : config?.hookOptOut
+          ? "已卸载：不会再自动接入，限额改由日志扫描发现；点「接入 hook」可恢复实时上报"
+          : "未接入：限额仅靠定期扫描日志发现（最多滞后数分钟）"
     : "加载中…";
 
   return (
@@ -1051,7 +1075,12 @@ function RateLimitCard() {
               {busy ? <Loader2 className="animate-spin" /> : null}卸载 hook
             </Button>
           ) : (
-            <Button id="rl-hook" size="sm" disabled={busy || !status} onClick={() => void onInstall()}>
+            <Button
+              id="rl-hook"
+              size="sm"
+              disabled={busy || !status || existingTargets.length === 0}
+              onClick={() => void onInstall()}
+            >
               {busy ? <Loader2 className="animate-spin" /> : null}接入 hook
             </Button>
           )}

@@ -620,11 +620,11 @@ async fn api_rate_limit_hook_status() -> Response {
     }
 }
 
-/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份）。
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份；同时清除「卸载过」标记）。
 async fn api_install_rate_limit_hook() -> Response {
     match tokio::task::spawn_blocking(|| {
         let result = rate_limit_hook::install_hook();
-        // 扫描范围随安装结果变化（hook 健康时只扫 IDE 两源），缓存必须作废。
+        // 扫描范围随安装结果变化（只对未注册的来源扫日志），缓存必须作废。
         limits::invalidate_scan_cache();
         result.map(|_| rate_limit_hook_status())
     })
@@ -637,6 +637,8 @@ async fn api_install_rate_limit_hook() -> Response {
 }
 
 /// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+///
+/// 卸载即用户拒绝自动接入（`hookOptOut`），与安装逻辑同处 core，两个宿主共用同一语义。
 async fn api_uninstall_rate_limit_hook() -> Response {
     match tokio::task::spawn_blocking(|| {
         let result = rate_limit_hook::uninstall_hook();
