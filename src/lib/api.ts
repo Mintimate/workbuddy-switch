@@ -21,6 +21,7 @@ import type {
   ImportResult,
   OAuthPollResult,
   OAuthStartResult,
+  RateLimitsPayload,
   RotateLog,
   RotateStatus,
   Session,
@@ -46,7 +47,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_token_statistics",
   "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
-  "get_travel_status", "get_auto_travel_config",
+  "get_travel_status", "get_auto_travel_config", "get_rate_limits",
 ]);
 
 export function isDemoMode(): boolean {
@@ -102,6 +103,7 @@ const ROUTES: Record<string, Route> = {
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
   get_token_statistics: { method: "GET", path: "/api/token-stats" },
+  get_rate_limits: { method: "GET", path: "/api/rate-limits" },
   checkin: { method: "POST", path: "/api/checkin" },
   checkin_all: { method: "POST", path: "/api/checkin/all" },
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
@@ -425,6 +427,15 @@ export function getCreditStatistics(refresh = false): Promise<CreditStatistics> 
 }
 
 export function getTokenStatistics(days?: number): Promise<TokenStatistics> { return call("get_token_statistics", days ? { days } : undefined); }
+
+/**
+ * 模型限额台账：一次返回**全部账号**当前受限的模型与官方恢复时刻。
+ *
+ * 不传档位：扫描本身就是全局的（两档位各扫一遍）。
+ */
+export function getRateLimits(): Promise<RateLimitsPayload> {
+  return call("get_rate_limits");
+}
 
 export function checkin(accountId: string): Promise<CheckinResult> {
   return call("checkin", { accountId });

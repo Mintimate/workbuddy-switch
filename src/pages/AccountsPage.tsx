@@ -55,7 +55,7 @@ import {
   variantSupportsTravel,
   variantUsesIntlCodebuddyIde,
 } from "@/lib/variant";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -169,6 +169,8 @@ export default function AccountsPage() {
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
+  /** 账号 id -> 当前受限的模型（数据源是本机日志台账，含两个档位） */
+  const [rateLimitMap, setRateLimitMap] = useState<Record<string, RateLimitEntry[]>>({});
   const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
@@ -349,6 +351,33 @@ export default function AccountsPage() {
       window.clearInterval(timer);
     };
   }, [travelAvailable, visibleAccounts]);
+
+  /**
+   * 模型限额台账（本机日志）：一次返回全部账号，这里转成「账号 id -> 受限模型」。
+   *
+   * 容错：老版本后端没有该命令、或扫描失败时按「无受限模型」处理（清空映射），
+   * 不弹错误、不影响账号页其它功能。
+   */
+  async function loadRateLimits() {
+    try {
+      const payload = await api.getRateLimits();
+      const next: Record<string, RateLimitEntry[]> = {};
+      for (const entry of payload.accounts ?? []) {
+        if (entry.limited?.length) next[entry.accountId] = entry.limited;
+      }
+      setRateLimitMap(next);
+    } catch {
+      setRateLimitMap({});
+    }
+  }
+
+  // 与账号页既有刷新节奏一致，约 60 秒重扫一次以捕获新事件；图标何时消失由卡片本地
+  // 按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
+  useEffect(() => {
+    void loadRateLimits();
+    const timer = window.setInterval(() => void loadRateLimits(), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
@@ -971,6 +1000,7 @@ export default function AccountsPage() {
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
+                rateLimits={rateLimitMap[a.id]}
                 credit={creditMap[a.id]}
                 creditLoading={creditLoadingMap[a.id]}
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}

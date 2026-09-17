@@ -1,7 +1,7 @@
 import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
-  GithubConfig, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
+  GithubConfig, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
   TravelConfig, TravelStatus,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -343,6 +343,36 @@ function travelStatus(accountId: string): TravelStatus {
   return { label: "no-buddy", rewardCredit: null, locationName: null };
 }
 
+/**
+ * 模型限额演示数据：A 单模型受限（图标无角标）、B 双模型受限（图标带数量角标，
+ * 其中一条故意归因失败以展示「未知模型」）、C 无受限（图标不渲染）。
+ *
+ * 恢复时刻必须相对 `Date.now()` 生成：前端每秒按 `resetAt` 过滤，写死绝对时间会让
+ * 演示页在某个时刻之后再也看不到图标。三条条目也刻意覆盖「小时级 / 分钟级」倒计时。
+ */
+function rateLimits(): RateLimitsPayload {
+  const now = Date.now();
+  return {
+    scannedAt: now,
+    windowDays: 2,
+    accounts: [
+      {
+        accountId: accounts[0].id,
+        limited: [
+          { model: "deepseek-v4.1-flash", resetAt: now + 134 * 60_000, firstSeenAt: now - 26 * 60_000, hitCount: 7 },
+        ],
+      },
+      {
+        accountId: accounts[1].id,
+        limited: [
+          { model: "kimi-k3-1", resetAt: now + 47 * 60_000, firstSeenAt: now - 41 * 60_000, hitCount: 7 },
+          { model: null, resetAt: now + 5 * 3_600_000, firstSeenAt: now - 12 * 60_000, hitCount: 2 },
+        ],
+      },
+    ],
+  };
+}
+
 function rotateConfig(): AutoRotateConfig {
   return { enabled: true, check_interval_minutes: 15, cooldown_minutes: 120, min_gap_hours: 24, min_urgency_hours: 72, active_guard_minutes: 30, min_remaining_credits: 50 };
 }
@@ -533,6 +563,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
+    case "get_rate_limits": return rateLimits();
     case "get_auto_travel_config": return travelConfig();
     case "get_auto_rotate_config": return config;
     case "rotate_status": return rotateStatus;

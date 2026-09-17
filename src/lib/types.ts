@@ -159,6 +159,32 @@ export interface TravelStatus {
   arriveAt?: number | null;
 }
 
+/** 单个受限模型；`model` 为 null 表示日志里归因不到模型（显示「未知模型」，不猜测）。 */
+export interface RateLimitEntry {
+  model: string | null;
+  /** 官方日志原文给出的恢复时刻（毫秒）。 */
+  resetAt: number;
+  /** 该事件首次出现的时刻（毫秒）。 */
+  firstSeenAt: number;
+  /** 去重前的原始命中行数（调试/排查用）。 */
+  hitCount: number;
+}
+
+/** 一个账号当前受限的全部模型（按 `resetAt` 升序）。 */
+export interface AccountRateLimits {
+  accountId: string;
+  limited: RateLimitEntry[];
+}
+
+/** 模型限额台账：一次返回全部账号的当前受限状态（数据来自本机日志）。 */
+export interface RateLimitsPayload {
+  scannedAt: number;
+  /** 固定 2 天，回显便于调试。 */
+  windowDays: number;
+  /** 只包含至少有一个受限模型的账号。 */
+  accounts: AccountRateLimits[];
+}
+
 export interface AutoRotateConfig {
   enabled: boolean;
   check_interval_minutes: number;
