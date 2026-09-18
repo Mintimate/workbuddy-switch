@@ -15,7 +15,6 @@ import type {
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
-  CopyResult,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
@@ -27,6 +26,7 @@ import type {
   RotateLog,
   RotateStatus,
   Session,
+  SessionCopyReport,
   SwitchResult,
   TravelConfig,
   TravelStatus,
@@ -343,10 +343,11 @@ export function listSessions(variant?: WbVariant): Promise<{
   return call("list_sessions", variantArgs(variant));
 }
 
+/** 把勾选会话复制到指定账号；返回 core 同形的复制报告（copied / alreadyLinked / errors）。 */
 export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
-): Promise<{ sourceUid: string; targetUid: string; copied: CopyResult[] }> {
+): Promise<SessionCopyReport & { variant?: WbVariant }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
 }
 

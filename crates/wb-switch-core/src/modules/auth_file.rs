@@ -5,7 +5,7 @@
 //! write_account_to_auth_file）在阶段 2 随 switch.rs 落地。
 
 use serde_json::{json, Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::modules::account::get_str;
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
@@ -37,11 +37,15 @@ pub fn workbuddy_app_path(variant: WbVariant) -> PathBuf {
 
 /// 读取认证文件 JSON；不存在或解析失败返回 None。
 pub fn read_auth_file(variant: WbVariant) -> Option<Value> {
-    let path = auth_file_path(variant);
+    read_auth_file_at(&auth_file_path(variant))
+}
+
+/// 读取指定路径的认证文件（单测注入临时登录态文件用）。
+pub fn read_auth_file_at(path: &Path) -> Option<Value> {
     if !path.exists() {
         return None;
     }
-    let text = std::fs::read_to_string(&path).ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
 

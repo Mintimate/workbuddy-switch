@@ -123,21 +123,34 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];
-      const copyError = res.sessionCopy?.error;
-      const copiedCount = res.sessionCopy?.copied?.length ?? 0;
-      if (copiedCount > 0) {
-        parts.push(`已复制 ${copiedCount} 个会话`);
-      }
+      const copyReport = res.sessionCopy;
+      const copiedCount = copyReport?.copied?.length ?? 0;
+      const linkedCount = copyReport?.alreadyLinked?.length ?? 0;
+      const copyErrors = copyReport?.errors ?? [];
+      if (copiedCount > 0) parts.push(`已复制 ${copiedCount} 个会话`);
+      if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个已有副本`);
+      if (copyErrors.length > 0) parts.push(`会话复制失败 ${copyErrors.length} 个`);
       if (res.backup) parts.push(`备份: ${res.backup}`);
       toast.success(`已切换至「${nickname}」`, {
         description: parts.length ? parts.join("；") : `${variantAppName(accountVariant(account))} 已重启为目标账号。`,
       });
       // 复制失败或被后端跳过时必须显式提示，不能静默当成成功。
-      if (copyError) {
-        toast.error("会话复制失败", { description: copyError });
-      } else if (requestedCopy && !res.sessionCopy) {
+      if (copyReport?.error) {
+        toast.error("会话复制未执行", { description: copyReport.error });
+      } else if (copyErrors.length > 0) {
+        toast.error("部分会话未复制", {
+          description: copyErrors.map((item) => item.error).join("；"),
+        });
+      } else if (requestedCopy && !copyReport) {
         toast.warning("会话未复制", {
           description: "后端未返回复制结果：当前档位可能不支持会话复制，账号已切换但未复制会话。",
+        });
+      }
+      // 未完成的会话写入：可重试项只提示，阻断项由后端直接返回错误。
+      const recoveryIssues = res.sessionRecovery?.needsRecovery ?? [];
+      if (recoveryIssues.length > 0) {
+        toast.error("存在未完成的会话写入", {
+          description: recoveryIssues.map((issue) => issue.reason).join("；"),
         });
       }
       onOpenChange(false);
@@ -210,7 +223,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         ? currentUid
           ? "当前账号暂无会话，无法复制"
           : "未检测到当前登录账号，无法列出会话"
-        : "将当前账号勾选的会话以新 id 复制给目标账号（云端归属目标）";
+        : "将当前账号勾选的会话以新 id 复制给目标账号（云端归属目标）；已有副本不会重复复制";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>

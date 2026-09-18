@@ -5443,6 +5443,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2 0.10.9",
  "tokio",
  "uuid",
  "windows 0.58.0",

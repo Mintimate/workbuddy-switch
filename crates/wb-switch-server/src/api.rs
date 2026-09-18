@@ -514,20 +514,15 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     };
     // 档位取目标账号自身（源 uid 也从该档位的登录态读）。
     let variant = account::variant_of(&target);
-    let source_uid = session::current_user_uid(variant);
-    // 能力不满足时返回明确错误而不是空对象。
-    let copied = match session::copy_sessions_for_switch(&target, &session_ids) {
+    // 与桌面端同形：直接返回 core 的复制报告（copied / alreadyLinked / errors / needsRecovery）。
+    let mut report = match session::copy_sessions_for_switch(&target, &session_ids) {
         Ok(report) => report,
         Err(error) => {
             return json_err(error, StatusCode::BAD_REQUEST);
         }
     };
-    json_ok(json!({
-        "sourceUid": source_uid,
-        "targetUid": target.get("uid"),
-        "copied": copied,
-        "variant": variant.as_str(),
-    }))
+    report["variant"] = json!(variant.as_str());
+    json_ok(report)
 }
 
 // ---------------------------------------------------------------------------

@@ -93,22 +93,38 @@ export interface Session {
   isPlayground?: boolean;
 }
 
+/** 本次新建的副本（目标 UUID 由后端预分配）。 */
 export interface CopyResult {
   id: string;
   newId: string;
-  jsonlCopied: boolean;
-  mappingWritten: boolean;
+  groupId: string;
   backup: string;
+}
+
+/** 目标账号上已有真实有效的副本：复用而不是重复复制。 */
+export interface LinkedCopyResult {
+  id: string;
+  sessionId: string;
+  groupId: string;
 }
 
 /** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
 export interface SessionCopyReport {
-  sourceUid: string;
-  targetUid: string;
-  /** 错误分支不返回该字段：后端只给 `{ error }`。 */
+  sourceUid?: string;
+  targetUid?: string;
   copied?: CopyResult[];
+  alreadyLinked?: LinkedCopyResult[];
   errors?: { id: string; error: string }[];
+  /** 仍有未完成的会话写入时为 true（失败项可重试，不会产生第二个副本）。 */
+  needsRecovery?: boolean;
   error?: string;
+}
+
+/** 切换前对未完成会话写入的恢复结果。 */
+export interface SessionRecoveryReport {
+  recovered: number;
+  abandoned: number;
+  needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
 }
 
 export interface SwitchResult {
@@ -118,6 +134,7 @@ export interface SwitchResult {
   variant?: WbVariant;
   backup: string | null;
   sessionCopy?: SessionCopyReport;
+  sessionRecovery?: SessionRecoveryReport;
 }
 
 export interface CheckinConfig {
