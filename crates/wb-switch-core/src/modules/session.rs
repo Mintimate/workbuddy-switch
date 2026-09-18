@@ -14,20 +14,32 @@
 //! 档位操作锁内先恢复未完成操作、再查询关联组；同一逻辑会话只保留一个有效副本，
 //! 目标 UUID 在任何副本写入前持久化，任一阶段失败都不报告完整成功，恢复复用同一
 //! UUID 且不产生第二个副本。
+//!
+//! 同步契约（design §5 / §6）：[`session_links_preview`] 只读预览双方共同参与的关联组并
+//! 下发预览凭据；[`sync_sessions_for_switch`] 在执行前重新加载账号身份、成员、基线与
+//! 正文并逐项核对凭据，然后按「备份 → 正文 → 数据库 → 组表」逐个阶段写入。
+//!
+//! 写入前置条件（design §5.4）：本次同步的备份必须成功且可核验（唯一目录、数据库
+//! 一致性快照、目标正文逐文件备份 + 摘要、恢复清单）。备份不可信时**零写入**：不碰
+//! 目标正文、不改数据库、不提交基线。任一阶段中断都保留未完成操作，下次切换按同一份
+//! 清单补完（复用同一目标 UUID 与新基线引用），不把未完成的写入报告成 `synced`。
 
+use rusqlite::backup::{Backup, StepResult};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::modules::account;
 use crate::modules::auth_file;
 use crate::modules::config::{atomic_write, now_ms, now_secs, store_dir, utc_iso};
 use crate::modules::process;
 use crate::modules::session_link::{
-    self, ContentSnapshot, ContentState, LinkGroup, LinkMember, MemberState, NormalizedContent,
-    OpPhase, Operation, OperationMember, RecoveryIssue, RecoveryReport, StoreState,
-    NORMALIZATION_VERSION, OPERATION_VERSION,
+    self, full_digest_of, BaselineState, ContentSnapshot, ContentState, LinkGroup, LinkMember,
+    LinkStore, MemberState, NormalizedContent, OpPhase, Operation, OperationMember, PreviewBinding,
+    PreviewMemberBinding, RecoveryIssue, RecoveryReport, StoreState, SyncDecision, SyncMode,
+    SyncVerdict, NORMALIZATION_VERSION, OPERATION_VERSION,
 };
 use crate::modules::variant::WbVariant;
 
@@ -84,6 +96,12 @@ impl SessionPaths {
 
     pub fn operations_dir(&self) -> PathBuf {
         self.session_links_dir().join("operations")
+    }
+
+    /// 预览凭据目录（design §6：绑定保存在服务端，前端只拿 id）。
+    /// 不属于未完成痕迹——凭据是一次性的，主文件缺失时不得据此拒绝初始化。
+    pub fn preview_tokens_dir(&self) -> PathBuf {
+        self.session_links_dir().join("previews")
     }
 
     pub fn locks_dir(&self) -> PathBuf {
@@ -195,6 +213,15 @@ fn nonempty_text(value: Option<String>) -> Option<String> {
     value
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 账号对象里的 uid；前后空白视为缺失。
+fn account_uid(account: &Value) -> String {
+    account
+        .get("uid")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// WorkBuddy 侧栏展示名：优先 custom_title（用户改名 / 定时任务名），否则 title。
@@ -564,11 +591,7 @@ fn copy_sessions_for_switch_at(
             variant.as_str()
         ));
     }
-    let target_uid = target_acc
-        .get("uid")
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let target_uid = account_uid(target_acc);
     if target_uid.is_empty() {
         return Err("目标账号缺少 uid，无法复制会话".to_string());
     }
@@ -844,7 +867,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     let mut operation = Operation {
         version: OPERATION_VERSION,
         operation_id: operation_id.clone(),
-        kind: "copy".to_string(),
+        kind: OPERATION_KIND_COPY.to_string(),
         variant: context.variant,
         group_id: group_id.clone(),
         source: OperationMember {
@@ -1134,6 +1157,1449 @@ fn account_id_for_uid(paths: &SessionPaths, uid: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// 同步预览与执行契约（design §5 / §6）
+// ---------------------------------------------------------------------------
+
+/// 会话同步能力不足时的错误文案。
+pub const SESSION_SYNC_UNSUPPORTED: &str = "该档位暂不支持会话同步";
+/// 预览凭据过期/失配时的原因码（design §5.2：不继承用户旧选择）。
+pub const REASON_PREVIEW_STALE: &str = "previewStale";
+
+/// 一条 `syncSelections` 入参（取代只传 `syncLinkIds`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSelection {
+    pub group_id: String,
+    pub preview_token: String,
+    pub mode: SyncMode,
+}
+
+impl SyncSelection {
+    /// 解析单条入参；缺字段或未知模式直接拒绝（不静默跳过、不回落默认值）。
+    pub fn parse(value: &Value) -> Result<Self, String> {
+        let group_id = value
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| "同步选择项缺少 groupId".to_string())?;
+        let preview_token = value
+            .get("previewToken")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| format!("同步选择项缺少 previewToken（组 {group_id}）"))?;
+        let mode = value
+            .get("mode")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("同步选择项缺少 mode（组 {group_id}）"))?;
+        Ok(Self {
+            group_id: group_id.to_string(),
+            preview_token: preview_token.to_string(),
+            mode: SyncMode::parse(mode)?,
+        })
+    }
+}
+
+/// 解析 `syncSelections`；缺省或 null 视为未勾选同步。
+pub fn parse_sync_selections(value: Option<&Value>) -> Result<Vec<SyncSelection>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let Some(items) = value.as_array() else {
+        return Err("syncSelections 必须是数组".to_string());
+    };
+    items.iter().map(SyncSelection::parse).collect()
+}
+
+/// 成员当前正文状态；`projects/` 下找不到正文一律按 Missing（不当作空正文）。
+fn member_content_state(paths: &SessionPaths, session_id: &str) -> ContentState {
+    match find_project_jsonl(paths, session_id) {
+        Some(path) => session_link::read_content_snapshot(&path, session_id),
+        None => ContentState::Missing,
+    }
+}
+
+/// 内容快照里的记录数（不可验证时为 0，仅用于展示）。
+fn record_count_of(content: &ContentState) -> usize {
+    match content {
+        ContentState::Ready(snapshot) => snapshot.normalized.record_count,
+        _ => 0,
+    }
+}
+
+/// 会话行的展示名与目录（标题优先 custom_title，与侧栏一致）。
+fn session_row_info(paths: &SessionPaths, cid: &str) -> Option<(String, String)> {
+    let db = paths.workbuddy_db();
+    let conn = open_db(&db, true)?;
+    if !table_exists(&conn, "sessions") {
+        return None;
+    }
+    let sql = if column_exists(&conn, "sessions", "custom_title") {
+        "SELECT title, custom_title, cwd FROM sessions WHERE id = ?1 AND deleted_at IS NULL"
+    } else {
+        "SELECT title, NULL, cwd FROM sessions WHERE id = ?1 AND deleted_at IS NULL"
+    };
+    conn.query_row(sql, [cid], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })
+    .ok()
+    .map(|(title, custom_title, cwd)| {
+        (
+            session_display_title(title, custom_title),
+            cwd.unwrap_or_default(),
+        )
+    })
+}
+
+/// 会话行是否仍归属该成员账号（行被删除或改归属即成员失效，design §5）。
+fn member_row_owned_by(paths: &SessionPaths, member: &LinkMember) -> bool {
+    session_row_owner(paths, &member.session_id).is_some_and(|owner| owner == member.uid)
+}
+
+/// 组内是否存在该账号的成员（任意状态）：双方都有成员才谈得上「共同参与」。
+fn has_member_for(group: &LinkGroup, uid: &str) -> bool {
+    group.members.iter().any(|member| member.uid == uid)
+}
+
+/// 成员摘要（只含身份与状态，不含正文）。
+fn member_summary(member: Option<&LinkMember>) -> Value {
+    match member {
+        Some(member) => json!({
+            "memberId": member.member_id,
+            "uid": member.uid,
+            "accountId": member.account_id,
+            "sessionId": member.session_id,
+            "state": member.state.as_str(),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// 成员在预览时刻的内容绑定（不可验证时摘要留空，判定必然为 unknown）。
+fn member_binding(member: &LinkMember, content: &ContentState) -> PreviewMemberBinding {
+    let (raw_digest, normalized_digest, record_count) = match content {
+        ContentState::Ready(snapshot) => (
+            snapshot.full_digest.clone(),
+            snapshot.normalized.total_digest.clone(),
+            snapshot.normalized.record_count,
+        ),
+        _ => (String::new(), String::new(), 0),
+    };
+    PreviewMemberBinding {
+        member_id: member.member_id.clone(),
+        account_id: member.account_id.clone(),
+        uid: member.uid.clone(),
+        session_id: member.session_id.clone(),
+        raw_digest,
+        normalized_digest,
+        record_count,
+    }
+}
+
+/// 由实时状态组装预览绑定（预览与执行前核对共用同一份装配逻辑）。
+fn live_preview_binding(
+    group: &LinkGroup,
+    source_member: &LinkMember,
+    target_member: &LinkMember,
+    source_content: &ContentState,
+    target_content: &ContentState,
+    baseline: &BaselineState,
+    verdict: SyncVerdict,
+) -> PreviewBinding {
+    PreviewBinding {
+        variant: group.variant,
+        group_id: group.id.clone(),
+        group_fingerprint: session_link::group_fingerprint(group),
+        source: member_binding(source_member, source_content),
+        target: member_binding(target_member, target_content),
+        baseline_ref: session_link::find_pair_base(
+            group,
+            &source_member.member_id,
+            &target_member.member_id,
+        )
+        .map(|pair| pair.baseline_ref.clone()),
+        baseline_total_digest: baseline.ready().map(|record| record.total_digest.clone()),
+        baseline_record_count: baseline.ready().map(|record| record.record_count),
+        verdict,
+    }
+}
+
+/// 预览「当前账号 → 目标账号」可同步的关联组（design §6）。
+///
+/// 只处理双方共同参与的组，不涉及第三方账号；只读，不写任何会话正文。
+/// 来源身份一律取该档位登录态文件，不接受前端传入。
+pub fn session_links_preview(variant: WbVariant, target_acc: &Value) -> Result<Value, String> {
+    session_links_preview_at(&SessionPaths::for_variant(variant), variant, target_acc)
+}
+
+fn session_links_preview_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    target_acc: &Value,
+) -> Result<Value, String> {
+    let target_uid = account_uid(target_acc);
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法同步会话".to_string());
+    }
+    let source_uid = current_user_uid_at(&paths.auth_file)
+        .ok_or_else(|| "未读取到本机登录态，无法确定来源账号".to_string())?;
+    if source_uid == target_uid {
+        return Err("当前账号与目标账号相同，无需同步会话".to_string());
+    }
+    // 能力探测与复制同口径：只对国际版生效（国内版数据根与改造前同构）。
+    let supported = variant != WbVariant::Ai || session_copy_supported_at(&paths.data_root);
+
+    let mut report = json!({
+        "supported": supported,
+        "sourceUid": source_uid,
+        "targetUid": target_uid,
+        "groups": [],
+    });
+    if !supported {
+        report["storeStatus"] = json!("unsupported");
+        return Ok(report);
+    }
+    match session_link::load_store(paths) {
+        StoreState::Missing => report["storeStatus"] = json!("missing"),
+        StoreState::Unavailable(reason) => {
+            report["storeStatus"] = json!("unavailable");
+            report["storeError"] = json!(reason);
+        }
+        StoreState::Ready(store) => {
+            report["storeStatus"] = json!("ready");
+            let groups: Vec<Value> = store
+                .groups
+                .iter()
+                .filter(|group| {
+                    group.variant == variant
+                        && has_member_for(group, &source_uid)
+                        && has_member_for(group, &target_uid)
+                })
+                .map(|group| preview_group_item(paths, group, &source_uid, &target_uid))
+                .collect();
+            report["groups"] = json!(groups);
+        }
+    }
+    Ok(report)
+}
+
+/// 单个关联组的预览项。
+///
+/// 记录数与差集只用于向用户解释；能否勾选只由判定结果决定（design §3.2）。
+fn preview_group_item(
+    paths: &SessionPaths,
+    group: &LinkGroup,
+    source_uid: &str,
+    target_uid: &str,
+) -> Value {
+    let source_any = group.members.iter().find(|member| member.uid == source_uid);
+    let target_any = group.members.iter().find(|member| member.uid == target_uid);
+    // 组展示名取来源会话（同步保留目标的 sessionId、标题与自定义标题）。
+    let (title, cwd) = source_any
+        .and_then(|member| session_row_info(paths, &member.session_id))
+        .unwrap_or_else(|| ("(无标题)".to_string(), String::new()));
+    let source_summary = member_summary(source_any);
+    let target_summary = member_summary(target_any);
+
+    let (Some(source_member), Some(target_member)) = (
+        session_link::active_member_for(group, source_uid),
+        session_link::active_member_for(group, target_uid),
+    ) else {
+        // 任一方的有效成员缺失（失效/已被替换）→ 关联不确定，不提供任何写入动作。
+        return json!({
+            "groupId": group.id,
+            "title": title,
+            "cwd": cwd,
+            "verdict": SyncVerdict::Unknown.as_str(),
+            "extraA": 0,
+            "extraB": 0,
+            "common": 0,
+            "defaultChecked": false,
+            "availableModes": [],
+            "reason": "关联成员已失效或已被替换，需手动处理",
+            // 记录数契约与其它不可验证路径一致：source/target 为 0、baseline 为 null
+            // （前端的 `recordCount` 类型按此声明，不能发 null）。
+            "recordCount": {"source": 0, "target": 0, "baseline": null},
+            "source": source_summary,
+            "target": target_summary,
+        });
+    };
+
+    let baseline = session_link::load_pair_baseline(
+        paths,
+        group,
+        &source_member.member_id,
+        &target_member.member_id,
+    );
+    let source_content = member_content_state(paths, &source_member.session_id);
+    let target_content = member_content_state(paths, &target_member.session_id);
+    let rows_match =
+        member_row_owned_by(paths, source_member) && member_row_owned_by(paths, target_member);
+    let decision = if rows_match {
+        session_link::decide_sync(&source_content, &target_content, &baseline)
+    } else {
+        // 会话行缺失/归属异常：成员实际已失效，与内容不可验证同等对待。
+        SyncDecision::unknown("会话行缺失或归属异常，关联成员已失效")
+    };
+    let reason = decision.reason.clone();
+    let modes: Vec<&str> = decision
+        .verdict
+        .available_modes()
+        .iter()
+        .map(|mode| mode.as_str())
+        .collect();
+    let actionable = !modes.is_empty();
+
+    let mut item = json!({
+        "groupId": group.id,
+        "title": title,
+        "cwd": cwd,
+        "verdict": decision.verdict.as_str(),
+        "extraA": decision.extra_a,
+        "extraB": decision.extra_b,
+        "common": decision.common,
+        "defaultChecked": decision.default_checked,
+        "availableModes": modes,
+        "reason": reason.clone(),
+        "recordCount": {
+            "source": record_count_of(&source_content),
+            "target": record_count_of(&target_content),
+            "baseline": baseline.ready().map(|record| record.record_count),
+        },
+        "source": source_summary,
+        "target": target_summary,
+    });
+    if actionable {
+        let binding = live_preview_binding(
+            group,
+            source_member,
+            target_member,
+            &source_content,
+            &target_content,
+            &baseline,
+            decision.verdict,
+        );
+        match session_link::save_preview_token(paths, binding) {
+            Ok(preview_id) => item["previewToken"] = json!(preview_id),
+            Err(error) => {
+                // 绑定存不下来就不能让用户勾选：不给出可执行动作，并说明原因。
+                item["availableModes"] = json!([]);
+                item["defaultChecked"] = json!(false);
+                item["reason"] = json!(format!("{reason}（预览凭据无法保存：{error}）"));
+            }
+        }
+    }
+    item
+}
+
+/// 校验通过后的执行计划：写入阶段与报告所需的全部已核对信息。
+///
+/// 正文快照来自同一次读取（在档位锁内、App 已停止写入之后），执行时不再回读来源，
+/// 避免执行与校验之间的 TOCTOU。
+struct SyncWritePlan {
+    group_id: String,
+    mode: SyncMode,
+    verdict: SyncVerdict,
+    source_member: LinkMember,
+    target_member: LinkMember,
+    source_snapshot: ContentSnapshot,
+    target_snapshot: ContentSnapshot,
+    /// 待写入目标的新正文：来源正文按本副本 sessionId 替换为目标 sessionId。
+    incoming_text: String,
+    /// 待写入正文的归一化内容（执行后据此复算摘要核验）。
+    incoming: NormalizedContent,
+    /// 提交前该成员对的基线引用（清单里记录，便于人工比对）。
+    old_baseline_ref: Option<String>,
+    reason: String,
+}
+
+impl SyncWritePlan {
+    fn source_records(&self) -> usize {
+        self.source_snapshot.normalized.record_count
+    }
+}
+
+/// 单条同步选择的校验结果。
+enum SyncItemOutcome {
+    /// 全部前置条件通过，可进入写入阶段（计划体较大，装箱避免枚举体积失衡）。
+    Validated {
+        mode: SyncMode,
+        verdict: SyncVerdict,
+        plan: Box<SyncWritePlan>,
+    },
+    /// 版本变化/前置条件不满足：跳过该项，不沿用用户旧选择。
+    Skipped {
+        reason: &'static str,
+        message: String,
+        verdict: Option<SyncVerdict>,
+    },
+    /// 入参或凭据非法、模式越权：拒绝，不静默执行。
+    Rejected { message: String },
+}
+
+/// 重新校验单条选择：凭据、身份、成员、基线、正文逐项核对（design §5.2）。
+fn plan_sync_selection(
+    context: &SyncContext,
+    store: Option<&LinkStore>,
+    selection: &SyncSelection,
+) -> SyncItemOutcome {
+    let paths = context.paths;
+    let variant = context.variant;
+    let (source_uid, target_uid) = (context.source_uid, context.target_uid);
+    // 凭据必须是我们服务端保存过的：伪造的 id 读不到，直接拒绝。
+    let Some(token) = session_link::load_preview_token(paths, &selection.preview_token) else {
+        return SyncItemOutcome::Rejected {
+            message: "预览凭据不存在或已失效，请重新预览后再操作".to_string(),
+        };
+    };
+    let binding = &token.binding;
+    if binding.variant != variant || binding.group_id != selection.group_id {
+        return SyncItemOutcome::Rejected {
+            message: "预览凭据与所选关联组不匹配，已拒绝".to_string(),
+        };
+    }
+    let skip = |message: String| SyncItemOutcome::Skipped {
+        reason: REASON_PREVIEW_STALE,
+        message,
+        verdict: Some(binding.verdict),
+    };
+    // 来源身份取登录态、目标身份取入参：与预览不一致说明账号已经变了。
+    if binding.source.uid != source_uid || binding.target.uid != target_uid {
+        return skip("账号已变化，预览已失效".to_string());
+    }
+    let Some(store) = store else {
+        return skip("关联存储不存在或不可用，预览已失效".to_string());
+    };
+    let Some(group) = store
+        .groups
+        .iter()
+        .find(|group| group.id == selection.group_id && group.variant == variant)
+    else {
+        return skip("关联组已不存在，预览已失效".to_string());
+    };
+    let (Some(source_member), Some(target_member)) = (
+        session_link::active_member_for(group, source_uid),
+        session_link::active_member_for(group, target_uid),
+    ) else {
+        return skip("关联成员已失效，预览已失效".to_string());
+    };
+    // 会话行缺失/归属异常：成员实际已失效（与预览的判定口径一致），提前拦下不写。
+    if !member_row_owned_by(paths, source_member) || !member_row_owned_by(paths, target_member) {
+        return skip("会话行缺失或归属异常，预览已失效".to_string());
+    }
+    // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
+    let source_content = member_content_state(paths, &source_member.session_id);
+    let target_content = member_content_state(paths, &target_member.session_id);
+    let baseline = session_link::load_pair_baseline(
+        paths,
+        group,
+        &source_member.member_id,
+        &target_member.member_id,
+    );
+    let decision = session_link::decide_sync(&source_content, &target_content, &baseline);
+    let live = live_preview_binding(
+        group,
+        source_member,
+        target_member,
+        &source_content,
+        &target_content,
+        &baseline,
+        decision.verdict,
+    );
+    let mismatches = session_link::verify_preview(&token, &live);
+    if !mismatches.is_empty() {
+        return skip(format!("预览已失效：{}", mismatches.join("；")));
+    }
+    // 判定已按当前内容重算：mode 必须仍然成立，unknown 不得被覆盖绕过。
+    if !decision.verdict.allows(selection.mode) {
+        return SyncItemOutcome::Rejected {
+            message: format!(
+                "该组判定为 {}，不允许以 {} 模式同步",
+                decision.verdict.as_str(),
+                selection.mode.as_str()
+            ),
+        };
+    }
+    // 判定非 unknown 必然双方正文可验证（decide_sync 的前置条件），这里仍然显式兜底。
+    let (ContentState::Ready(source_snapshot), ContentState::Ready(target_snapshot)) =
+        (&source_content, &target_content)
+    else {
+        return skip("双方正文不可验证，预览已失效".to_string());
+    };
+    // 目标正文 = 来源正文，只把本副本 sessionId 换成目标 sessionId（保留目标 SID）。
+    let incoming_text = source_snapshot
+        .text
+        .replace(&source_member.session_id, &target_member.session_id);
+    let incoming = match session_link::normalize_jsonl(&incoming_text, &target_member.session_id) {
+        Ok(normalized) => normalized,
+        Err(reason) => {
+            return SyncItemOutcome::Rejected {
+                message: format!("目标正文无法按来源内容生成（{reason}），已拒绝"),
+            }
+        }
+    };
+    SyncItemOutcome::Validated {
+        mode: selection.mode,
+        verdict: decision.verdict,
+        plan: Box::new(SyncWritePlan {
+            group_id: selection.group_id.clone(),
+            mode: selection.mode,
+            verdict: decision.verdict,
+            source_member: source_member.clone(),
+            target_member: target_member.clone(),
+            source_snapshot: source_snapshot.clone(),
+            target_snapshot: target_snapshot.clone(),
+            incoming_text,
+            incoming,
+            old_baseline_ref: live.baseline_ref,
+            reason: decision.reason,
+        }),
+    }
+}
+
+/// 重新校验勾选的同步项并返回 `sessionSync` 报告（design §5 / §6）。
+///
+/// 每项走「解析 → 重新加载身份/成员/基线/正文 → 核对预览凭据 → 重新判定 → 备份 →
+/// 阶段化写入」：任一版本变化都跳过该项（原因码 [`REASON_PREVIEW_STALE`]），
+/// 只在全部校验通过后才写目标；写入到 `completed` 才算 `synced`，
+/// 中断的操作保留记录并置 `needsRecovery`，绝不报成成功。
+///
+/// 调用方需保证 App 已停止写入：本函数自行获取档位操作锁，并在加锁后复查一次。
+pub fn sync_sessions_for_switch(
+    target_acc: &Value,
+    selections: &[SyncSelection],
+) -> Result<Value, String> {
+    let variant = account::variant_of(target_acc);
+    let paths = SessionPaths::for_variant(variant);
+    sync_sessions_for_switch_at(
+        &paths,
+        variant,
+        target_acc,
+        selections,
+        process::is_workbuddy_running,
+    )
+}
+
+/// 同步上下文中不变的输入（避免逐项重复解析身份）。
+struct SyncContext<'a> {
+    paths: &'a SessionPaths,
+    variant: WbVariant,
+    source_uid: &'a str,
+    source_account_id: Option<String>,
+    target_uid: &'a str,
+    target_account_id: Option<String>,
+    /// 本次进入写入前仍未完成的操作（同一目标上不得再写一次）。
+    pending: &'a [Operation],
+}
+
+fn sync_sessions_for_switch_at(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    target_acc: &Value,
+    selections: &[SyncSelection],
+    is_app_running: impl Fn(WbVariant) -> bool,
+) -> Result<Value, String> {
+    let mut synced: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    let mut errors: Vec<Value> = Vec::new();
+    if selections.is_empty() {
+        return Ok(json!({ "synced": synced, "skipped": skipped, "errors": errors }));
+    }
+    // 与复制同一条生命周期保护：会话写入必须发生在 App 停止写入之后。
+    if is_app_running(variant) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    if variant == WbVariant::Ai && !session_copy_supported_at(&paths.data_root) {
+        return Err(format!(
+            "{SESSION_SYNC_UNSUPPORTED}（档位 {}）",
+            variant.as_str()
+        ));
+    }
+    let target_uid = account_uid(target_acc);
+    if target_uid.is_empty() {
+        return Err("目标账号缺少 uid，无法同步会话".to_string());
+    }
+    let source_uid = current_user_uid_at(&paths.auth_file)
+        .ok_or_else(|| "未读取到本机登录态，无法确定来源账号".to_string())?;
+    if source_uid == target_uid {
+        return Err("当前账号与目标账号相同，无需同步会话".to_string());
+    }
+
+    // 档位操作锁与复制共用：预览后的校验与写入都不得与并发复制交错。
+    let _ops_lock = session_link::try_acquire_variant_ops_lock(paths, variant)?;
+    if is_app_running(variant) {
+        return Err(SESSION_COPY_APP_RUNNING.to_string());
+    }
+    let recovery = recover_pending_session_operations_at(paths, variant);
+    let pending = session_link::pending_operations(paths, variant);
+    let (store, store_unavailable) = match session_link::load_store(paths) {
+        StoreState::Ready(store) => (Some(store), None),
+        StoreState::Missing => (None, None),
+        StoreState::Unavailable(reason) => (None, Some(reason)),
+    };
+    // 关系表损坏/未知版本，或存在解析不出来的操作日志：不能当成没有关联继续校验。
+    let store_broken = store_unavailable.is_some();
+    let blocked = store_unavailable.or_else(|| {
+        recovery
+            .needs_recovery
+            .iter()
+            .find(|issue| !issue.retryable && issue.reason.contains(UNPARSEABLE_OPERATION_REASON))
+            .map(|issue| issue.reason.clone())
+    });
+    let context = SyncContext {
+        paths,
+        variant,
+        source_uid: &source_uid,
+        source_account_id: account_id_for_uid(paths, &source_uid),
+        target_uid: &target_uid,
+        target_account_id: nonempty_text(
+            target_acc
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        ),
+        pending: &pending,
+    };
+    match blocked {
+        Some(reason) => {
+            for selection in selections {
+                errors.push(json!({ "groupId": selection.group_id, "error": reason }));
+            }
+        }
+        None => {
+            for selection in selections {
+                match plan_sync_selection(&context, store.as_ref(), selection) {
+                    SyncItemOutcome::Validated {
+                        mode,
+                        verdict,
+                        plan,
+                    } => match execute_sync_item(&context, &plan, mode, verdict) {
+                        Ok(item) => synced.push(item),
+                        Err(error) => {
+                            errors.push(json!({ "groupId": selection.group_id, "error": error }))
+                        }
+                    },
+                    SyncItemOutcome::Skipped {
+                        reason,
+                        message,
+                        verdict,
+                    } => skipped.push(json!({
+                        "groupId": selection.group_id,
+                        "status": "skipped",
+                        "reasonCode": reason,
+                        "message": message,
+                        "verdict": verdict.map(SyncVerdict::as_str),
+                    })),
+                    SyncItemOutcome::Rejected { message } => {
+                        errors.push(json!({ "groupId": selection.group_id, "error": message }))
+                    }
+                }
+            }
+        }
+    }
+
+    let unfinished_after = session_link::pending_operations(paths, variant);
+    let needs_recovery = store_broken || !recovery.is_clean() || !unfinished_after.is_empty();
+    let mut report = json!({ "synced": synced, "skipped": skipped, "errors": errors });
+    if needs_recovery {
+        report["needsRecovery"] = json!(true);
+    }
+    Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// 同步执行与备份（design §5.4 / §5.5）
+// ---------------------------------------------------------------------------
+
+/// 同步备份清单格式版本；读到其它版本一律视为不可用。
+pub const SYNC_BACKUP_VERSION: u32 = 1;
+/// 备份目录名（按档位 + operationId 唯一）。
+const SYNC_BACKUP_DIR_NAME: &str = "session-sync";
+/// 数据库快照方法（清单里如实记录，恢复方据此选择恢复方法）。
+const DB_SNAPSHOT_METHOD: &str = "sqliteBackupApi";
+/// 数据库快照的分页步长与超时：App 已关闭，超时说明库被其它进程占用。
+const DB_BACKUP_PAGES_PER_STEP: i32 = 1024;
+const DB_BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// 操作日志的 kind 取值。
+const OPERATION_KIND_COPY: &str = "copy";
+const OPERATION_KIND_SYNC: &str = "sync";
+
+/// 一次同步的备份目录：`backups/session-sync/{variant}/{operationId}`（唯一，不复用）。
+fn sync_backup_dir(paths: &SessionPaths, variant: WbVariant, operation_id: &str) -> PathBuf {
+    paths
+        .backup_root()
+        .join(SYNC_BACKUP_DIR_NAME)
+        .join(variant.as_str())
+        .join(operation_id)
+}
+
+fn sync_manifest_file(dir: &Path) -> PathBuf {
+    dir.join("manifest.json")
+}
+
+/// 清单里记录的单个成员：身份、覆盖前正文摘要与备份位置。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBackupMember {
+    member_id: String,
+    uid: String,
+    session_id: String,
+    /// 覆盖前正文的备份位置（相对备份目录）；来源侧不写目标，为 None。
+    body_file: Option<String>,
+    body_raw_digest: String,
+    body_normalized_digest: String,
+    record_count: usize,
+}
+
+/// 本次待写入目标的新正文：恢复补写按这份内容重放，不回读可能已变化的来源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBackupPayload {
+    body_file: String,
+    body_raw_digest: String,
+    body_normalized_digest: String,
+    record_count: usize,
+}
+
+/// 目标会话行的覆盖前快照（恢复「目标行」用，design §5.4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBackupRow {
+    session_id: String,
+    user_id: String,
+    title: Option<String>,
+    custom_title: Option<String>,
+    updated_at: Option<i64>,
+    deleted_at: Option<i64>,
+}
+
+/// 数据库备份：一致性快照位置、目标行覆盖前快照与本次写入的时间戳。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBackupDb {
+    snapshot_file: String,
+    method: String,
+    target_row: Option<SyncBackupRow>,
+    /// 本次写入目标行的 updated_at（恢复时据此判断这一步是否已应用）。
+    new_updated_at: i64,
+}
+
+/// 同步备份清单：路径、目标行、备份位置与恢复方法（design §5.4）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncBackupManifest {
+    version: u32,
+    operation_id: String,
+    variant: WbVariant,
+    group_id: String,
+    mode: SyncMode,
+    verdict: SyncVerdict,
+    created_at: i64,
+    /// 目标正文的绝对路径（恢复补写用；使用时必须校验落在本项目录内）。
+    target_body_path: String,
+    source: SyncBackupMember,
+    target: SyncBackupMember,
+    incoming: SyncBackupPayload,
+    db: SyncBackupDb,
+    /// 本次要提交的新配对基线引用（恢复补完复用同一个引用，不重复新建）。
+    new_baseline_ref: String,
+    old_baseline_ref: Option<String>,
+    /// 提交成功后目标成员的 lastSyncedAt。
+    last_synced_at: i64,
+    /// 恢复方法（人类可读；备份路径可查看，design §6 / R6）。
+    restore_steps: Vec<String>,
+}
+
+/// 一次同步的备份结果：目录、清单位置与清单本体。
+struct SyncBackup {
+    dir: PathBuf,
+    manifest_file: PathBuf,
+    manifest: SyncBackupManifest,
+}
+
+/// 备份单个文件并按摘要核验（不一致即报错，不宣称备份成功）。
+fn backup_file_with_digest(
+    source: &Path,
+    dest: &Path,
+    expected_raw_digest: &str,
+) -> Result<(), String> {
+    let bytes = std::fs::read(source).map_err(|error| format!("备份读取失败：{error}"))?;
+    if full_digest_of(&bytes) != expected_raw_digest {
+        return Err("备份内容与读取时不一致（正文在读取后被改动），已停止写入".to_string());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| format!("备份目录创建失败：{error}"))?;
+    }
+    std::fs::write(dest, &bytes).map_err(|error| format!("备份写入失败：{error}"))?;
+    let read_back = std::fs::read(dest).map_err(|error| format!("备份回读失败：{error}"))?;
+    if full_digest_of(&read_back) != expected_raw_digest {
+        return Err("备份写后核验不一致，未报告备份成功".to_string());
+    }
+    Ok(())
+}
+
+/// 用 SQLite 在线备份 API 生成一致性快照（design §5.4：不直接 cp 活动库）。
+///
+/// 活动库可能带 WAL/SHM，直接复制会拿到半写状态；backup API 产出的是自洽的独立
+/// 数据库文件（同时自动带上未 checkpoint 的 WAL 内容），并做写后核验。
+fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
+    if !source.is_file() {
+        return Err("会话数据库不存在，无法备份".to_string());
+    }
+    if dest.exists() {
+        return Err("备份数据库已存在同名文件，未覆盖".to_string());
+    }
+    // 源连接用读写打开：WAL 库在缺 -shm 时无法只读打开，而备份是写入门禁，
+    // 不能因此失败。App 已关闭且持有档位锁，读写打开不会改动会话内容。
+    let src = open_db(source, false).ok_or_else(|| "会话数据库无法打开，未同步".to_string())?;
+    {
+        let mut dst =
+            Connection::open(dest).map_err(|error| format!("备份数据库创建失败：{error}"))?;
+        let backup = Backup::new(&src, &mut dst)
+            .map_err(|error| format!("数据库快照初始化失败：{error}"))?;
+        let deadline = Instant::now() + DB_BACKUP_TIMEOUT;
+        loop {
+            match backup.step(DB_BACKUP_PAGES_PER_STEP) {
+                Ok(StepResult::Done) => break,
+                Ok(StepResult::Busy) | Ok(StepResult::Locked) => {
+                    if Instant::now() >= deadline {
+                        return Err("数据库快照超时（数据库被占用），未同步".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(format!("数据库快照失败：{error}")),
+            }
+        }
+    }
+    verify_db_snapshot(dest)
+}
+
+/// 快照核验：可回读、完整性检查通过、会话表存在。
+fn verify_db_snapshot(path: &Path) -> Result<(), String> {
+    let conn =
+        open_db(path, true).ok_or_else(|| "备份数据库无法回读，未报告备份成功".to_string())?;
+    let check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("备份数据库完整性校验失败：{error}"))?;
+    if check != "ok" {
+        return Err(format!("备份数据库完整性校验未通过：{check}"));
+    }
+    if !table_exists(&conn, "sessions") {
+        return Err("备份数据库缺少 sessions 表，未报告备份成功".to_string());
+    }
+    Ok(())
+}
+
+/// 读取一行会话的覆盖前快照（含标题类列）。
+fn read_session_row(conn: &Connection, cid: &str) -> Option<SyncBackupRow> {
+    if !table_exists(conn, "sessions") {
+        return None;
+    }
+    let sql = if column_exists(conn, "sessions", "custom_title") {
+        "SELECT id, user_id, title, custom_title, updated_at, deleted_at \
+         FROM sessions WHERE id = ?1"
+    } else {
+        "SELECT id, user_id, title, NULL, updated_at, deleted_at FROM sessions WHERE id = ?1"
+    };
+    conn.query_row(sql, [cid], |row| {
+        Ok(SyncBackupRow {
+            session_id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            user_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            title: row.get(2)?,
+            custom_title: row.get(3)?,
+            updated_at: row.get(4)?,
+            deleted_at: row.get(5)?,
+        })
+    })
+    .ok()
+}
+
+/// 会话行的覆盖前快照（独立打开连接，供写入前记录清单用）。
+fn session_row_snapshot(paths: &SessionPaths, cid: &str) -> Option<SyncBackupRow> {
+    let conn = open_db(&paths.workbuddy_db(), true)?;
+    read_session_row(&conn, cid)
+}
+
+/// 读取备份清单；缺失/损坏/版本不符一律返回 None（视为没有恢复依据）。
+fn load_sync_manifest(dir: &Path) -> Option<SyncBackupManifest> {
+    let text = std::fs::read_to_string(sync_manifest_file(dir)).ok()?;
+    let manifest: SyncBackupManifest = serde_json::from_str(&text).ok()?;
+    (manifest.version == SYNC_BACKUP_VERSION).then_some(manifest)
+}
+
+/// 备份完整性核验：覆盖前正文与待写入正文都能按清单摘要读回，数据库快照可回读。
+fn verify_sync_backup(dir: &Path, manifest: &SyncBackupManifest) -> Result<(), String> {
+    let Some(target_body_file) = manifest.target.body_file.as_deref() else {
+        return Err("备份清单缺少目标正文备份位置".to_string());
+    };
+    for (relative, digest) in [
+        (target_body_file, manifest.target.body_raw_digest.as_str()),
+        (
+            manifest.incoming.body_file.as_str(),
+            manifest.incoming.body_raw_digest.as_str(),
+        ),
+    ] {
+        let bytes = std::fs::read(dir.join(relative))
+            .map_err(|error| format!("备份文件缺失或不可读（{relative}）：{error}"))?;
+        if full_digest_of(&bytes) != digest {
+            return Err(format!("备份文件摘要不一致（{relative}），已停止恢复"));
+        }
+    }
+    let snapshot = dir.join(&manifest.db.snapshot_file);
+    if !snapshot.is_file() {
+        return Err("数据库快照缺失，已停止恢复".to_string());
+    }
+    let conn =
+        open_db(&snapshot, true).ok_or_else(|| "数据库快照无法打开，已停止恢复".to_string())?;
+    if !table_exists(&conn, "sessions") {
+        return Err("数据库快照缺少 sessions 表，已停止恢复".to_string());
+    }
+    Ok(())
+}
+
+/// 目标正文路径：必须是档位 `projects/` 目录下 `{目标 sessionId}.jsonl`。
+///
+/// 清单可能被外部改动，恢复写入前必须重新确认路径落在本项目录内，不能按清单原样写。
+fn validated_target_body_path(
+    paths: &SessionPaths,
+    manifest: &SyncBackupManifest,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(&manifest.target_body_path);
+    let expected_name = format!("{}.jsonl", manifest.target.session_id);
+    let name_matches = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy() == expected_name);
+    if !path.starts_with(paths.projects_dir()) || !name_matches {
+        return Err("备份清单记录的目标正文路径不合法，已停止写入".to_string());
+    }
+    Ok(path)
+}
+
+/// 创建本次同步的备份：唯一目录 + 覆盖前正文 + 待写入正文 + 数据库一致性快照 + 清单。
+///
+/// 全过程只读目标、只写备份目录；任何一步失败都返回 Err，调用方必须零写入
+/// （不碰目标正文、不改数据库、不提交基线）。
+fn create_sync_backup(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    plan: &SyncWritePlan,
+    target_body_path: &Path,
+    new_updated_at: i64,
+    new_baseline_ref: &str,
+    last_synced_at: i64,
+) -> Result<SyncBackup, String> {
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let dir = sync_backup_dir(paths, variant, &operation_id);
+    std::fs::create_dir_all(dir.join("bodies"))
+        .map_err(|error| format!("同步备份目录创建失败：{error}"))?;
+
+    // 1) 覆盖前正文备份 + 摘要核验（恢复/回滚的唯一依据）。
+    let original_rel = format!("bodies/original-{}.jsonl", plan.target_member.session_id);
+    backup_file_with_digest(
+        target_body_path,
+        &dir.join(&original_rel),
+        &plan.target_snapshot.full_digest,
+    )?;
+    // 2) 待写入正文备份 + 摘要核验（写入与恢复都只写这份字节）。
+    let incoming_rel = format!("bodies/incoming-{}.jsonl", plan.target_member.session_id);
+    let incoming_raw = plan.incoming_text.as_bytes();
+    std::fs::write(dir.join(&incoming_rel), incoming_raw)
+        .map_err(|error| format!("待写入正文备份失败：{error}"))?;
+    let incoming_raw_digest = full_digest_of(incoming_raw);
+    if full_digest_of(
+        &std::fs::read(dir.join(&incoming_rel))
+            .map_err(|error| format!("待写入正文回读失败：{error}"))?,
+    ) != incoming_raw_digest
+    {
+        return Err("待写入正文备份写后核验不一致，未报告备份成功".to_string());
+    }
+    // 3) 数据库一致性快照。
+    let db_rel = "workbuddy.db".to_string();
+    snapshot_workbuddy_db(&paths.workbuddy_db(), &dir.join(&db_rel))?;
+
+    let manifest = SyncBackupManifest {
+        version: SYNC_BACKUP_VERSION,
+        operation_id: operation_id.clone(),
+        variant,
+        group_id: plan.group_id.clone(),
+        mode: plan.mode,
+        verdict: plan.verdict,
+        created_at: now_ms(),
+        target_body_path: target_body_path.to_string_lossy().to_string(),
+        source: SyncBackupMember {
+            member_id: plan.source_member.member_id.clone(),
+            uid: plan.source_member.uid.clone(),
+            session_id: plan.source_member.session_id.clone(),
+            body_file: None,
+            body_raw_digest: plan.source_snapshot.full_digest.clone(),
+            body_normalized_digest: plan.source_snapshot.normalized.total_digest.clone(),
+            record_count: plan.source_records(),
+        },
+        target: SyncBackupMember {
+            member_id: plan.target_member.member_id.clone(),
+            uid: plan.target_member.uid.clone(),
+            session_id: plan.target_member.session_id.clone(),
+            body_file: Some(original_rel),
+            body_raw_digest: plan.target_snapshot.full_digest.clone(),
+            body_normalized_digest: plan.target_snapshot.normalized.total_digest.clone(),
+            record_count: plan.target_snapshot.normalized.record_count,
+        },
+        incoming: SyncBackupPayload {
+            body_file: incoming_rel,
+            body_raw_digest: incoming_raw_digest,
+            body_normalized_digest: plan.incoming.total_digest.clone(),
+            record_count: plan.incoming.record_count,
+        },
+        db: SyncBackupDb {
+            snapshot_file: db_rel,
+            method: DB_SNAPSHOT_METHOD.to_string(),
+            target_row: session_row_snapshot(paths, &plan.target_member.session_id),
+            new_updated_at,
+        },
+        new_baseline_ref: new_baseline_ref.to_string(),
+        old_baseline_ref: plan.old_baseline_ref.clone(),
+        last_synced_at,
+        restore_steps: vec![
+            "目标正文：从 bodies/ 下 original-*.jsonl 写回目标路径（先校验当前正文是否为本次写入的内容）"
+                .to_string(),
+            "目标会话行：把 sessions.updated_at 还原为清单 db.targetRow.updatedAt（先校验归属与当前值）"
+                .to_string(),
+            "数据库：workbuddy.db 为本次写入前的一致性快照，可用 SQLite 打开核对；不要整库覆盖当前库"
+                .to_string(),
+            "配对基线：把 manifest.newBaselineRef 对应的成员对基线还原为 oldBaselineRef（若未改动则无需处理）"
+                .to_string(),
+        ],
+    };
+    // 4) 清单落盘并回读核验：备份必须可验证恢复，读不回来的清单不算备份成功。
+    let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    let manifest_file = sync_manifest_file(&dir);
+    atomic_write(&manifest_file, &content)
+        .map_err(|error| format!("同步备份清单写入失败：{error}"))?;
+    match load_sync_manifest(&dir) {
+        Some(read_back) if read_back == manifest => {}
+        _ => return Err("同步备份清单写后核验不一致，未报告备份成功".to_string()),
+    }
+    verify_sync_backup(&dir, &manifest)?;
+    Ok(SyncBackup {
+        dir,
+        manifest_file,
+        manifest,
+    })
+}
+
+/// 目标正文相对本次操作的状态。
+enum SyncBodyState {
+    /// 已经是本次写入的内容。
+    Ours,
+    /// 仍是覆盖前的内容（尚未写入，或已被还原）。
+    PreSync,
+    /// 正文不存在。
+    Gone,
+    /// 两者都不是：可能被其它程序改动，停止恢复，不覆盖未知内容。
+    Unknown(String),
+}
+
+fn classify_sync_body(
+    target_body_path: &Path,
+    target_session_id: &str,
+    pre_sync_raw_digest: &str,
+    expected_digest: &str,
+) -> SyncBodyState {
+    match session_link::read_content_snapshot(target_body_path, target_session_id) {
+        ContentState::Ready(content) if content.normalized.total_digest == expected_digest => {
+            SyncBodyState::Ours
+        }
+        ContentState::Ready(content) if content.full_digest == pre_sync_raw_digest => {
+            SyncBodyState::PreSync
+        }
+        ContentState::Ready(_) => SyncBodyState::Unknown(
+            "目标正文与本次写入及覆盖前版本都不一致（可能被其它程序改动），已停止写入，不覆盖未知内容"
+                .to_string(),
+        ),
+        ContentState::Missing => SyncBodyState::Gone,
+        ContentState::Unavailable(reason) => SyncBodyState::Unknown(format!(
+            "目标正文无法验证（{reason}），已停止写入"
+        )),
+    }
+}
+
+/// 原子替换目标正文（同目录临时文件 + rename），写后复算摘要核验。
+fn write_sync_body(
+    target_body_path: &Path,
+    target_session_id: &str,
+    text: &str,
+    expected_digest: &str,
+) -> Result<NormalizedContent, String> {
+    atomic_write(target_body_path, text).map_err(|error| format!("同步正文写入失败：{error}"))?;
+    match session_link::read_content_snapshot(target_body_path, target_session_id) {
+        ContentState::Ready(read_back) if read_back.normalized.total_digest == expected_digest => {
+            Ok(read_back.normalized)
+        }
+        ContentState::Ready(_) => Err("同步正文写后校验不一致，未报告成功".to_string()),
+        ContentState::Missing => Err("同步正文写入后不存在，未报告成功".to_string()),
+        ContentState::Unavailable(reason) => Err(format!("同步正文写后无法验证：{reason}")),
+    }
+}
+
+/// 从备份目录取待写入正文并原子替换目标正文：写入的字节等于备份的字节。
+fn apply_sync_body(
+    paths: &SessionPaths,
+    backup_dir: &Path,
+    manifest: &SyncBackupManifest,
+    expected_digest: &str,
+) -> Result<NormalizedContent, String> {
+    let target_body_path = validated_target_body_path(paths, manifest)?;
+    let bytes = std::fs::read(backup_dir.join(&manifest.incoming.body_file))
+        .map_err(|error| format!("待写入正文备份读取失败：{error}"))?;
+    if full_digest_of(&bytes) != manifest.incoming.body_raw_digest {
+        return Err("待写入正文备份与清单不一致，已停止写入".to_string());
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| "待写入正文不是合法 UTF-8，未写入".to_string())?;
+    write_sync_body(
+        &target_body_path,
+        &manifest.target.session_id,
+        &text,
+        expected_digest,
+    )
+}
+
+/// 事务内更新目标行 updated_at：命中归属（owner = 目标 uid）且未删除。
+///
+/// 只改 updated_at：sessionId、标题、custom_title 必须与覆盖前一致（R4 / 验收项）。
+fn update_target_session_row(
+    paths: &SessionPaths,
+    target: &OperationMember,
+    new_updated_at: i64,
+    before: Option<&SyncBackupRow>,
+) -> Result<(), String> {
+    let mut conn = open_db(&paths.workbuddy_db(), false)
+        .ok_or_else(|| "会话数据库无法打开，未同步".to_string())?;
+    if !table_exists(&conn, "sessions") {
+        return Err("会话数据库缺少 sessions 表，未同步".to_string());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("会话数据库事务开启失败：{error}"))?;
+    let affected = tx
+        .execute(
+            "UPDATE sessions SET updated_at = ?1 \
+             WHERE id = ?2 AND user_id = ?3 AND deleted_at IS NULL",
+            rusqlite::params![new_updated_at, target.session_id, target.uid],
+        )
+        .map_err(|error| format!("目标会话行更新失败：{error}"))?;
+    if affected != 1 {
+        return Err(
+            "目标会话行归属校验失败：会话不存在、不属于目标账号或已被删除，未报告成功".to_string(),
+        );
+    }
+    match (read_session_row(&tx, &target.session_id), before) {
+        (None, _) => return Err("目标会话行写入后不可见，未报告成功".to_string()),
+        (Some(after), Some(before)) => {
+            if after.session_id != before.session_id
+                || after.user_id != before.user_id
+                || after.title != before.title
+                || after.custom_title != before.custom_title
+            {
+                return Err("目标会话行的归属或标题在写入期间发生变化，已回滚本次更新".to_string());
+            }
+            if after.updated_at != Some(new_updated_at) {
+                return Err("目标会话行更新时间未按本次写入生效，未报告成功".to_string());
+            }
+        }
+        (Some(_), None) => {}
+    }
+    tx.commit()
+        .map_err(|error| format!("会话数据库提交失败：{error}"))?;
+    Ok(())
+}
+
+/// 提交 A/B 新基线与目标成员 lastSyncedAt（定向更新，不触碰其它配对）。
+///
+/// 新基线用新的 ref，避免覆盖被其它成员对继承的历史基线（A/B 同步不代表 C 也同步）。
+fn commit_sync_baseline(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    manifest: &SyncBackupManifest,
+    normalized: &NormalizedContent,
+) -> Result<(), String> {
+    let source_member_id = manifest.source.member_id.as_str();
+    let target_member_id = manifest.target.member_id.as_str();
+    session_link::with_link_store_write(paths, |store| {
+        let Some(group) = store
+            .groups
+            .iter_mut()
+            .find(|group| group.id == manifest.group_id && group.variant == variant)
+        else {
+            return Err("关联组已不存在，未提交同步结果".to_string());
+        };
+        if !group
+            .members
+            .iter()
+            .any(|member| member.member_id == source_member_id)
+        {
+            return Err("来源成员已不存在，未提交同步结果".to_string());
+        }
+        {
+            let Some(target) = group
+                .members
+                .iter_mut()
+                .find(|member| member.member_id == target_member_id)
+            else {
+                return Err("目标成员已不存在，未提交同步结果".to_string());
+            };
+            target.last_synced_at = Some(manifest.last_synced_at);
+        }
+        session_link::save_baseline(paths, &manifest.new_baseline_ref, normalized)?;
+        session_link::set_pair_base(
+            group,
+            source_member_id,
+            target_member_id,
+            &manifest.new_baseline_ref,
+            NORMALIZATION_VERSION,
+        );
+        Ok(())
+    })
+}
+
+/// 核验 A/B 配对基线已提交为本次的新引用（已越过该阶段时不重放，只核验）。
+fn verify_sync_baseline_committed(
+    paths: &SessionPaths,
+    manifest: &SyncBackupManifest,
+) -> Result<(), String> {
+    match session_link::load_store(paths) {
+        StoreState::Ready(store) => {
+            let Some(group) = store
+                .groups
+                .iter()
+                .find(|group| group.id == manifest.group_id)
+            else {
+                return Err("关联组缺失，已停止恢复".to_string());
+            };
+            let Some(pair) = session_link::find_pair_base(
+                group,
+                &manifest.source.member_id,
+                &manifest.target.member_id,
+            ) else {
+                return Err("配对基线缺失，已停止恢复".to_string());
+            };
+            if pair.baseline_ref != manifest.new_baseline_ref {
+                return Err("配对基线与本次写入不一致，已停止恢复".to_string());
+            }
+            if session_link::load_baseline(paths, &manifest.new_baseline_ref).is_none() {
+                return Err("基线文件缺失或内容不自洽，已停止恢复".to_string());
+            }
+            Ok(())
+        }
+        StoreState::Missing => Err("关联存储主文件缺失，已停止恢复".to_string()),
+        StoreState::Unavailable(reason) => Err(reason),
+    }
+}
+
+/// 用备份里的覆盖前正文回滚目标正文（只在当前内容确为本次写入时调用）。
+fn restore_sync_backup_body(
+    paths: &SessionPaths,
+    dir: &Path,
+    manifest: &SyncBackupManifest,
+) -> Result<(), String> {
+    let Some(relative) = manifest.target.body_file.as_deref() else {
+        return Err("备份清单缺少目标正文备份位置".to_string());
+    };
+    let bytes =
+        std::fs::read(dir.join(relative)).map_err(|error| format!("备份正文读取失败：{error}"))?;
+    if full_digest_of(&bytes) != manifest.target.body_raw_digest {
+        return Err("备份正文摘要不一致，已停止回滚".to_string());
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| "备份正文不是合法 UTF-8，未回滚".to_string())?;
+    let target_body_path = validated_target_body_path(paths, manifest)?;
+    atomic_write(&target_body_path, &text).map_err(|error| format!("目标正文回滚失败：{error}"))
+}
+
+/// 阶段化写入：正文 → 数据库 → 组表 → completed；每步先落阶段再推进，可恢复。
+///
+/// 正常执行与恢复共用同一段代码：阶段只前进不回退，已越过的阶段不重放（只核验产物），
+/// 因此恢复不会产生第二份写入。
+fn run_sync_phases(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    operation: &mut Operation,
+    backup_dir: &Path,
+    manifest: &SyncBackupManifest,
+    body: SyncBodyState,
+) -> Result<(), String> {
+    let normalized = match body {
+        // 已写入：只核验现场，不重写。
+        SyncBodyState::Ours => {
+            let target_body_path = validated_target_body_path(paths, manifest)?;
+            match session_link::read_content_snapshot(
+                &target_body_path,
+                &manifest.target.session_id,
+            ) {
+                ContentState::Ready(content)
+                    if content.normalized.total_digest == operation.expected_content_digest =>
+                {
+                    content.normalized
+                }
+                ContentState::Ready(_) => {
+                    return Err("目标正文与本次写入不一致，已停止恢复".to_string())
+                }
+                ContentState::Missing => return Err("目标正文丢失，已停止恢复".to_string()),
+                ContentState::Unavailable(reason) => {
+                    return Err(format!("目标正文无法验证（{reason}），已停止恢复"))
+                }
+            }
+        }
+        SyncBodyState::PreSync | SyncBodyState::Gone => {
+            let normalized = apply_sync_body(
+                paths,
+                backup_dir,
+                manifest,
+                &operation.expected_content_digest,
+            )?;
+            advance_operation(paths, operation, OpPhase::BodyWritten)?;
+            normalized
+        }
+        SyncBodyState::Unknown(reason) => return Err(reason),
+    };
+
+    // 数据库：更新目标行 updated_at 是幂等操作（同一时间戳重复写等价），
+    // 未命中归属/已删除时直接失败，不报成功。
+    update_target_session_row(
+        paths,
+        &operation.target,
+        manifest.db.new_updated_at,
+        manifest.db.target_row.as_ref(),
+    )?;
+    advance_operation(paths, operation, OpPhase::DbWritten)?;
+
+    if operation.phase < OpPhase::LinksCommitted {
+        commit_sync_baseline(paths, variant, manifest, &normalized)?;
+        advance_operation(paths, operation, OpPhase::LinksCommitted)?;
+    } else {
+        verify_sync_baseline_committed(paths, manifest)?;
+    }
+    advance_operation(paths, operation, OpPhase::Completed)?;
+    Ok(())
+}
+
+/// 执行单条同步：备份 → 阶段化写入 → completed。
+///
+/// 任一阶段失败都保留未完成操作（同一目标 UUID 与新基线引用，下次切换按清单补完），
+/// 绝不把未完成的写入报告成 `synced`。
+fn execute_sync_item(
+    context: &SyncContext,
+    plan: &SyncWritePlan,
+    mode: SyncMode,
+    verdict: SyncVerdict,
+) -> Result<Value, String> {
+    let paths = context.paths;
+    // 同一目标上仍有未完成写入：本轮不得再写一次（等恢复完成）。
+    if let Some(operation) = context.pending.iter().find(|operation| {
+        operation.phase.is_unfinished()
+            && operation.target.session_id == plan.target_member.session_id
+    }) {
+        return Err(format!(
+            "上一次会话写入尚未完成（操作 {}）：{}，本次未写入",
+            operation.operation_id,
+            operation
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "等待恢复".to_string())
+        ));
+    }
+    let target_body_path = find_project_jsonl(paths, &plan.target_member.session_id)
+        .ok_or_else(|| "目标正文不存在，未同步".to_string())?;
+    let new_updated_at = now_ms();
+    let last_synced_at = now_ms();
+    let new_baseline_ref = uuid::Uuid::new_v4().to_string();
+    // 备份是一道门禁：备份不可信就零写入（不碰正文、不改数据库、不提交基线）。
+    let backup = create_sync_backup(
+        paths,
+        context.variant,
+        plan,
+        &target_body_path,
+        new_updated_at,
+        &new_baseline_ref,
+        last_synced_at,
+    )?;
+
+    let mut operation = Operation {
+        version: OPERATION_VERSION,
+        operation_id: backup.manifest.operation_id.clone(),
+        kind: OPERATION_KIND_SYNC.to_string(),
+        variant: context.variant,
+        group_id: plan.group_id.clone(),
+        source: OperationMember {
+            account_id: context.source_account_id.clone(),
+            uid: plan.source_member.uid.clone(),
+            session_id: plan.source_member.session_id.clone(),
+        },
+        target: OperationMember {
+            account_id: context.target_account_id.clone(),
+            uid: plan.target_member.uid.clone(),
+            session_id: plan.target_member.session_id.clone(),
+        },
+        expected_content_digest: plan.incoming.total_digest.clone(),
+        expected_record_count: plan.incoming.record_count,
+        phase: OpPhase::Prepared,
+        backup: Some(backup.manifest_file.to_string_lossy().to_string()),
+        last_error: None,
+        created_at: now_ms(),
+        updated_at: now_ms(),
+    };
+    session_link::save_operation(paths, &operation)?;
+
+    let body = classify_sync_body(
+        &target_body_path,
+        &plan.target_member.session_id,
+        &plan.target_snapshot.full_digest,
+        &operation.expected_content_digest,
+    );
+    if let Err(error) = run_sync_phases(
+        paths,
+        context.variant,
+        &mut operation,
+        &backup.dir,
+        &backup.manifest,
+        body,
+    ) {
+        fail_operation(paths, &mut operation, &error);
+        return Err(error);
+    }
+    let _ = session_link::prune_operations(
+        paths,
+        context.variant,
+        session_link::KEEP_COMPLETED_OPERATIONS,
+    );
+    Ok(json!({
+        "groupId": plan.group_id,
+        "status": "synced",
+        "verdict": verdict.as_str(),
+        "mode": mode.as_str(),
+        "sourceSessionId": plan.source_member.session_id,
+        "targetSessionId": plan.target_member.session_id,
+        "recordCount": {
+            "source": plan.source_records(),
+            "targetBefore": plan.target_snapshot.normalized.record_count,
+            "target": plan.incoming.record_count,
+        },
+        "updatedAt": backup.manifest.db.new_updated_at,
+        "backup": backup.dir.to_string_lossy(),
+        "backupManifest": backup.manifest_file.to_string_lossy(),
+        "message": plan.reason,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // 未完成操作恢复（design §4.2 / §4.5）
 // ---------------------------------------------------------------------------
 
@@ -1238,6 +2704,136 @@ fn check_target_body(paths: &SessionPaths, operation: &Operation) -> BodyCheck {
 /// 恢复单个操作：按「持久化阶段 + 实际状态」逐阶段判断，已经越过的阶段不重放
 /// （不重复登记映射、不重写关联存储与基线）；校验不因跳过重放而放松。
 fn recover_operation(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    operation: Operation,
+) -> RecoverOutcome {
+    if operation.kind == OPERATION_KIND_SYNC {
+        return recover_sync_operation(paths, variant, operation);
+    }
+    recover_copy_operation(paths, variant, operation)
+}
+
+/// 恢复一次同步（design §5.6）：先校验现场，再按清单补完，绝不覆盖未知内容。
+///
+/// 顺序：备份必须完好 → 目标正文只能是「本次写入的」或「覆盖前的」→ 目标行归属与
+/// 更新时间必须可安全识别 → 复用同一段阶段代码补完。任一项不满足即停止并上报
+/// needsRecovery（不可重试，宿主据此暂停启动 App）。
+fn recover_sync_operation(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    mut operation: Operation,
+) -> RecoverOutcome {
+    let operation_id = operation.operation_id.clone();
+    let needs = |reason: String, retryable: bool| RecoverOutcome::NeedsRecovery {
+        id: operation_id.clone(),
+        reason,
+        retryable,
+    };
+
+    // 1) 备份必须完好：没有可验证的备份就没有恢复依据，也不得盲目重放。
+    // 操作日志里记录的是本次的备份清单路径，备份目录是它的父目录。
+    let Some(backup_dir) = operation
+        .backup
+        .clone()
+        .map(PathBuf::from)
+        .and_then(|manifest_file| manifest_file.parent().map(Path::to_path_buf))
+    else {
+        return needs(
+            "同步备份位置缺失，已停止恢复，请手动处理".to_string(),
+            false,
+        );
+    };
+    let Some(manifest) = load_sync_manifest(&backup_dir) else {
+        return needs(
+            "同步备份清单缺失或损坏，已停止恢复，请手动处理".to_string(),
+            false,
+        );
+    };
+    if let Err(reason) = verify_sync_backup(&backup_dir, &manifest) {
+        return needs(reason, false);
+    }
+    let target_body_path = match validated_target_body_path(paths, &manifest) {
+        Ok(path) => path,
+        Err(reason) => return needs(reason, false),
+    };
+
+    // 2) 目标正文：只接受「本次写入的内容」或「覆盖前的内容」。
+    let body = classify_sync_body(
+        &target_body_path,
+        &operation.target.session_id,
+        &manifest.target.body_raw_digest,
+        &operation.expected_content_digest,
+    );
+    match &body {
+        // 后续无关修改（用户/官方 App 追加过内容）或内容不可验证：停止恢复，不覆盖。
+        SyncBodyState::Unknown(reason) => return needs(reason.clone(), false),
+        SyncBodyState::Gone if operation.phase >= OpPhase::BodyWritten => {
+            return needs("目标正文丢失，已停止恢复".to_string(), false);
+        }
+        _ => {}
+    }
+
+    // 3) 目标行：归属与更新时间必须可安全识别。
+    let row = session_row_snapshot(paths, &operation.target.session_id);
+    let row_absent = match &row {
+        None => true,
+        // 已删除的会话（软删除）同样没有可更新的行：会话在 App 里已经不存在。
+        Some(row) => row.deleted_at.is_some(),
+    };
+    if row_absent {
+        // 没有可更新的行就无法补完。若残留的是本次写入的正文，按清单回滚成覆盖前
+        // 内容，不留无行的半成品；这不算成功，记为放弃（无需人工处理，不阻断启动）。
+        if matches!(body, SyncBodyState::Ours) {
+            if let Err(error) = restore_sync_backup_body(paths, &backup_dir, &manifest) {
+                return needs(
+                    format!("目标会话行已不存在且正文回滚失败（{error}），请手动处理"),
+                    false,
+                );
+            }
+        }
+        abandon_operation_with(
+            paths,
+            &mut operation,
+            "目标会话行已不存在（或已删除），本次同步已从备份回滚，未写入会话内容",
+        );
+        return RecoverOutcome::Abandoned(operation_id);
+    }
+    let Some(row) = row else {
+        // row_absent 已经把 None 分支处理掉，这里只是形式上的兜底。
+        return needs("目标会话行无法读取，已停止恢复".to_string(), false);
+    };
+    if row.user_id != operation.target.uid {
+        return needs("目标会话行归属异常，已停止恢复".to_string(), false);
+    }
+    let before = manifest
+        .db
+        .target_row
+        .as_ref()
+        .and_then(|row| row.updated_at);
+    let applied = row.updated_at == Some(manifest.db.new_updated_at);
+    let untouched = before.is_some() && row.updated_at == before;
+    if !applied && !untouched && before.is_some() {
+        // 既不是本次写入的值、也不是覆盖前的值：被其它程序改动过，不覆盖。
+        return needs(
+            "目标会话行的更新时间与本次写入及覆盖前值都不一致（可能被其它程序改动），已停止恢复"
+                .to_string(),
+            false,
+        );
+    }
+
+    // 4) 复用同一段阶段代码补完（阶段只前进，已越过的阶段只核验不重放）。
+    match run_sync_phases(paths, variant, &mut operation, &backup_dir, &manifest, body) {
+        Ok(()) => RecoverOutcome::Recovered(operation_id),
+        Err(error) => {
+            fail_operation(paths, &mut operation, &error);
+            needs(error, true)
+        }
+    }
+}
+
+/// 恢复一次复制（第一步的原有逻辑，保持不变）。
+fn recover_copy_operation(
     paths: &SessionPaths,
     variant: WbVariant,
     mut operation: Operation,
@@ -1380,8 +2976,17 @@ fn recover_operation(
 }
 
 fn abandon_operation(paths: &SessionPaths, operation: &mut Operation) {
+    abandon_operation_with(
+        paths,
+        operation,
+        "源会话已不可用，且未写入任何副本，已放弃该操作",
+    );
+}
+
+/// 放弃一个未写入任何会话内容的操作（阶段置 Abandoned，不算成功）。
+fn abandon_operation_with(paths: &SessionPaths, operation: &mut Operation, reason: &str) {
     operation.phase = OpPhase::Abandoned;
-    operation.last_error = Some("源会话已不可用，且未写入任何副本，已放弃该操作".to_string());
+    operation.last_error = Some(reason.to_string());
     operation.updated_at = now_ms();
     let _ = session_link::save_operation(paths, operation);
 }
@@ -2972,5 +4577,1691 @@ mod tests {
         assert_eq!(session_row_owner(&env.paths(), "missing"), None);
         env.delete_row("sess-1");
         assert_eq!(session_row_owner(&env.paths(), "sess-1"), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // 同步预览与执行契约（S5）
+    // ---------------------------------------------------------------------------
+
+    /// 追加 `count` 条有序记录（模拟用户在来源账号继续对话）。
+    fn append_records(path: &Path, cid: &str, from: usize, count: usize) {
+        let mut text = std::fs::read_to_string(path).unwrap();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        for index in from..from + count {
+            text.push_str(
+                &json!({"type": "assistant", "sessionId": cid, "index": index}).to_string(),
+            );
+            text.push('\n');
+        }
+        std::fs::write(path, &text).unwrap();
+    }
+
+    fn preview(env: &Env, target_uid: &str) -> Value {
+        session_links_preview_at(&env.paths(), WbVariant::Cn, &env.target(target_uid)).unwrap()
+    }
+
+    fn selection(group_id: &str, preview_token: &str, mode: SyncMode) -> SyncSelection {
+        SyncSelection {
+            group_id: group_id.to_string(),
+            preview_token: preview_token.to_string(),
+            mode,
+        }
+    }
+
+    fn sync(env: &Env, target_uid: &str, selections: &[SyncSelection]) -> Value {
+        sync_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target(target_uid),
+            selections,
+            |_| false,
+        )
+        .unwrap()
+    }
+
+    /// 组内所有配对基线的快照：同步不得推进任何关联版本（含第三方成员的配对）。
+    fn pair_snapshot(env: &Env) -> Vec<String> {
+        let mut items: Vec<String> = env
+            .store()
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .pair_bases
+                    .iter()
+                    .map(|pair| format!("{}/{}", pair.member_ids.join("+"), pair.baseline_ref))
+            })
+            .collect();
+        items.sort();
+        items
+    }
+
+    /// 造一个可快进的场景：A→B 复制后来源追加 3 条记录，返回 (groupId, 预览凭据, 目标会话 id)。
+    fn fast_forward_scene(env: &Env) -> (String, String, String) {
+        let report = copy(env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        append_records(&env.body_path("sess-1"), "sess-1", 0, 3);
+
+        let preview = preview(env, "uid-b");
+        assert_eq!(preview["groups"].as_array().unwrap().len(), 1, "{preview}");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "fastForward", "{preview}");
+        (
+            group["groupId"].as_str().unwrap().to_string(),
+            group["previewToken"].as_str().unwrap().to_string(),
+            target_id,
+        )
+    }
+
+    /// 预览报告 fastForward 与默认勾选；预览本身是只读的（不改正文与关联版本）。
+    #[test]
+    fn preview_reports_fast_forward_and_stays_read_only() {
+        let env = ready_env("sync-preview-ff");
+        let (_, _, target_id) = fast_forward_scene(&env);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        let revision_before = env.store().revision;
+        let baselines_before = env.baseline_files();
+
+        let preview = preview(&env, "uid-b");
+        assert_eq!(preview["supported"], true);
+        assert_eq!(preview["storeStatus"], "ready");
+        assert_eq!(preview["sourceUid"], "uid-a");
+        assert_eq!(preview["targetUid"], "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["title"], "标题一");
+        assert_eq!(group["cwd"], "/ws/a");
+        assert_eq!(group["verdict"], "fastForward");
+        assert_eq!(group["defaultChecked"], true);
+        assert_eq!(group["extraA"], 3);
+        assert_eq!(group["extraB"], 0);
+        assert_eq!(group["common"], 2);
+        assert_eq!(group["availableModes"], json!(["fastForward"]));
+        assert_eq!(group["recordCount"]["source"], 5);
+        assert_eq!(group["recordCount"]["target"], 2);
+        assert_eq!(group["recordCount"]["baseline"], 2);
+        assert_eq!(group["source"]["uid"], "uid-a");
+        assert_eq!(group["target"]["sessionId"], target_id);
+        assert_eq!(group["target"]["state"], "active");
+        assert!(group["previewToken"].as_str().is_some());
+        assert!(group["reason"].as_str().unwrap().contains("记录"));
+        // 预览是只读的：目标正文与关联版本都不变。
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+        assert_eq!(env.store().revision, revision_before);
+        assert_eq!(env.baseline_files(), baselines_before);
+    }
+
+    /// 仅目标变化 → ahead：不可勾选、不发凭据，目标正文不变。
+    #[test]
+    fn preview_reports_ahead_when_only_target_changed() {
+        let env = ready_env("sync-preview-ahead");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        append_records(&env.body_path(&target_id), &target_id, 0, 5);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        let revision_before = env.store().revision;
+
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "ahead");
+        assert_eq!(group["defaultChecked"], false);
+        assert_eq!(group["extraA"], 0);
+        assert_eq!(group["extraB"], 5);
+        assert_eq!(group["availableModes"], json!([]));
+        assert!(group.get("previewToken").is_none(), "不可勾选的组不发凭据");
+        assert!(group["reason"].as_str().unwrap().contains("仅目标有变化"));
+
+        // 预览不写目标：正文与关联版本都不变。
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+        assert_eq!(env.store().revision, revision_before);
+    }
+
+    /// 一方有效成员缺失（失效/被替换）→ 不提供写入动作，记录数按契约给 0 而不是 null。
+    #[test]
+    fn preview_reports_invalid_member_as_unknown_without_null_record_counts() {
+        let env = ready_env("sync-preview-invalid-member");
+        let (group_id, _token, target_id) = fast_forward_scene(&env);
+        session_link::with_link_store_write(&env.paths(), |store| {
+            let group = store
+                .groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+                .expect("组必须存在");
+            let member_id = session_link::active_member_for(group, "uid-b")
+                .expect("目标成员原本有效")
+                .member_id
+                .clone();
+            assert!(session_link::set_member_state(
+                group,
+                &member_id,
+                MemberState::Stale
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "unknown", "{preview}");
+        assert_eq!(group["defaultChecked"], false);
+        assert_eq!(group["availableModes"], json!([]));
+        assert!(group.get("previewToken").is_none(), "不可执行的组不发凭据");
+        assert!(
+            group["reason"].as_str().unwrap().contains("关联成员已失效"),
+            "{preview}"
+        );
+        // 契约：不可验证时 source/target 为 0、baseline 为 null（前端类型据此声明）。
+        assert_eq!(
+            group["recordCount"],
+            json!({"source": 0, "target": 0, "baseline": null}),
+            "{preview}"
+        );
+        // 两侧成员状态仍要展示（用户据此判断是哪一侧失效）。
+        assert_eq!(group["target"]["sessionId"], target_id);
+        assert_eq!(group["target"]["state"], "stale");
+        assert_eq!(group["source"]["state"], "active");
+    }
+
+    /// 预览后来源追加 → 执行时跳过该组（previewStale），不继承用户旧选择。
+    #[test]
+    fn sync_skips_when_source_changed_after_preview() {
+        let env = ready_env("sync-stale-source");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+
+        append_records(&env.body_path("sess-1"), "sess-1", 3, 1);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty());
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let skipped = &report["skipped"][0];
+        assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE);
+        assert!(
+            skipped["message"].as_str().unwrap().contains("来源正文"),
+            "{skipped}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+    }
+
+    /// 预览后目标被改动 → 执行时跳过（显式覆盖也不能绕过版本校验）。
+    #[test]
+    fn sync_skips_when_target_changed_after_preview_even_with_overwrite() {
+        let env = ready_env("sync-stale-target");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        append_records(&env.body_path(&target_id), &target_id, 0, 1);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+
+        for mode in [SyncMode::FastForward, SyncMode::Overwrite] {
+            let report = sync(&env, "uid-b", &[selection(&group_id, &token, mode)]);
+            assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+            let skipped = &report["skipped"][0];
+            assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
+            assert!(
+                skipped["message"].as_str().unwrap().contains("目标正文"),
+                "{skipped}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+    }
+
+    /// 预览后换了账号 → 执行时跳过（身份由后端从登录态读取，不沿用令牌里的身份）。
+    #[test]
+    fn sync_skips_when_account_changed_after_preview() {
+        let env = ready_env("sync-stale-account");
+        let (group_id, token, _) = fast_forward_scene(&env);
+        let revision_before = env.store().revision;
+
+        env.set_login("uid-c");
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let skipped = &report["skipped"][0];
+        assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE);
+        assert!(
+            skipped["message"].as_str().unwrap().contains("账号已变化"),
+            "{skipped}"
+        );
+        assert_eq!(env.store().revision, revision_before);
+    }
+
+    /// 预览后关联组或基线变化 → 执行时跳过。
+    #[test]
+    fn sync_skips_when_group_or_baseline_changed_after_preview() {
+        // 组变化：同组新增成员（例如并发复制把第三方账号加进来）。
+        let env = ready_env("sync-stale-group");
+        let (group_id, token, _) = fast_forward_scene(&env);
+        let paths = env.paths();
+        session_link::with_link_store_write(&paths, |store| {
+            let group = store
+                .groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+                .expect("组必须存在");
+            session_link::add_active_member(
+                group,
+                LinkMember {
+                    member_id: "m-uid-c".to_string(),
+                    account_id: None,
+                    uid: "uid-c".to_string(),
+                    session_id: "sess-c".to_string(),
+                    state: MemberState::Active,
+                    linked_at: 1,
+                    last_synced_at: None,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        let skipped = &report["skipped"][0];
+        assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
+        assert!(
+            skipped["message"]
+                .as_str()
+                .unwrap()
+                .contains("关联组或配对基线已变化"),
+            "{skipped}"
+        );
+
+        // 基线变化：同一个基线引用被改写成另一份内容。
+        let env = ready_env("sync-stale-baseline");
+        let (group_id, token, _) = fast_forward_scene(&env);
+        let baseline_ref = env.store().groups[0].pair_bases[0].baseline_ref.clone();
+        let drifted = session_link::BaselineRecord {
+            version: session_link::BASELINE_VERSION,
+            baseline_ref: baseline_ref.clone(),
+            normalization_version: session_link::NORMALIZATION_VERSION,
+            created_at: 1,
+            record_count: 1,
+            total_digest: session_link::total_digest_of(&["00".to_string()]),
+            line_digests: vec!["00".to_string()],
+        };
+        std::fs::write(
+            env.paths
+                .baselines_dir()
+                .join(format!("{baseline_ref}.json")),
+            serde_json::to_string(&drifted).unwrap(),
+        )
+        .unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        let skipped = &report["skipped"][0];
+        assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
+        assert!(
+            skipped["message"]
+                .as_str()
+                .unwrap()
+                .contains("配对基线内容已变化"),
+            "{skipped}"
+        );
+    }
+
+    /// 伪造 token / 张冠李戴的组 → 拒绝，不静默执行。
+    #[test]
+    fn sync_rejects_forged_or_mismatched_preview_token() {
+        let env = ready_env("sync-forged");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+
+        for forged in [
+            "11111111-2222-3333-4444-555555555555",
+            "../../../../etc/passwd",
+            "sess-1.json",
+        ] {
+            let report = sync(
+                &env,
+                "uid-b",
+                &[selection(&group_id, forged, SyncMode::FastForward)],
+            );
+            assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+            let errors = report["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{report}");
+            assert!(
+                errors[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("预览凭据不存在"),
+                "{report}"
+            );
+        }
+
+        // 真实凭据 + 别的组 id：张冠李戴同样拒绝。
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection("g-other", &token, SyncMode::FastForward)],
+        );
+        assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+        assert!(
+            report["errors"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("不匹配"),
+            "{report}"
+        );
+
+        // 未知模式在解析阶段就拒绝。
+        assert!(parse_sync_selections(Some(
+            &json!([{"groupId": group_id, "previewToken": token, "mode": "force"}])
+        ))
+        .unwrap_err()
+        .contains("未知的同步模式"));
+
+        // 全程没有任何写入。
+        assert_eq!(env.body_files().len(), 2);
+        assert_eq!(
+            session_row_owner(&env.paths(), &target_id).as_deref(),
+            Some("uid-b")
+        );
+    }
+
+    /// 判定为 unknown 时强制覆盖 → 拒绝（不得绕过版本校验）。
+    #[test]
+    fn sync_rejects_forced_overwrite_when_verdict_is_unknown() {
+        let env = ready_env("sync-unknown-overwrite");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        let revision_before = env.store().revision;
+
+        // 基线文件被删除：共同基线不可验证 → 重新判定必然 unknown。
+        let store = env.store();
+        let group = store
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .unwrap();
+        let baseline_ref = group.pair_bases[0].baseline_ref.clone();
+        std::fs::remove_file(
+            env.paths
+                .baselines_dir()
+                .join(format!("{baseline_ref}.json")),
+        )
+        .unwrap();
+
+        let paths = env.paths();
+        let source_member = session_link::active_member_for(group, "uid-a").unwrap();
+        let target_member = session_link::active_member_for(group, "uid-b").unwrap();
+        let source_content = member_content_state(&paths, &source_member.session_id);
+        let target_content = member_content_state(&paths, &target_member.session_id);
+        let baseline = session_link::load_pair_baseline(
+            &paths,
+            group,
+            &source_member.member_id,
+            &target_member.member_id,
+        );
+        assert_eq!(
+            session_link::decide_sync(&source_content, &target_content, &baseline).verdict,
+            SyncVerdict::Unknown
+        );
+        // 前端只能回传凭据 id；这里直接构造一份「unknown + 空可选模式」的服务端凭据，
+        // 模拟强行以覆盖模式执行。
+        let forged = session_link::save_preview_token(
+            &paths,
+            live_preview_binding(
+                group,
+                source_member,
+                target_member,
+                &source_content,
+                &target_content,
+                &baseline,
+                SyncVerdict::Unknown,
+            ),
+        )
+        .unwrap();
+
+        for mode in [SyncMode::Overwrite, SyncMode::FastForward] {
+            let report = sync(&env, "uid-b", &[selection(&group_id, &forged, mode)]);
+            assert!(
+                report["skipped"].as_array().unwrap().is_empty(),
+                "unknown 不得进入校验通过：{report}"
+            );
+            let errors = report["errors"].as_array().unwrap();
+            assert_eq!(errors.len(), 1, "{report}");
+            assert!(
+                errors[0]["error"].as_str().unwrap().contains("不允许以"),
+                "{report}"
+            );
+        }
+
+        // 以原凭据 + 覆盖模式 → 版本校验先拦下（判定已变），同样不写。
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::Overwrite)],
+        );
+        assert_eq!(report["skipped"][0]["reasonCode"], REASON_PREVIEW_STALE);
+
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+        assert_eq!(env.store().revision, revision_before);
+    }
+
+    /// 第三方账号：只处理 A 与 B 共同参与的组，同步只推进 A/B 的基线与正文。
+    #[test]
+    fn sync_never_touches_third_account_member_or_baseline() {
+        let env = ready_env("sync-third-account");
+        let a_to_b = copy(&env, "uid-b", &["sess-1"]);
+        let b_id = env.first_copy_id(&a_to_b);
+        let a_to_c = copy(&env, "uid-c", &["sess-1"]);
+        let c_id = env.first_copy_id(&a_to_c);
+        append_records(&env.body_path("sess-1"), "sess-1", 0, 2);
+        append_records(&env.body_path(&c_id), &c_id, 0, 7);
+
+        let pairs_before = pair_snapshot(&env);
+        let baselines_before = env.baseline_files();
+        let c_body_before = std::fs::read_to_string(env.body_path(&c_id)).unwrap();
+        let b_body_before = std::fs::read_to_string(env.body_path(&b_id)).unwrap();
+
+        // 只列出 A 与 B 共同参与的组；C 的改动不影响 A/B 的判定。
+        let preview = preview(&env, "uid-b");
+        let groups = preview["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "{preview}");
+        assert_eq!(groups[0]["verdict"], "fastForward", "{preview}");
+        assert_eq!(groups[0]["extraB"], 0);
+        let group_id = groups[0]["groupId"].as_str().unwrap().to_string();
+        let token = groups[0]["previewToken"].as_str().unwrap().to_string();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report.get("needsRecovery").is_none(), "{report}");
+
+        // 只有 A/B 的配对基线被推进（旧引用消失、新引用出现），A/C 与 B/C 原样保留。
+        let store = env.store();
+        let group = store
+            .groups
+            .iter()
+            .find(|group| group.id == group_id)
+            .unwrap();
+        let pairs_after = pair_snapshot(&env);
+        let removed: Vec<&String> = pairs_before
+            .iter()
+            .filter(|entry| !pairs_after.contains(entry))
+            .collect();
+        let added: Vec<&String> = pairs_after
+            .iter()
+            .filter(|entry| !pairs_before.contains(entry))
+            .collect();
+        assert_eq!(removed.len(), 1, "只有 A/B 的基线被改写：{pairs_after:?}");
+        let (a_member, b_member) = (member_id_of(group, "uid-a"), member_id_of(group, "uid-b"));
+        assert!(
+            removed[0].starts_with(&format!("{a_member}+{b_member}"))
+                || removed[0].starts_with(&format!("{b_member}+{a_member}")),
+            "被改写的必须是 A/B 成员对：{}",
+            removed[0]
+        );
+        assert_eq!(added.len(), 1);
+        assert_eq!(env.baseline_files(), baselines_before + 1, "只新增一份基线");
+
+        // C 的正文、基线与同步时间都不动；来源账号也不被标成已同步。
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&c_id)).unwrap(),
+            c_body_before,
+            "C 的正文不得被同步改写"
+        );
+        assert_ne!(
+            std::fs::read_to_string(env.body_path(&b_id)).unwrap(),
+            b_body_before,
+            "B 的正文应被同步替换"
+        );
+        let group = env
+            .store()
+            .groups
+            .into_iter()
+            .find(|group| group.id == group_id)
+            .unwrap();
+        assert!(group
+            .members
+            .iter()
+            .find(|member| member.uid == "uid-c")
+            .unwrap()
+            .last_synced_at
+            .is_none());
+        assert!(session_link::active_member_for(&group, "uid-a")
+            .unwrap()
+            .last_synced_at
+            .is_none());
+        assert!(session_link::active_member_for(&group, "uid-b")
+            .unwrap()
+            .last_synced_at
+            .is_some());
+    }
+
+    fn member_id_of(group: &LinkGroup, uid: &str) -> String {
+        group
+            .members
+            .iter()
+            .find(|member| member.uid == uid)
+            .unwrap()
+            .member_id
+            .clone()
+    }
+
+    /// 关联存储不可用/缺失 → 不把校验当成通过。
+    #[test]
+    fn sync_reports_store_problems_instead_of_passing_checks() {
+        // 损坏：保留现场，全部选择项报错并要求恢复。
+        let env = ready_env("sync-store-broken");
+        let (group_id, token, _) = fast_forward_scene(&env);
+        std::fs::write(env.paths.session_links_file(), "not-json").unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+        assert!(
+            report["errors"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("关联存储"),
+            "{report}"
+        );
+        assert_eq!(report["needsRecovery"], true, "关系表损坏必须要求恢复");
+
+        // 主文件与基线都被清掉（首次使用）：凭据无从校验 → 跳过。
+        let env = ready_env("sync-store-missing");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        std::fs::remove_file(env.paths.session_links_file()).unwrap();
+        std::fs::remove_dir_all(env.paths.baselines_dir()).unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["skipped"][0]["reasonCode"], REASON_PREVIEW_STALE);
+        assert_eq!(env.body_files().len(), 2);
+        assert!(env.body_path(&target_id).exists());
+    }
+
+    /// 预览的能力与状态上报：档位不支持、关联存储未初始化、入参错误。
+    #[test]
+    fn preview_reports_supported_and_store_status() {
+        let env = Env::new("sync-preview-status");
+        env.set_login("uid-a");
+
+        // 关联存储还没建立 → missing，不是错误。
+        let report = preview(&env, "uid-b");
+        assert_eq!(report["supported"], true);
+        assert_eq!(report["storeStatus"], "missing");
+        assert_eq!(report["groups"].as_array().unwrap().len(), 0);
+
+        // 国际版数据根不同构 → 不支持，前端据此隐藏同步区块。
+        let ai_paths = SessionPaths {
+            store_root: env.root.join("store-ai"),
+            data_root: env.root.join("data-ai"),
+            auth_file: env.paths.auth_file.clone(),
+        };
+        std::fs::create_dir_all(&ai_paths.data_root).unwrap();
+        let report = session_links_preview_at(
+            &ai_paths,
+            WbVariant::Ai,
+            &json!({"id": "ai-1", "uid": "uid-b", "variant": "ai"}),
+        )
+        .unwrap();
+        assert_eq!(report["supported"], false);
+        assert_eq!(report["storeStatus"], "unsupported");
+        assert_eq!(report["groups"].as_array().unwrap().len(), 0);
+
+        // 入参错误：缺 uid、同账号。
+        assert!(
+            session_links_preview_at(&env.paths(), WbVariant::Cn, &json!({"uid": " "}))
+                .unwrap_err()
+                .contains("缺少 uid")
+        );
+        assert!(
+            session_links_preview_at(&env.paths(), WbVariant::Cn, &env.target("uid-a"))
+                .unwrap_err()
+                .contains("当前账号与目标账号相同")
+        );
+    }
+
+    /// 执行入口的生命周期与入参保护。
+    #[test]
+    fn sync_requires_app_stopped_and_valid_target() {
+        let env = ready_env("sync-lifecycle");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        let one = [selection(&group_id, &token, SyncMode::FastForward)];
+
+        // App 运行中 → 拒绝（与复制同一条生命周期保护），不写任何东西。
+        let err = sync_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target("uid-b"),
+            &one,
+            |_| true,
+        )
+        .unwrap_err();
+        assert_eq!(err, SESSION_COPY_APP_RUNNING);
+
+        // 空选择项 → 什么都不做，也不要求关闭 App。
+        let report = sync_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target("uid-b"),
+            &[],
+            |_| true,
+        )
+        .unwrap();
+        assert!(report["skipped"].as_array().unwrap().is_empty());
+        assert!(report["errors"].as_array().unwrap().is_empty());
+        assert!(report["synced"].as_array().unwrap().is_empty());
+
+        // 缺 uid / 同账号。
+        let err = sync_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &json!({"uid": "  "}),
+            &one,
+            |_| false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "目标账号缺少 uid，无法同步会话");
+        let err = sync_sessions_for_switch_at(
+            &env.paths(),
+            WbVariant::Cn,
+            &env.target("uid-a"),
+            &one,
+            |_| false,
+        )
+        .unwrap_err();
+        assert!(err.contains("当前账号与目标账号相同"), "{err}");
+
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            target_body_before
+        );
+    }
+
+    /// syncSelections 解析：缺字段/未知模式/非数组一律拒绝。
+    #[test]
+    fn sync_selection_parsing_rejects_invalid_input() {
+        assert!(parse_sync_selections(None).unwrap().is_empty());
+        assert!(parse_sync_selections(Some(&json!(null)))
+            .unwrap()
+            .is_empty());
+        assert!(parse_sync_selections(Some(&json!("x")))
+            .unwrap_err()
+            .contains("必须是数组"));
+
+        let parsed = parse_sync_selections(Some(&json!([
+            {"groupId": "g-1", "previewToken": "11111111-2222-3333-4444-555555555555", "mode": "overwrite"}
+        ])))
+        .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].group_id, "g-1");
+        assert_eq!(parsed[0].mode, SyncMode::Overwrite);
+
+        for (name, item) in [
+            (
+                "缺 groupId",
+                json!({"previewToken": "t", "mode": "fastForward"}),
+            ),
+            (
+                "缺 previewToken",
+                json!({"groupId": "g-1", "mode": "fastForward"}),
+            ),
+            ("缺 mode", json!({"groupId": "g-1", "previewToken": "t"})),
+            (
+                "空白 groupId",
+                json!({"groupId": "  ", "previewToken": "t", "mode": "fastForward"}),
+            ),
+        ] {
+            let error = parse_sync_selections(Some(&json!([item]))).unwrap_err();
+            assert!(!error.is_empty(), "{name}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 备份、写入与中断恢复（S6）
+    // ---------------------------------------------------------------------------
+
+    /// 目标会话行的可观测状态（用户 id、标题、自定义标题、更新时间、删除时间）。
+    type RowView = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    fn try_session_row(env: &Env, cid: &str) -> Option<RowView> {
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.query_row(
+            "SELECT user_id, title, custom_title, updated_at, deleted_at FROM sessions WHERE id = ?1",
+            [cid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .ok()
+    }
+
+    fn session_row(env: &Env, cid: &str) -> RowView {
+        try_session_row(env, cid).expect("会话行必须存在")
+    }
+
+    /// 改标题与自定义标题（模拟用户在目标账号改名；标题不是内容身份，不使预览失效）。
+    fn set_row_meta(env: &Env, cid: &str, title: &str, custom_title: Option<&str>) {
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET title = ?1, custom_title = ?2 WHERE id = ?3",
+            rusqlite::params![title, custom_title, cid],
+        )
+        .unwrap();
+    }
+
+    fn group_snapshot(env: &Env, group_id: &str) -> LinkGroup {
+        env.store()
+            .groups
+            .into_iter()
+            .find(|group| group.id == group_id)
+            .expect("关联组必须存在")
+    }
+
+    fn pair_ref_of(group: &LinkGroup, left_uid: &str, right_uid: &str) -> String {
+        session_link::find_pair_base(
+            group,
+            &member_id_of(group, left_uid),
+            &member_id_of(group, right_uid),
+        )
+        .expect("成员对基线必须存在")
+        .baseline_ref
+        .clone()
+    }
+
+    /// 同步后目标正文的预期内容：来源正文 + 目标 sessionId。
+    fn incoming_text(env: &Env, source_id: &str, target_id: &str) -> String {
+        std::fs::read_to_string(env.body_path(source_id))
+            .unwrap()
+            .replace(source_id, target_id)
+    }
+
+    /// 让 `sessions` 的 UPDATE 在事务内失败（模拟数据库写入阶段中断）。
+    fn install_block_update_trigger(env: &Env) {
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER block_sync_update BEFORE UPDATE ON sessions
+             BEGIN SELECT RAISE(ABORT, 'sessions 更新被测试拦截'); END;",
+        )
+        .unwrap();
+    }
+
+    fn drop_block_update_trigger(env: &Env) {
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute_batch("DROP TRIGGER block_sync_update;")
+            .unwrap();
+    }
+
+    fn body_bytes(env: &Env, cid: &str) -> Vec<u8> {
+        std::fs::read(env.body_path(cid)).unwrap()
+    }
+
+    fn sync_operations(env: &Env) -> Vec<Operation> {
+        session_link::scan_operations(&env.paths)
+            .operations
+            .into_iter()
+            .filter(|operation| operation.kind == OPERATION_KIND_SYNC)
+            .collect()
+    }
+
+    /// 成功路径：正文替换为来源内容，SID/标题/custom_title/归属保留，updated_at 更新，
+    /// A/B 基线推进、目标成员 lastSyncedAt 更新、不触碰映射库、备份可查看。
+    #[test]
+    fn sync_fast_forward_replaces_body_and_advances_pair_baseline() {
+        let env = ready_env("sync-ff-write");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let source_body = std::fs::read_to_string(env.body_path("sess-1")).unwrap();
+        let source_digest_before = full_digest_of(source_body.as_bytes());
+        let target_body_before = body_bytes(&env, &target_id);
+        // 目标账号已改过名：同步必须原样保留标题与自定义标题。
+        set_row_meta(&env, &target_id, "改名后的标题", Some("自定义名"));
+        let row_before = session_row(&env, &target_id);
+        let pair_ref_before = pair_ref_of(&group_snapshot(&env, &group_id), "uid-a", "uid-b");
+        let baselines_before = env.baseline_files();
+        let edge_db_before = std::fs::read(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report.get("needsRecovery").is_none(), "{report}");
+        let synced = report["synced"].as_array().unwrap();
+        assert_eq!(synced.len(), 1, "{report}");
+        assert_eq!(synced[0]["status"], "synced");
+        assert_eq!(synced[0]["groupId"], group_id);
+        assert_eq!(synced[0]["mode"], "fastForward");
+        assert_eq!(synced[0]["verdict"], "fastForward");
+        assert_eq!(synced[0]["sourceSessionId"], "sess-1");
+        assert_eq!(synced[0]["targetSessionId"], target_id);
+        assert_eq!(synced[0]["recordCount"]["source"], 5);
+        assert_eq!(synced[0]["recordCount"]["targetBefore"], 2);
+        assert_eq!(synced[0]["recordCount"]["target"], 5);
+
+        // 备份可查看：唯一目录 + 清单 + 一致性快照 + 正文备份与摘要在清单里。
+        let backup_dir = PathBuf::from(synced[0]["backup"].as_str().unwrap());
+        let manifest_file = PathBuf::from(synced[0]["backupManifest"].as_str().unwrap());
+        assert!(backup_dir.is_dir());
+        assert_eq!(
+            manifest_file,
+            backup_dir.join("manifest.json"),
+            "清单是恢复的唯一依据"
+        );
+        let manifest = load_sync_manifest(&backup_dir).expect("备份清单必须可读");
+        assert!(
+            backup_dir.ends_with(&manifest.operation_id),
+            "备份目录按 operationId 唯一"
+        );
+        assert_ne!(manifest.operation_id, group_id);
+        assert_eq!(manifest.group_id, group_id);
+        assert_eq!(manifest.variant, WbVariant::Cn);
+        assert_eq!(manifest.mode, SyncMode::FastForward);
+        assert_eq!(manifest.verdict, SyncVerdict::FastForward);
+        assert_eq!(manifest.source.uid, "uid-a");
+        assert_eq!(manifest.source.session_id, "sess-1");
+        assert_eq!(manifest.source.body_file, None);
+        assert_eq!(manifest.target.uid, "uid-b");
+        assert_eq!(manifest.target.session_id, target_id);
+        assert_eq!(
+            manifest.target_body_path,
+            env.body_path(&target_id).to_string_lossy()
+        );
+        assert!(backup_dir.join(&manifest.db.snapshot_file).is_file());
+        assert_eq!(manifest.db.method, DB_SNAPSHOT_METHOD);
+        // 恢复清单：路径、目标行、备份位置、恢复方法。
+        let before_row = manifest.db.target_row.as_ref().expect("必须记录目标行");
+        assert_eq!(before_row.session_id, target_id);
+        assert_eq!(before_row.user_id, "uid-b");
+        assert_eq!(before_row.title.as_deref(), Some("改名后的标题"));
+        assert_eq!(before_row.custom_title.as_deref(), Some("自定义名"));
+        assert_eq!(before_row.updated_at, row_before.3);
+        assert_eq!(before_row.deleted_at, None);
+        let original_backup = backup_dir.join(manifest.target.body_file.clone().unwrap());
+        assert_eq!(std::fs::read(&original_backup).unwrap(), target_body_before);
+        assert_eq!(
+            full_digest_of(&std::fs::read(&original_backup).unwrap()),
+            manifest.target.body_raw_digest
+        );
+        assert_eq!(manifest.target.record_count, 2);
+        assert_eq!(manifest.incoming.record_count, 5);
+        assert!(manifest.restore_steps.len() >= 4);
+        verify_sync_backup(&backup_dir, &manifest).expect("备份必须可核验");
+
+        // 目标正文被替换为来源内容（本副本 sessionId 换成目标 id）；来源正文不动。
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            full_digest_of(std::fs::read(env.body_path("sess-1")).unwrap().as_slice()),
+            source_digest_before
+        );
+
+        // 数据库：只更新 updated_at，SID/归属/标题/custom_title 原样保留。
+        let row_after = session_row(&env, &target_id);
+        assert_eq!(row_after.0, row_before.0);
+        assert_eq!(row_after.1, row_before.1);
+        assert_eq!(row_after.2, row_before.2);
+        assert_eq!(row_after.3, Some(manifest.db.new_updated_at));
+        assert!(row_after.3.unwrap() > row_before.3.unwrap());
+        assert_eq!(row_after.4, None);
+
+        // 组表：A/B 基线推进到新引用，目标成员 lastSyncedAt 更新。
+        let group = group_snapshot(&env, &group_id);
+        let pair_ref_after = pair_ref_of(&group, "uid-a", "uid-b");
+        assert_ne!(pair_ref_after, pair_ref_before);
+        assert_eq!(pair_ref_after, manifest.new_baseline_ref);
+        assert_eq!(env.baseline_files(), baselines_before + 1);
+        let baseline = session_link::load_baseline(&env.paths, &pair_ref_after).unwrap();
+        assert_eq!(
+            baseline.total_digest,
+            manifest.incoming.body_normalized_digest
+        );
+        assert_eq!(baseline.record_count, 5);
+        assert_eq!(
+            session_link::active_member_for(&group, "uid-b")
+                .unwrap()
+                .last_synced_at,
+            Some(manifest.last_synced_at)
+        );
+        assert!(session_link::active_member_for(&group, "uid-a")
+            .unwrap()
+            .last_synced_at
+            .is_none());
+
+        // 不修改 edge-sync-mapping 库；不产生第二个副本；操作日志只有一条且已完成。
+        assert_eq!(
+            std::fs::read(env.paths.edge_sync_db(WbVariant::Cn)).unwrap(),
+            edge_db_before
+        );
+        assert_eq!(env.body_files().len(), 2);
+        let operations = sync_operations(&env);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].phase, OpPhase::Completed);
+        assert_eq!(operations[0].target.session_id, target_id);
+        assert_eq!(
+            operations[0].backup.as_deref(),
+            Some(&*manifest_file.to_string_lossy())
+        );
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
+
+    /// 显式覆盖：目标全文被替换为来源内容（目标独有记录不再保留），仍然保留 SID/标题。
+    #[test]
+    fn sync_overwrite_replaces_target_full_text() {
+        let env = ready_env("sync-overwrite");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        // 双方都变化：来源追加 2 条，目标也追加 3 条 → diverge。
+        append_records(&env.body_path("sess-1"), "sess-1", 0, 2);
+        append_records(&env.body_path(&target_id), &target_id, 10, 3);
+        set_row_meta(&env, &target_id, "目标标题", Some("目标自定义名"));
+        let row_before = session_row(&env, &target_id);
+
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "diverge", "{preview}");
+        assert_eq!(group["defaultChecked"], false);
+        assert_eq!(group["availableModes"], json!(["overwrite"]));
+        assert_eq!(group["extraB"], 3);
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+        let token = group["previewToken"].as_str().unwrap().to_string();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::Overwrite)],
+        );
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected,
+            "覆盖必须替换目标全文"
+        );
+        let row_after = session_row(&env, &target_id);
+        assert_eq!(row_after.1.as_deref(), Some("目标标题"));
+        assert_eq!(row_after.2.as_deref(), Some("目标自定义名"));
+        assert_ne!(row_after.3, row_before.3);
+    }
+
+    /// 双方一致（identical）不写正文：既不发凭据，强行执行也会被拒绝。
+    #[test]
+    fn sync_identical_verdict_never_writes_body() {
+        let env = ready_env("sync-identical");
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        let target_id = env.first_copy_id(&report);
+        let target_before = body_bytes(&env, &target_id);
+        let revision_before = env.store().revision;
+
+        let preview = preview(&env, "uid-b");
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "identical", "{preview}");
+        assert_eq!(group["defaultChecked"], false);
+        assert_eq!(group["availableModes"], json!([]));
+        assert!(group.get("previewToken").is_none(), "不可执行的组不发凭据");
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+
+        // 伪造一份 identical 的服务端凭据强行覆盖：判定不允许该模式 → 拒绝，不写正文。
+        let paths = env.paths();
+        let store = env.store();
+        let g = store
+            .groups
+            .iter()
+            .find(|candidate| candidate.id == group_id)
+            .unwrap();
+        let source_member = session_link::active_member_for(g, "uid-a").unwrap();
+        let target_member = session_link::active_member_for(g, "uid-b").unwrap();
+        let source_content = member_content_state(&paths, &source_member.session_id);
+        let target_content = member_content_state(&paths, &target_member.session_id);
+        let baseline = session_link::load_pair_baseline(
+            &paths,
+            g,
+            &source_member.member_id,
+            &target_member.member_id,
+        );
+        assert_eq!(
+            session_link::decide_sync(&source_content, &target_content, &baseline).verdict,
+            SyncVerdict::Identical
+        );
+        let forged = session_link::save_preview_token(
+            &paths,
+            live_preview_binding(
+                g,
+                source_member,
+                target_member,
+                &source_content,
+                &target_content,
+                &baseline,
+                SyncVerdict::Identical,
+            ),
+        )
+        .unwrap();
+        for mode in [SyncMode::Overwrite, SyncMode::FastForward] {
+            let report = sync(&env, "uid-b", &[selection(&group_id, &forged, mode)]);
+            assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+            assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+            assert!(
+                report["errors"][0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("不允许以"),
+                "{report}"
+            );
+        }
+        assert_eq!(body_bytes(&env, &target_id), target_before);
+        assert_eq!(env.store().revision, revision_before);
+        assert_eq!(pair_snapshot(&env).len(), 1, "基线没有被推进");
+    }
+
+    /// 备份失败 → 零覆盖：正文、数据库、基线、关联版本都没有变化，也不留未完成操作。
+    #[test]
+    fn sync_backup_failure_leaves_target_and_store_untouched() {
+        let env = ready_env("sync-backup-fail");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let target_before = body_bytes(&env, &target_id);
+        let row_before = session_row(&env, &target_id);
+        let revision_before = env.store().revision;
+        let baselines_before = env.baseline_files();
+        let pairs_before = pair_snapshot(&env);
+
+        // 备份目录的父路径被占成普通文件 → 备份目录创建失败。
+        std::fs::create_dir_all(env.paths.backup_root()).unwrap();
+        std::fs::write(
+            env.paths.backup_root().join(SYNC_BACKUP_DIR_NAME),
+            b"occupied",
+        )
+        .unwrap();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("同步备份目录创建失败"), "{error}");
+
+        // 零写入：正文、数据库行、基线、关联版本原样保留。
+        assert_eq!(body_bytes(&env, &target_id), target_before);
+        assert_eq!(session_row(&env, &target_id), row_before);
+        assert_eq!(env.store().revision, revision_before);
+        assert_eq!(env.baseline_files(), baselines_before);
+        assert_eq!(pair_snapshot(&env), pairs_before);
+        // 备份没成功就什么都不能留下：没有未完成操作，也不需要恢复。
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+        assert!(sync_operations(&env).is_empty());
+        assert!(report.get("needsRecovery").is_none(), "{report}");
+    }
+
+    /// 正文写入阶段中断：不报成功、保留未完成操作、恢复后补完且不产生第二份。
+    #[cfg(unix)]
+    #[test]
+    fn sync_body_write_failure_keeps_pending_then_recovers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let env = ready_env("sync-body-fail");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let row_before = session_row(&env, &target_id);
+        let target_before = body_bytes(&env, &target_id);
+
+        let ws = env.paths.projects_dir().join("ws-a");
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::write(ws.join(".probe"), b"x").is_ok();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        std::fs::set_permissions(&ws, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable {
+            // root / 特殊 ACL 环境：写保护无效，跳过断言。
+            return;
+        }
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("同步正文写入失败"), "{error}");
+        assert_eq!(report["needsRecovery"], true);
+
+        // 正文与数据库都没变；备份已生成并留下未完成操作（阶段停在 Prepared）。
+        assert_eq!(body_bytes(&env, &target_id), target_before);
+        assert_eq!(session_row(&env, &target_id), row_before);
+        let pending = session_link::pending_operations(&env.paths, WbVariant::Cn);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, OpPhase::Prepared);
+        let operation_id = pending[0].operation_id.clone();
+        let backup_dir = PathBuf::from(pending[0].backup.clone().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manifest = load_sync_manifest(&backup_dir).expect("备份清单必须可读");
+
+        // 恢复：按同一份清单补完，复用同一个目标 UUID 与新基线引用。
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.recovered, vec![operation_id.clone()]);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_ne!(session_row(&env, &target_id).3, row_before.3);
+        assert_eq!(env.body_files().len(), 2, "恢复不得产生第二份副本");
+        assert_eq!(
+            pair_ref_of(&group_snapshot(&env, &group_id), "uid-a", "uid-b"),
+            manifest.new_baseline_ref,
+            "恢复复用同一个新基线引用"
+        );
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+        let operations = sync_operations(&env);
+        assert_eq!(operations.len(), 1, "不得新增第二条操作记录");
+        assert_eq!(operations[0].operation_id, operation_id);
+        assert_eq!(operations[0].phase, OpPhase::Completed);
+        assert_eq!(operations[0].target.session_id, target_id);
+    }
+
+    /// 数据库更新阶段中断：不报成功；解除故障后恢复补完，不产生第二份写入。
+    #[test]
+    fn sync_db_update_failure_is_not_reported_as_success_then_recovers() {
+        let env = ready_env("sync-db-fail");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let row_before = session_row(&env, &target_id);
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        let baselines_before = env.baseline_files();
+        let pairs_before = pair_snapshot(&env);
+
+        install_block_update_trigger(&env);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("目标会话行更新失败"), "{error}");
+        assert_eq!(report["needsRecovery"], true);
+
+        // 正文已写入，但数据库未更新：绝不报成功；组表也未提交。
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(session_row(&env, &target_id), row_before);
+        assert_eq!(env.baseline_files(), baselines_before);
+        assert_eq!(pair_snapshot(&env), pairs_before);
+        let pending = session_link::pending_operations(&env.paths, WbVariant::Cn);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, OpPhase::BodyWritten);
+        let manifest_dir = PathBuf::from(pending[0].backup.clone().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manifest = load_sync_manifest(&manifest_dir).unwrap();
+
+        // 同一组再次同步（故障未解除）：预览已过期，不得写入，也不得新建第二份。
+        let again = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(again["synced"].as_array().unwrap().is_empty(), "{again}");
+        assert!(again.get("needsRecovery").is_some(), "{again}");
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(env.body_files().len(), 2);
+
+        // 解除故障后恢复：补完数据库与组表，仍复用同一份清单与同一条操作记录。
+        drop_block_update_trigger(&env);
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.recovered.len(), 1, "{:?}", recovery.needs_recovery);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        assert_eq!(
+            session_row(&env, &target_id).3,
+            Some(manifest.db.new_updated_at)
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(env.body_files().len(), 2);
+        assert_eq!(env.baseline_files(), baselines_before + 1);
+        let group = group_snapshot(&env, &group_id);
+        assert_eq!(
+            pair_ref_of(&group, "uid-a", "uid-b"),
+            manifest.new_baseline_ref
+        );
+        assert_eq!(
+            session_link::active_member_for(&group, "uid-b")
+                .unwrap()
+                .last_synced_at,
+            Some(manifest.last_synced_at)
+        );
+        let operations = sync_operations(&env);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].phase, OpPhase::Completed);
+        assert_eq!(operations[0].target.session_id, target_id);
+    }
+
+    /// 组表提交阶段中断：正文与数据库已写、不报成功；恢复只补组表，不重放已完成阶段。
+    #[test]
+    fn sync_link_commit_failure_keeps_pending_then_recovers() {
+        let env = ready_env("sync-link-fail");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let row_before = session_row(&env, &target_id);
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        let baselines_before = env.baseline_files();
+        let revision_before = env.store().revision;
+
+        // 关联存储锁被占用：只有组表提交这一步会失败。
+        let held = session_link::try_lock_file(&env.paths.link_store_lock_file()).unwrap();
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        drop(held);
+
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["needsRecovery"], true);
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("关联存储"), "{error}");
+
+        // 正文与数据库都已写入，但组表未提交 → 阶段停在 DbWritten。
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_ne!(session_row(&env, &target_id).3, row_before.3);
+        assert_eq!(
+            env.baseline_files(),
+            baselines_before,
+            "组表未提交，基线文件也未落盘"
+        );
+        assert_eq!(env.store().revision, revision_before, "组表未写");
+        let pending = session_link::pending_operations(&env.paths, WbVariant::Cn);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].phase, OpPhase::DbWritten);
+        let manifest_dir = PathBuf::from(pending[0].backup.clone().unwrap())
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let manifest = load_sync_manifest(&manifest_dir).unwrap();
+
+        // 恢复：只补组表（复用清单里的新基线引用），不重写正文、不重复登记第二份。
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.recovered.len(), 1, "{:?}", recovery.needs_recovery);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        assert_eq!(env.store().revision, revision_before + 1, "组表只提交一次");
+        assert_eq!(env.baseline_files(), baselines_before + 1, "不新增重复基线");
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(
+            session_row(&env, &target_id).3,
+            Some(manifest.db.new_updated_at)
+        );
+        let group = group_snapshot(&env, &group_id);
+        assert_eq!(
+            pair_ref_of(&group, "uid-a", "uid-b"),
+            manifest.new_baseline_ref
+        );
+        assert_eq!(
+            session_link::active_member_for(&group, "uid-b")
+                .unwrap()
+                .last_synced_at,
+            Some(manifest.last_synced_at)
+        );
+        let operations = sync_operations(&env);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].phase, OpPhase::Completed);
+        assert_eq!(env.body_files().len(), 2);
+    }
+
+    /// 造一个「正文已写入、数据库未更新」的中断现场：返回 (目标会话 id, 覆盖前正文, 本次写入正文)。
+    fn interrupted_sync_scene(env: &Env) -> (String, Vec<u8>, String) {
+        let (group_id, token, target_id) = fast_forward_scene(env);
+        let target_before = body_bytes(env, &target_id);
+        install_block_update_trigger(env);
+        let report = sync(
+            env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert_eq!(report["needsRecovery"], true, "{report}");
+        drop_block_update_trigger(env);
+        let written = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+        assert_eq!(written, incoming_text(env, "sess-1", &target_id));
+        assert_eq!(
+            session_link::pending_operations(&env.paths, WbVariant::Cn)[0].phase,
+            OpPhase::BodyWritten
+        );
+        (target_id, target_before, written)
+    }
+
+    /// 恢复不覆盖后续无关修改：目标正文被改动过 → 停止恢复并要求人工处理。
+    #[test]
+    fn sync_recovery_stops_when_target_changed_after_interrupted_write() {
+        let env = ready_env("sync-recovery-unknown");
+        let (target_id, _, _) = interrupted_sync_scene(&env);
+        let baselines_before = env.baseline_files();
+        let pairs_before = pair_snapshot(&env);
+
+        // 官方 App / 用户对中间产物继续追加了内容：属于「未知内容」，不得覆盖。
+        append_records(&env.body_path(&target_id), &target_id, 100, 1);
+        let tampered = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(recovery.recovered.is_empty(), "{:?}", recovery.recovered);
+        assert_eq!(recovery.needs_recovery.len(), 1);
+        assert!(
+            !recovery.needs_recovery[0].retryable,
+            "未知内容必须暂停启动：{:?}",
+            recovery.needs_recovery[0]
+        );
+        assert!(
+            recovery.needs_recovery[0].reason.contains("不一致")
+                || recovery.needs_recovery[0].reason.contains("无法验证"),
+            "{}",
+            recovery.needs_recovery[0].reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            tampered,
+            "不得覆盖后续无关修改"
+        );
+        // 数据库与组表都保持原样，未完成操作保留待人工处理。
+        assert_eq!(env.baseline_files(), baselines_before);
+        assert_eq!(pair_snapshot(&env), pairs_before);
+        assert_eq!(
+            session_link::pending_operations(&env.paths, WbVariant::Cn).len(),
+            1
+        );
+        // 编排层据此暂停切换与启动 App。
+        assert!(crate::modules::switch::recovery_blocks_startup(&recovery));
+    }
+
+    /// 目标行更新时间被其它程序改动 → 停止恢复（不覆盖未知修改）。
+    #[test]
+    fn sync_recovery_stops_when_target_row_changed_after_write() {
+        let env = ready_env("sync-recovery-row-drift");
+        let (target_id, _, written) = interrupted_sync_scene(&env);
+
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET updated_at = 987654321 WHERE id = ?1",
+            [&target_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(recovery.recovered.is_empty(), "{:?}", recovery.recovered);
+        assert_eq!(recovery.needs_recovery.len(), 1);
+        assert!(!recovery.needs_recovery[0].retryable);
+        assert!(
+            recovery.needs_recovery[0].reason.contains("更新时间"),
+            "{}",
+            recovery.needs_recovery[0].reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            written
+        );
+    }
+
+    /// 目标行归属不符（被改到别的账号）→ 停止恢复，不报成功。
+    #[test]
+    fn sync_recovery_stops_when_target_row_owner_changed() {
+        let env = ready_env("sync-recovery-owner");
+        let (target_id, _, written) = interrupted_sync_scene(&env);
+
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET user_id = 'uid-x' WHERE id = ?1",
+            [&target_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(recovery.recovered.is_empty(), "{:?}", recovery.recovered);
+        assert_eq!(recovery.needs_recovery.len(), 1);
+        assert!(!recovery.needs_recovery[0].retryable);
+        assert!(
+            recovery.needs_recovery[0].reason.contains("归属"),
+            "{}",
+            recovery.needs_recovery[0].reason
+        );
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            written,
+            "归属异常时不得继续改写正文"
+        );
+        assert_eq!(
+            session_link::pending_operations(&env.paths, WbVariant::Cn).len(),
+            1
+        );
+    }
+
+    /// 目标行已不存在（硬删除）→ 无法补完，按备份回滚正文，不留无行的半成品。
+    #[test]
+    fn sync_recovery_rolls_back_body_when_target_row_is_gone() {
+        let env = ready_env("sync-recovery-row-gone");
+        let (target_id, target_before, _) = interrupted_sync_scene(&env);
+        let baselines_before = env.baseline_files();
+        env.delete_row(&target_id);
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.abandoned.len(), 1, "{:?}", recovery.recovered);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        assert_eq!(
+            body_bytes(&env, &target_id),
+            target_before,
+            "必须按备份回滚成覆盖前内容"
+        );
+        assert_eq!(env.baseline_files(), baselines_before, "基线未被提交");
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+        assert!(try_session_row(&env, &target_id).is_none(), "目标行已删除");
+    }
+
+    /// 目标行被软删除（deleted_at 非空）→ 同样无法补完，回滚正文并记为放弃。
+    #[test]
+    fn sync_recovery_rolls_back_body_when_target_row_is_soft_deleted() {
+        let env = ready_env("sync-recovery-row-deleted");
+        let (target_id, target_before, _) = interrupted_sync_scene(&env);
+        let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+        conn.execute(
+            "UPDATE sessions SET deleted_at = 123456 WHERE id = ?1",
+            [&target_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.abandoned.len(), 1, "{:?}", recovery.recovered);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        assert_eq!(body_bytes(&env, &target_id), target_before);
+        assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
+
+    /// 同一请求里重复勾选同一组：第一次写入后凭据即失效，第二次跳过，不重复写。
+    #[test]
+    fn sync_duplicate_selection_in_one_request_writes_once() {
+        let env = ready_env("sync-duplicate-selection");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let baselines_before = env.baseline_files();
+        let expected = incoming_text(&env, "sess-1", &target_id);
+        let once = selection(&group_id, &token, SyncMode::FastForward);
+
+        let report = sync(&env, "uid-b", &[once.clone(), once]);
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        let skipped = report["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "{report}");
+        assert_eq!(skipped[0]["reasonCode"], REASON_PREVIEW_STALE);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            expected
+        );
+        assert_eq!(env.body_files().len(), 2, "不得产生第二份副本");
+        assert_eq!(env.baseline_files(), baselines_before + 1, "只提交一次基线");
+        assert_eq!(sync_operations(&env).len(), 1, "只留一条同步操作");
+    }
+
+    /// 同一目标仍有未完成写入时，本轮不得再写一次（等恢复完成）。
+    #[test]
+    fn sync_refuses_to_write_while_previous_operation_is_unfinished() {
+        let env = ready_env("sync-pending-guard");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        let target_before = body_bytes(&env, &target_id);
+        let paths = env.paths();
+        // 手工留下一条缺备份清单的未完成同步操作：恢复无法完成它，只能保持 pending。
+        session_link::save_operation(
+            &paths,
+            &Operation {
+                version: OPERATION_VERSION,
+                operation_id: "op-sync-pending".to_string(),
+                kind: OPERATION_KIND_SYNC.to_string(),
+                variant: WbVariant::Cn,
+                group_id: group_id.clone(),
+                source: OperationMember {
+                    account_id: None,
+                    uid: "uid-a".to_string(),
+                    session_id: "sess-1".to_string(),
+                },
+                target: OperationMember {
+                    account_id: None,
+                    uid: "uid-b".to_string(),
+                    session_id: target_id.clone(),
+                },
+                expected_content_digest: "d".to_string(),
+                expected_record_count: 1,
+                phase: OpPhase::Prepared,
+                backup: None,
+                last_error: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["needsRecovery"], true, "{report}");
+        assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("上一次会话写入尚未完成"), "{error}");
+        assert_eq!(body_bytes(&env, &target_id), target_before);
+        assert_eq!(env.body_files().len(), 2);
+        assert_eq!(
+            session_link::pending_operations(&paths, WbVariant::Cn).len(),
+            1,
+            "旧操作保留待恢复，不新增待写操作"
+        );
+    }
+
+    /// 同步的备份清单被删/为空目录时不得盲目重放。
+    #[test]
+    fn sync_recovery_stops_without_usable_backup() {
+        let env = ready_env("sync-recovery-no-backup");
+        let (group_id, _token, target_id) = fast_forward_scene(&env);
+        let target_before = body_bytes(&env, &target_id);
+        let paths = env.paths();
+        session_link::save_operation(
+            &paths,
+            &Operation {
+                version: OPERATION_VERSION,
+                operation_id: "op-sync-no-backup".to_string(),
+                kind: OPERATION_KIND_SYNC.to_string(),
+                variant: WbVariant::Cn,
+                group_id,
+                source: OperationMember {
+                    account_id: None,
+                    uid: "uid-a".to_string(),
+                    session_id: "sess-1".to_string(),
+                },
+                target: OperationMember {
+                    account_id: None,
+                    uid: "uid-b".to_string(),
+                    session_id: target_id.clone(),
+                },
+                expected_content_digest: "d".to_string(),
+                expected_record_count: 1,
+                phase: OpPhase::BodyWritten,
+                backup: Some(
+                    env.paths
+                        .backup_root()
+                        .join("session-sync/cn/does-not-exist/manifest.json")
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+                last_error: None,
+                created_at: 1,
+                updated_at: 1,
+            },
+        )
+        .unwrap();
+
+        let recovery = recover_pending_session_operations_at(&paths, WbVariant::Cn);
+        assert!(recovery.recovered.is_empty(), "{:?}", recovery.recovered);
+        assert_eq!(recovery.needs_recovery.len(), 1);
+        assert!(!recovery.needs_recovery[0].retryable);
+        assert!(
+            recovery.needs_recovery[0].reason.contains("备份"),
+            "{}",
+            recovery.needs_recovery[0].reason
+        );
+        assert_eq!(body_bytes(&env, &target_id), target_before);
     }
 }

@@ -195,6 +195,7 @@ pub fn run() {
             commands::switch_account,
             commands::list_sessions,
             commands::copy_sessions,
+            commands::session_links_preview,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,

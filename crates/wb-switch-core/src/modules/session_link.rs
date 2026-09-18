@@ -4,6 +4,7 @@
 //!   - `session_links.json`                  关联组主表（version + revision + groups）
 //!   - `session-links/baselines/{ref}.json`  配对基线（有序行摘要 + 总摘要 + 记录数）
 //!   - `session-links/operations/{id}.json`  复制操作日志（阶段 + 预分配目标 UUID）
+//!   - `session-links/previews/{id}.json`    预览凭据（服务端保存的版本绑定，一次性的）
 //!   - `locks/session-ops-{variant}.lock`    档位操作锁（跨进程，覆盖整个会话操作）
 //!   - `locks/session-links.lock`            关联存储短时全局锁（读改写在锁内进行）
 //!
@@ -12,7 +13,11 @@
 //!
 //! 读取语义区分 Missing / Ready / Unavailable：只有「首次使用且没有任何未完成痕迹」
 //! 才按 Missing 初始化；损坏、权限失败、未知版本、主文件缺失但残留未完成操作或基线
-//! 一律 Unavailable——保留现场并禁止写入，不得降级成空表后保存。
+//! 一律 Unavailable——保留现场并禁止写入，不得降级成空表后保存。预览凭据不算痕迹
+//! （一次性、可随时重发），主文件缺失时不得据此拒绝初始化。
+//!
+//! 判定（design §3.2）由 [`decide_sync`] 承担：给定双方内容状态与配对共同基线即可确定
+//! 结果，不做任何 IO；差集多重集只用于解释记录数，不参与自动勾选。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -251,6 +256,17 @@ pub enum MemberState {
     Superseded,
 }
 
+impl MemberState {
+    /// 稳定字符串（组指纹与上报用；与 serde 输出保持一致，有单测守住）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberState::Active => "active",
+            MemberState::Stale => "stale",
+            MemberState::Superseded => "superseded",
+        }
+    }
+}
+
 /// 组内成员：某个账号上的某一个会话副本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,7 +293,7 @@ pub struct PairBase {
 }
 
 /// 基线记录本体：有序归一化行摘要 + 总摘要 + 记录数。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaselineRecord {
     pub version: u32,
@@ -296,6 +312,259 @@ impl BaselineRecord {
             && self.record_count == self.line_digests.len()
             && self.total_digest == total_digest_of(&self.line_digests)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 同步判定（design §3.2）
+// ---------------------------------------------------------------------------
+
+/// 配对共同基线的可用状态。
+///
+/// 这是判定输入的一部分（不含 IO），调用方负责先读文件再传进来，
+/// [`decide_sync`] 因此是纯函数：同样的输入必然得到同样的判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaselineState {
+    /// 可验证的共同基线：文件自洽且归一化版本一致。
+    Ready(BaselineRecord),
+    /// 该成员对从未建立过基线。
+    Missing,
+    /// 有基线引用但内容不可验证（文件缺失/损坏/归一化版本不符）。
+    Unverifiable(String),
+}
+
+impl BaselineState {
+    pub fn ready(&self) -> Option<&BaselineRecord> {
+        match self {
+            BaselineState::Ready(record) => Some(record),
+            _ => None,
+        }
+    }
+
+    /// 不可验证时的说明；[`BaselineState::Ready`] 返回 None。
+    pub fn unusable_reason(&self) -> Option<String> {
+        match self {
+            BaselineState::Ready(_) => None,
+            BaselineState::Missing => Some("该成员对没有可验证的共同基线，不提供同步".to_string()),
+            BaselineState::Unverifiable(reason) => {
+                Some(format!("共同基线不可验证（{reason}），不提供同步"))
+            }
+        }
+    }
+}
+
+/// 同步判定结果（design §3.2 优先级表的取值）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncVerdict {
+    /// 双方有序内容一致：不写正文。
+    Identical,
+    /// 目标等于共同基线、来源是它的严格有序追加：默认勾选快进。
+    FastForward,
+    /// 来源等于共同基线、目标已变化：仅目标变化，不写目标。
+    Ahead,
+    /// 双方都有变化，或来源重写/重排/压缩：默认不勾，可显式覆盖。
+    Diverge,
+    /// 成员/文件无效、内容不可验证或缺可验证基线：禁止同步。
+    Unknown,
+}
+
+impl SyncVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncVerdict::Identical => "identical",
+            SyncVerdict::FastForward => "fastForward",
+            SyncVerdict::Ahead => "ahead",
+            SyncVerdict::Diverge => "diverge",
+            SyncVerdict::Unknown => "unknown",
+        }
+    }
+
+    /// 是否允许用户勾选执行：ahead 由目标侧承担、identical 无需动作，
+    /// unknown 一律禁止（含显式覆盖）。
+    pub fn is_actionable(self) -> bool {
+        matches!(self, SyncVerdict::FastForward | SyncVerdict::Diverge)
+    }
+
+    /// 该判定允许的写入模式。unknown 不匹配任何模式——覆盖不能绕过未知。
+    pub fn allows(self, mode: SyncMode) -> bool {
+        match mode {
+            SyncMode::FastForward => self == SyncVerdict::FastForward,
+            SyncMode::Overwrite => self == SyncVerdict::Diverge,
+        }
+    }
+
+    /// 前端可选的写入模式（空表示不可勾选）。
+    pub fn available_modes(self) -> Vec<SyncMode> {
+        match self {
+            SyncVerdict::FastForward => vec![SyncMode::FastForward],
+            SyncVerdict::Diverge => vec![SyncMode::Overwrite],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// 同步写入模式（design §6 的 `mode`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncMode {
+    /// 目标未偏离基线时，把来源的新增记录追加到目标（默认勾选）。
+    FastForward,
+    /// 用户显式选择的覆盖：必须仍为有效可比较的冲突。
+    Overwrite,
+}
+
+impl SyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncMode::FastForward => "fastForward",
+            SyncMode::Overwrite => "overwrite",
+        }
+    }
+
+    /// 解析前端传入的模式；未知值直接拒绝，不回落默认值。
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "fastForward" => Ok(SyncMode::FastForward),
+            "overwrite" => Ok(SyncMode::Overwrite),
+            other => Err(format!("未知的同步模式：{other}")),
+        }
+    }
+}
+
+/// 判定结果：verdict、默认勾选与解释性记录数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncDecision {
+    pub verdict: SyncVerdict,
+    /// 来源独有记录数（多重集差集）。只用于向用户解释，不参与判定。
+    pub extra_a: usize,
+    /// 目标独有记录数（多重集差集）。只用于向用户解释，不参与判定。
+    pub extra_b: usize,
+    /// 双方共有记录数（多重集交集）。只用于向用户解释，不参与判定。
+    pub common: usize,
+    /// 是否默认勾选：只有 fastForward 为 true。
+    pub default_checked: bool,
+    pub reason: String,
+}
+
+impl SyncDecision {
+    /// 禁止同步：任何模式都不得写入。
+    pub fn unknown(reason: impl Into<String>) -> Self {
+        Self {
+            verdict: SyncVerdict::Unknown,
+            extra_a: 0,
+            extra_b: 0,
+            common: 0,
+            default_checked: false,
+            reason: reason.into(),
+        }
+    }
+
+    fn decide(verdict: SyncVerdict, counts: (usize, usize, usize), reason: String) -> Self {
+        Self {
+            verdict,
+            extra_a: counts.0,
+            extra_b: counts.1,
+            common: counts.2,
+            default_checked: verdict == SyncVerdict::FastForward,
+            reason,
+        }
+    }
+}
+
+/// 逐行摘要的多重集差集：`extra_a` 来源独有、`extra_b` 目标独有、`common` 双方共有。
+///
+/// 只用于向用户解释记录数（design §3.2）：即使 `extra_b == 0` 也不代表顺序与语义无损，
+/// 因此本函数的结果不得参与自动勾选——没有「共同占比」之类的阈值判定。
+fn multiset_counts(source: &[String], target: &[String]) -> (usize, usize, usize) {
+    let mut remaining: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for digest in target {
+        *remaining.entry(digest.as_str()).or_insert(0) += 1;
+    }
+    let mut common = 0usize;
+    for digest in source {
+        if let Some(count) = remaining.get_mut(digest.as_str()) {
+            if *count > 0 {
+                *count -= 1;
+                common += 1;
+            }
+        }
+    }
+    (source.len() - common, target.len() - common, common)
+}
+
+/// 判定来源 A 与目标 B 能否同步（design §3.2，顺序不可调换）。
+///
+/// 1. 成员/文件无效或内容不可验证 → [`SyncVerdict::Unknown`]；
+/// 2. A 与 B 有序一致 → [`SyncVerdict::Identical`]；
+/// 3. 无可验证共同基线 → [`SyncVerdict::Unknown`]；
+/// 4. B 等于基线且 A 是基线的严格有序追加 → [`SyncVerdict::FastForward`]；
+/// 5. A 等于基线、B 已变化 → [`SyncVerdict::Ahead`]；
+/// 6. 其余（双方变化、来源重写/重排/压缩）→ [`SyncVerdict::Diverge`]。
+///
+/// 纯函数：不读文件、不写文件、无时间依赖。
+pub fn decide_sync(
+    source: &ContentState,
+    target: &ContentState,
+    baseline: &BaselineState,
+) -> SyncDecision {
+    let (source, target) = match (source, target) {
+        (ContentState::Ready(source), ContentState::Ready(target)) => (source, target),
+        (ContentState::Missing, _) => return SyncDecision::unknown("来源正文不存在，内容不可验证"),
+        (ContentState::Unavailable(reason), _) => {
+            return SyncDecision::unknown(format!("来源正文无法验证：{reason}"))
+        }
+        (_, ContentState::Missing) => return SyncDecision::unknown("目标正文不存在，内容不可验证"),
+        (_, ContentState::Unavailable(reason)) => {
+            return SyncDecision::unknown(format!("目标正文无法验证：{reason}"))
+        }
+    };
+    let counts = multiset_counts(
+        &source.normalized.line_digests,
+        &target.normalized.line_digests,
+    );
+
+    if source.normalized.line_digests == target.normalized.line_digests {
+        return SyncDecision::decide(
+            SyncVerdict::Identical,
+            counts,
+            format!(
+                "双方记录数一致（{} 条），无需写入",
+                source.normalized.record_count
+            ),
+        );
+    }
+    let Some(record) = baseline.ready() else {
+        return SyncDecision::unknown(
+            baseline
+                .unusable_reason()
+                .unwrap_or_else(|| "缺少可验证的共同基线".to_string()),
+        );
+    };
+    if target.normalized.line_digests == record.line_digests
+        && is_strict_ordered_extension(&record.line_digests, &source.normalized.line_digests)
+    {
+        let added = source.normalized.record_count - record.record_count;
+        return SyncDecision::decide(
+            SyncVerdict::FastForward,
+            counts,
+            format!("目标未偏离共同基线，来源新增 {added} 条记录，可快进"),
+        );
+    }
+    if source.normalized.line_digests == record.line_digests {
+        return SyncDecision::decide(
+            SyncVerdict::Ahead,
+            counts,
+            format!("仅目标有变化（目标独有 {} 条记录），本次不同步", counts.1),
+        );
+    }
+    SyncDecision::decide(
+        SyncVerdict::Diverge,
+        counts,
+        format!(
+            "双方都有变化或来源已重写（目标独有 {} 条记录）；覆盖会替换目标全文",
+            counts.1
+        ),
+    )
 }
 
 /// 操作日志（design §2 Operation / §4）。
@@ -827,6 +1096,248 @@ pub fn inheritable_baseline(
         return None;
     }
     Some(record)
+}
+
+/// 读取某个成员对的共同基线状态（供判定使用，见 [`BaselineState`]）。
+///
+/// 归一化版本不符、文件缺失或损坏都返回 [`BaselineState::Unverifiable`]——
+/// 不能与「从未建立过基线」混为一谈，两者都不允许快进。
+pub fn load_pair_baseline(
+    paths: &SessionPaths,
+    group: &LinkGroup,
+    member_a: &str,
+    member_b: &str,
+) -> BaselineState {
+    let Some(pair) = find_pair_base(group, member_a, member_b) else {
+        return BaselineState::Missing;
+    };
+    if pair.normalization_version != NORMALIZATION_VERSION {
+        return BaselineState::Unverifiable(format!(
+            "归一化版本 {} 不受支持（当前 {}）",
+            pair.normalization_version, NORMALIZATION_VERSION
+        ));
+    }
+    match load_baseline(paths, &pair.baseline_ref) {
+        Some(record) => BaselineState::Ready(record),
+        None => BaselineState::Unverifiable("基线文件缺失或内容不自洽".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 预览凭据（design §6）
+// ---------------------------------------------------------------------------
+
+/// 预览凭据格式版本；读到其它版本一律视为过期。
+pub const PREVIEW_TOKEN_VERSION: u32 = 1;
+/// 每档位保留的历史预览凭据条数（凭据是一次性的，不做长期保留）。
+pub const KEEP_PREVIEW_TOKENS: usize = 200;
+
+/// 预览时记录的单个成员绑定：执行前逐项核对，任何一项变化都算预览过期。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewMemberBinding {
+    pub member_id: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub uid: String,
+    pub session_id: String,
+    /// 原始正文摘要（含空白）：预览之后正文有任何改动都会失配。
+    pub raw_digest: String,
+    /// 归一化总摘要：判定的依据。
+    pub normalized_digest: String,
+    /// 记录数（不称消息数）。
+    pub record_count: usize,
+}
+
+/// 预览凭据绑定的全部版本信息：身份、组与基线版本、双方原始正文摘要、判定结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewBinding {
+    pub variant: WbVariant,
+    pub group_id: String,
+    /// 组结构指纹（成员身份/状态 + 配对基线引用）。
+    pub group_fingerprint: String,
+    pub source: PreviewMemberBinding,
+    pub target: PreviewMemberBinding,
+    #[serde(default)]
+    pub baseline_ref: Option<String>,
+    #[serde(default)]
+    pub baseline_total_digest: Option<String>,
+    #[serde(default)]
+    pub baseline_record_count: Option<usize>,
+    pub verdict: SyncVerdict,
+}
+
+/// 服务端保存的预览凭据。
+///
+/// 前端只拿得到 `preview_id`，绑定内容保存在服务端：伪造或篡改前端参数都不能扩大权限。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewToken {
+    pub version: u32,
+    pub preview_id: String,
+    pub created_at: i64,
+    pub binding: PreviewBinding,
+}
+
+/// 组结构指纹：成员（id/身份/状态）与配对基线引用，顺序无关。
+///
+/// 组内任何成员替换或基线变化都会改变指纹，因此可用作预览凭据的「组版本」。
+/// 其它组的变化不会影响本指纹，避免同一次切换里的复制误伤无关组的预览。
+pub fn group_fingerprint(group: &LinkGroup) -> String {
+    let mut members: Vec<String> = group
+        .members
+        .iter()
+        .map(|member| {
+            format!(
+                "{}|{}|{}|{}",
+                member.member_id,
+                member.uid,
+                member.session_id,
+                member.state.as_str()
+            )
+        })
+        .collect();
+    members.sort();
+    let mut pairs: Vec<String> = group
+        .pair_bases
+        .iter()
+        .map(|pair| {
+            format!(
+                "{}|{}|{}|{}",
+                pair.member_ids[0],
+                pair.member_ids[1],
+                pair.baseline_ref,
+                pair.normalization_version
+            )
+        })
+        .collect();
+    pairs.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"wb-switch-group-v1\0");
+    hasher.update(group.variant.as_str().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(group.id.as_bytes());
+    hasher.update([0u8]);
+    for entry in members {
+        hasher.update(entry.as_bytes());
+        hasher.update([0u8]);
+    }
+    for entry in pairs {
+        hasher.update(entry.as_bytes());
+        hasher.update([0u8]);
+    }
+    to_hex(&hasher.finalize())
+}
+
+/// 凭据 id 必须是本模块生成的 UUID：拒绝路径穿越等构造值。
+pub fn valid_preview_id(preview_id: &str) -> bool {
+    uuid::Uuid::parse_str(preview_id.trim()).is_ok()
+}
+
+fn preview_file(paths: &SessionPaths, preview_id: &str) -> PathBuf {
+    paths
+        .preview_tokens_dir()
+        .join(format!("{preview_id}.json"))
+}
+
+/// 保存一份预览绑定并返回凭据 id。
+pub fn save_preview_token(paths: &SessionPaths, binding: PreviewBinding) -> Result<String, String> {
+    let preview_id = uuid::Uuid::new_v4().to_string();
+    let token = PreviewToken {
+        version: PREVIEW_TOKEN_VERSION,
+        preview_id: preview_id.clone(),
+        created_at: now_ms(),
+        binding,
+    };
+    std::fs::create_dir_all(paths.preview_tokens_dir()).map_err(|error| error.to_string())?;
+    // 先清理再写入：清理按时间排序，刚保存的凭据不会被自己的清理删掉
+    // （不受文件系统时间戳精度影响）。
+    prune_preview_tokens(paths, KEEP_PREVIEW_TOKENS.saturating_sub(1));
+    let content = serde_json::to_string_pretty(&token).map_err(|error| error.to_string())?;
+    atomic_write(&preview_file(paths, &preview_id), &content)
+        .map_err(|error| format!("预览凭据写入失败：{error}"))?;
+    Ok(preview_id)
+}
+
+/// 读取预览凭据；id 非法、文件缺失/损坏、版本不符一律返回 None（视为过期）。
+pub fn load_preview_token(paths: &SessionPaths, preview_id: &str) -> Option<PreviewToken> {
+    if !valid_preview_id(preview_id) {
+        return None;
+    }
+    let text = std::fs::read_to_string(preview_file(paths, preview_id.trim())).ok()?;
+    let token: PreviewToken = serde_json::from_str(&text).ok()?;
+    (token.version == PREVIEW_TOKEN_VERSION && token.preview_id == preview_id.trim())
+        .then_some(token)
+}
+
+/// 清理历史预览凭据，保留最近 `keep` 条。
+pub fn prune_preview_tokens(paths: &SessionPaths, keep: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(paths.preview_tokens_dir()) else {
+        return 0;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|entry| {
+            let stamp = entry.metadata().ok()?.modified().ok()?;
+            Some((stamp, entry.path()))
+        })
+        .collect();
+    if files.len() <= keep {
+        return 0;
+    }
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut removed = 0usize;
+    for (_, path) in files.into_iter().skip(keep) {
+        if std::fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 核对预览凭据与实时状态，返回不一致项的说明（空表示一致，可以继续）。
+///
+/// 逐字段比较而不是整体比较，是为了给用户「哪一项变了」的可读原因。任何不一致都必须
+/// 跳过该项，不得沿用用户旧选择（design §5.2）。
+pub fn verify_preview(preview: &PreviewToken, live: &PreviewBinding) -> Vec<String> {
+    let mut stale: Vec<String> = Vec::new();
+    if preview.version != PREVIEW_TOKEN_VERSION {
+        stale.push("预览凭据版本不受支持".to_string());
+    }
+    let expected = &preview.binding;
+    if expected.variant != live.variant {
+        stale.push("档位已变化".to_string());
+    }
+    if expected.group_id != live.group_id {
+        stale.push("关联组已变化".to_string());
+    }
+    if expected.group_fingerprint != live.group_fingerprint {
+        stale.push("关联组或配对基线已变化".to_string());
+    }
+    if expected.source != live.source {
+        stale.push("来源正文或成员已变化".to_string());
+    }
+    if expected.target != live.target {
+        stale.push("目标正文或成员已变化".to_string());
+    }
+    if expected.baseline_ref != live.baseline_ref {
+        stale.push("配对基线已变化".to_string());
+    } else if expected.baseline_total_digest != live.baseline_total_digest
+        || expected.baseline_record_count != live.baseline_record_count
+    {
+        stale.push("配对基线内容已变化".to_string());
+    }
+    if expected.verdict != live.verdict {
+        stale.push(format!(
+            "判定结果已变化（{} → {}）",
+            expected.verdict.as_str(),
+            live.verdict.as_str()
+        ));
+    }
+    stale
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,5 +2130,620 @@ mod tests {
         }
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    // -----------------------------------------------------------------------
+    // 同步判定（design §3.2）
+    // -----------------------------------------------------------------------
+
+    /// `count` 条有序记录（index 递增，便于构造严格有序追加）。
+    fn records(count: usize, from: usize) -> String {
+        (from..from + count)
+            .map(|index| format!("{{\"type\":\"assistant\",\"index\":{index}}}\n"))
+            .collect()
+    }
+
+    /// 按给定 index 顺序构造正文（制造重排用）。
+    fn records_in_order(order: &[usize]) -> String {
+        order
+            .iter()
+            .map(|index| format!("{{\"type\":\"assistant\",\"index\":{index}}}\n"))
+            .collect()
+    }
+
+    fn normalized_from(text: &str) -> NormalizedContent {
+        normalize_jsonl(text, "sess").expect("测试正文必须可归一化")
+    }
+
+    fn content_from(text: &str) -> ContentState {
+        ContentState::Ready(ContentSnapshot {
+            text: text.to_string(),
+            full_digest: full_digest_of(text.as_bytes()),
+            normalized: normalized_from(text),
+        })
+    }
+
+    fn baseline_from(text: &str) -> BaselineRecord {
+        let normalized = normalized_from(text);
+        BaselineRecord {
+            version: BASELINE_VERSION,
+            baseline_ref: "base-x".to_string(),
+            normalization_version: NORMALIZATION_VERSION,
+            created_at: 1,
+            record_count: normalized.record_count,
+            total_digest: normalized.total_digest,
+            line_digests: normalized.line_digests,
+        }
+    }
+
+    /// A 与 B 有序内容一致 → identical（无需基线；有基线也一样）。
+    #[test]
+    fn verdict_identical_does_not_write_body() {
+        let body = records(4, 0);
+        for baseline in [
+            BaselineState::Missing,
+            BaselineState::Ready(baseline_from(&body)),
+        ] {
+            let decision = decide_sync(&content_from(&body), &content_from(&body), &baseline);
+            assert_eq!(decision.verdict, SyncVerdict::Identical);
+            assert!(!decision.default_checked);
+            assert!(decision.verdict.available_modes().is_empty());
+            assert!(decision.reason.contains("记录"), "{}", decision.reason);
+        }
+    }
+
+    /// 快进样例：共同基线 X、B = X、A = X + 3 条有序记录 → 默认勾选，extraB = 0。
+    #[test]
+    fn verdict_fast_forward_when_target_keeps_baseline_and_source_appends() {
+        let base = records(5, 0);
+        let source = records(8, 0);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&base),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::FastForward);
+        assert!(decision.default_checked, "只有快进默认勾选");
+        assert_eq!(decision.extra_a, 3);
+        assert_eq!(decision.extra_b, 0);
+        assert_eq!(decision.common, 5);
+        assert_eq!(
+            decision.verdict.available_modes(),
+            vec![SyncMode::FastForward]
+        );
+        assert!(
+            decision.reason.contains("新增 3 条记录"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    /// 目标变化样例：A = X、B = X + 5 条 → ahead，仅目标变化，不写目标。
+    #[test]
+    fn verdict_ahead_when_only_target_changed() {
+        let base = records(5, 0);
+        let target = records(10, 0);
+        let decision = decide_sync(
+            &content_from(&base),
+            &content_from(&target),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Ahead);
+        assert!(!decision.default_checked);
+        assert_eq!(decision.extra_a, 0);
+        assert_eq!(decision.extra_b, 5);
+        assert!(
+            decision.verdict.available_modes().is_empty(),
+            "ahead 不可勾选"
+        );
+        assert!(
+            decision.reason.contains("仅目标有变化"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    /// 双方都变化 → diverge：默认不勾，但可显式覆盖。
+    #[test]
+    fn verdict_diverge_when_both_sides_changed() {
+        let base = records(5, 0);
+        let decision = decide_sync(
+            &content_from(&records(7, 0)),
+            &content_from(&records(10, 0)),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Diverge);
+        assert!(!decision.default_checked);
+        assert_eq!(
+            decision.verdict.available_modes(),
+            vec![SyncMode::Overwrite]
+        );
+        assert!(
+            decision.verdict.allows(SyncMode::Overwrite),
+            "有效可比较的冲突才允许显式覆盖"
+        );
+        assert!(!decision.verdict.allows(SyncMode::FastForward));
+        assert!(
+            decision.reason.contains("替换目标全文"),
+            "{}",
+            decision.reason
+        );
+    }
+
+    /// 来源重写/压缩 → diverge，不得当成快进。
+    #[test]
+    fn verdict_diverge_when_source_rewritten_or_compacted() {
+        let base = records(5, 0);
+        let ready = BaselineState::Ready(baseline_from(&base));
+
+        // 压缩：来源比基线还短。
+        let compacted = decide_sync(&content_from(&records(3, 0)), &content_from(&base), &ready);
+        assert_eq!(compacted.verdict, SyncVerdict::Diverge);
+
+        // 重写：同样条数但内容不同。
+        let rewritten_text = records(5, 100);
+        let rewritten = decide_sync(&content_from(&rewritten_text), &content_from(&base), &ready);
+        assert_eq!(rewritten.verdict, SyncVerdict::Diverge);
+
+        // 目标侧被重写、来源等于基线 → ahead（只报目标变化，不写目标）。
+        let target_rewritten =
+            decide_sync(&content_from(&base), &content_from(&rewritten_text), &ready);
+        assert_eq!(target_rewritten.verdict, SyncVerdict::Ahead);
+    }
+
+    /// 相同多重集、顺序不同 → 不得判快进（extraB 为 0 也不代表安全）。
+    #[test]
+    fn verdict_diverge_for_same_multiset_in_different_order() {
+        let base_order = vec![0usize, 1, 2, 3];
+        let base = records_in_order(&base_order);
+        let source = records_in_order(&[0, 1, 3, 2]);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&base),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Diverge);
+        assert!(!decision.default_checked);
+        assert_eq!(decision.extra_a, 0, "多重集相同：差集为 0 只是解释信息");
+        assert_eq!(decision.extra_b, 0);
+        assert_eq!(decision.common, 4);
+    }
+
+    /// 缺少可验证基线 / 内容不可验证 → unknown，禁止任何模式（含显式覆盖）。
+    #[test]
+    fn verdict_unknown_without_verifiable_baseline_or_content() {
+        let base = records(5, 0);
+        let source = records(8, 0);
+
+        for (name, baseline) in [
+            ("缺少基线引用", BaselineState::Missing),
+            (
+                "基线不可验证",
+                BaselineState::Unverifiable("基线文件缺失或内容不自洽".to_string()),
+            ),
+        ] {
+            let decision = decide_sync(&content_from(&source), &content_from(&base), &baseline);
+            assert_eq!(decision.verdict, SyncVerdict::Unknown, "{name}");
+            assert!(!decision.default_checked, "{name}");
+            assert!(decision.verdict.available_modes().is_empty(), "{name}");
+            assert!(
+                !decision.verdict.allows(SyncMode::Overwrite),
+                "{name}：unknown 不得被覆盖"
+            );
+            assert!(!decision.reason.is_empty(), "{name}");
+        }
+        assert_eq!(
+            BaselineState::Ready(baseline_from(&base)).unusable_reason(),
+            None
+        );
+        assert!(BaselineState::Missing
+            .unusable_reason()
+            .unwrap()
+            .contains("没有可验证的共同基线"));
+
+        // 正文不可验证：缺失/截断/非法一律不得默认快进。
+        let ready = BaselineState::Ready(baseline_from(&base));
+        for (name, source, target) in [
+            ("来源缺失", ContentState::Missing, content_from(&base)),
+            (
+                "来源不可验证",
+                ContentState::Unavailable("第 3 行不是合法 JSON".to_string()),
+                content_from(&base),
+            ),
+            (
+                "目标不可验证",
+                content_from(&source),
+                ContentState::Unavailable("正文读取失败".to_string()),
+            ),
+        ] {
+            let decision = decide_sync(&source, &target, &ready);
+            assert_eq!(decision.verdict, SyncVerdict::Unknown, "{name}");
+            assert!(!decision.default_checked, "{name}");
+            assert!(decision.verdict.available_modes().is_empty(), "{name}");
+            assert!(
+                !decision.verdict.allows(SyncMode::Overwrite),
+                "{name}：内容不可验证时禁止覆盖"
+            );
+        }
+    }
+
+    /// 长时间正常追加（远超 50%）不得因「共同占比低」被误判。
+    #[test]
+    fn verdict_fast_forward_survives_large_ordered_append() {
+        let base = records(5, 0);
+        let decision = decide_sync(
+            &content_from(&records(205, 0)),
+            &content_from(&base),
+            &BaselineState::Ready(baseline_from(&base)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::FastForward);
+        assert!(decision.default_checked);
+        assert_eq!(decision.extra_a, 200);
+        assert_eq!(decision.extra_b, 0);
+        assert_eq!(decision.common, 5, "共同记录只占 2%，仍应判快进");
+    }
+
+    /// 判定/模式的字符串契约与 serde 输出一致，且 unknown 不接受任何模式。
+    #[test]
+    fn verdict_and_mode_string_contract() {
+        for verdict in [
+            SyncVerdict::Identical,
+            SyncVerdict::FastForward,
+            SyncVerdict::Ahead,
+            SyncVerdict::Diverge,
+            SyncVerdict::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_value(verdict).unwrap().as_str().unwrap(),
+                verdict.as_str()
+            );
+            assert_eq!(
+                verdict.allows(SyncMode::FastForward) || verdict.allows(SyncMode::Overwrite),
+                verdict.is_actionable()
+            );
+        }
+        for mode in [SyncMode::FastForward, SyncMode::Overwrite] {
+            assert_eq!(
+                serde_json::to_value(mode).unwrap().as_str().unwrap(),
+                mode.as_str()
+            );
+            assert_eq!(SyncMode::parse(mode.as_str()).unwrap(), mode);
+        }
+        assert!(SyncMode::parse(" overwrite ").is_ok());
+        assert!(SyncMode::parse("force").unwrap_err().contains("force"));
+
+        assert!(SyncVerdict::FastForward.allows(SyncMode::FastForward));
+        assert!(!SyncVerdict::FastForward.allows(SyncMode::Overwrite));
+        assert!(SyncVerdict::Diverge.allows(SyncMode::Overwrite));
+        for verdict in [
+            SyncVerdict::Unknown,
+            SyncVerdict::Ahead,
+            SyncVerdict::Identical,
+        ] {
+            assert!(!verdict.allows(SyncMode::FastForward), "{verdict:?}");
+            assert!(!verdict.allows(SyncMode::Overwrite), "{verdict:?}");
+        }
+    }
+
+    /// 文案统一称「记录数」，不得把 JSONL 行数叫「消息数」。
+    #[test]
+    fn verdict_reasons_use_record_wording() {
+        let base = records(5, 0);
+        let ready = BaselineState::Ready(baseline_from(&base));
+        let decisions = [
+            decide_sync(&content_from(&base), &content_from(&base), &ready),
+            decide_sync(&content_from(&records(8, 0)), &content_from(&base), &ready),
+            decide_sync(&content_from(&base), &content_from(&records(9, 0)), &ready),
+            decide_sync(
+                &content_from(&records(7, 0)),
+                &content_from(&records(9, 0)),
+                &ready,
+            ),
+            decide_sync(
+                &content_from(&base),
+                &content_from(&base),
+                &BaselineState::Missing,
+            ),
+        ];
+        for decision in &decisions {
+            assert!(
+                !decision.reason.contains("消息"),
+                "不得把记录数叫消息数：{}",
+                decision.reason
+            );
+        }
+        for decision in &decisions[..4] {
+            assert!(decision.reason.contains("记录"), "{}", decision.reason);
+        }
+    }
+
+    /// 成员状态字符串契约与 serde 输出一致。
+    #[test]
+    fn member_state_string_contract() {
+        for state in [
+            MemberState::Active,
+            MemberState::Stale,
+            MemberState::Superseded,
+        ] {
+            assert_eq!(
+                serde_json::to_value(state).unwrap().as_str().unwrap(),
+                state.as_str()
+            );
+        }
+    }
+
+    /// 组指纹：成员身份/状态与配对基线引用参与，组内顺序无关；其它组的成员不影响它。
+    #[test]
+    fn group_fingerprint_tracks_members_and_pair_bases() {
+        let mut group = group_with_members(
+            "g-1",
+            vec![
+                member("uid-a", "sess-1", MemberState::Active),
+                member("uid-b", "sess-b", MemberState::Active),
+            ],
+        );
+        set_pair_base(&mut group, "m-uid-a-sess-1", "m-uid-b-sess-b", "base-ab", 1);
+        let baseline = group_fingerprint(&group);
+
+        // 顺序无关：同一集合换个书写顺序指纹不变。
+        group.members.reverse();
+        assert_eq!(group_fingerprint(&group), baseline);
+        group.members.reverse();
+
+        // 状态变化 / 新增成员 / 基线变化都会改变指纹。
+        set_member_state(&mut group, "m-uid-b-sess-b", MemberState::Stale);
+        let stale = group_fingerprint(&group);
+        assert_ne!(stale, baseline);
+        set_member_state(&mut group, "m-uid-b-sess-b", MemberState::Active);
+        assert_eq!(group_fingerprint(&group), baseline);
+
+        let mut added = group.clone();
+        add_active_member(&mut added, member("uid-c", "sess-c", MemberState::Active));
+        assert_ne!(group_fingerprint(&added), baseline, "新增成员必须改变指纹");
+
+        let mut rebased = group.clone();
+        set_pair_base(
+            &mut rebased,
+            "m-uid-a-sess-1",
+            "m-uid-b-sess-b",
+            "base-ab2",
+            1,
+        );
+        assert_ne!(
+            group_fingerprint(&rebased),
+            baseline,
+            "基线引用变化必须改变指纹"
+        );
+
+        let mut other_variant = group.clone();
+        other_variant.variant = WbVariant::Ai;
+        assert_ne!(group_fingerprint(&other_variant), baseline);
+    }
+
+    // -----------------------------------------------------------------------
+    // 预览凭据（design §6）
+    // -----------------------------------------------------------------------
+
+    fn sample_binding(group: &LinkGroup) -> PreviewBinding {
+        PreviewBinding {
+            variant: group.variant,
+            group_id: group.id.clone(),
+            group_fingerprint: group_fingerprint(group),
+            source: PreviewMemberBinding {
+                member_id: "m-a".to_string(),
+                account_id: None,
+                uid: "uid-a".to_string(),
+                session_id: "sess-1".to_string(),
+                raw_digest: "raw-a".to_string(),
+                normalized_digest: "norm-a".to_string(),
+                record_count: 3,
+            },
+            target: PreviewMemberBinding {
+                member_id: "m-b".to_string(),
+                account_id: None,
+                uid: "uid-b".to_string(),
+                session_id: "sess-b".to_string(),
+                raw_digest: "raw-b".to_string(),
+                normalized_digest: "norm-b".to_string(),
+                record_count: 2,
+            },
+            baseline_ref: Some("base-ab".to_string()),
+            baseline_total_digest: Some("base-digest".to_string()),
+            baseline_record_count: Some(2),
+            verdict: SyncVerdict::FastForward,
+        }
+    }
+
+    /// 凭据读写：只有本模块生成的 UUID 能命中，伪造/穿越形状的 id 一律读不到。
+    #[test]
+    fn preview_token_round_trips_and_rejects_foreign_ids() {
+        let dir = TempDir::new("preview-token");
+        let paths = temp_paths(&dir);
+        let group = group_with_members("g-1", vec![]);
+        let binding = sample_binding(&group);
+
+        let id = save_preview_token(&paths, binding.clone()).unwrap();
+        let loaded = load_preview_token(&paths, &id).expect("刚保存的凭据必须能读回");
+        assert_eq!(loaded.binding, binding);
+        assert_eq!(loaded.version, PREVIEW_TOKEN_VERSION);
+
+        // 未知 id / 路径穿越形状 / 空值一律视为过期，且不读取任何文件。
+        for bad in [
+            "11111111-2222-3333-4444-555555555555",
+            "../../../../etc/passwd",
+            "sess-1.json",
+            "",
+            "   ",
+        ] {
+            assert!(load_preview_token(&paths, bad).is_none(), "非法 id：{bad}");
+        }
+        assert!(!valid_preview_id("../../etc/passwd"));
+
+        // 版本不符视为过期。
+        let mut version_bumped = loaded.clone();
+        version_bumped.version = PREVIEW_TOKEN_VERSION + 1;
+        std::fs::write(
+            paths.preview_tokens_dir().join(format!("{id}.json")),
+            serde_json::to_string(&version_bumped).unwrap(),
+        )
+        .unwrap();
+        assert!(load_preview_token(&paths, &id).is_none());
+
+        // 清理保留最近 N 条，且不影响其它文件；保存流程自身不会删掉刚写的凭据。
+        std::fs::write(paths.preview_tokens_dir().join("keep.txt"), "x").unwrap();
+        for _ in 0..4 {
+            let saved = save_preview_token(&paths, binding.clone()).unwrap();
+            assert!(
+                load_preview_token(&paths, &saved).is_some(),
+                "刚保存的凭据必须立即可用"
+            );
+        }
+        assert!(prune_preview_tokens(&paths, 2) >= 3);
+        assert!(paths.preview_tokens_dir().join("keep.txt").exists());
+    }
+
+    /// 逐项核对：任一绑定字段变化都必须报出可读原因。
+    #[test]
+    fn verify_preview_reports_every_binding_mismatch() {
+        let group = group_with_members("g-1", vec![]);
+        let binding = sample_binding(&group);
+        let token = PreviewToken {
+            version: PREVIEW_TOKEN_VERSION,
+            preview_id: "p-1".to_string(),
+            created_at: 1,
+            binding: binding.clone(),
+        };
+        assert!(verify_preview(&token, &binding).is_empty());
+
+        let cases: [(&str, PreviewBinding); 7] = [
+            (
+                "档位",
+                PreviewBinding {
+                    variant: WbVariant::Ai,
+                    ..binding.clone()
+                },
+            ),
+            (
+                "关联组",
+                PreviewBinding {
+                    group_id: "g-2".to_string(),
+                    ..binding.clone()
+                },
+            ),
+            (
+                "关联组或配对基线",
+                PreviewBinding {
+                    group_fingerprint: "changed".to_string(),
+                    ..binding.clone()
+                },
+            ),
+            (
+                "来源正文",
+                PreviewBinding {
+                    source: PreviewMemberBinding {
+                        raw_digest: "changed".to_string(),
+                        ..binding.source.clone()
+                    },
+                    ..binding.clone()
+                },
+            ),
+            (
+                "目标正文",
+                PreviewBinding {
+                    target: PreviewMemberBinding {
+                        session_id: "sess-b2".to_string(),
+                        ..binding.target.clone()
+                    },
+                    ..binding.clone()
+                },
+            ),
+            (
+                "配对基线",
+                PreviewBinding {
+                    baseline_ref: Some("base-other".to_string()),
+                    ..binding.clone()
+                },
+            ),
+            (
+                "判定结果",
+                PreviewBinding {
+                    verdict: SyncVerdict::Diverge,
+                    ..binding.clone()
+                },
+            ),
+        ];
+        for (name, mutated) in cases {
+            let stale = verify_preview(&token, &mutated);
+            assert!(!stale.is_empty(), "{name} 不一致必须报过期");
+            assert!(
+                stale.iter().any(|reason| reason.contains(name)),
+                "{name} 的原因文案缺失：{stale:?}"
+            );
+        }
+
+        // 基线内容变化（引用不变）同样必须被报出。
+        let drifted = PreviewBinding {
+            baseline_total_digest: Some("other".to_string()),
+            ..binding.clone()
+        };
+        let stale = verify_preview(&token, &drifted);
+        assert!(
+            stale.iter().any(|reason| reason.contains("基线")),
+            "{stale:?}"
+        );
+
+        // 凭据版本不符直接报过期。
+        let mut old = token.clone();
+        old.version = PREVIEW_TOKEN_VERSION + 1;
+        assert!(!verify_preview(&old, &binding).is_empty());
+    }
+
+    /// 配对基线状态解析：无引用 → Missing，引用读不出来 → Unverifiable。
+    #[test]
+    fn pair_baseline_state_distinguishes_missing_from_unverifiable() {
+        let dir = TempDir::new("pair-baseline-state");
+        let paths = temp_paths(&dir);
+        let text = sample_body("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        let normalized = normalized_from(&text);
+
+        let mut group = group_with_members(
+            "g-1",
+            vec![
+                member("uid-a", "sess-1", MemberState::Active),
+                member("uid-b", "sess-b", MemberState::Active),
+            ],
+        );
+        assert_eq!(
+            load_pair_baseline(&paths, &group, "m-uid-a-sess-1", "m-uid-b-sess-b"),
+            BaselineState::Missing
+        );
+
+        save_baseline(&paths, "base-ab", &normalized).unwrap();
+        set_pair_base(&mut group, "m-uid-a-sess-1", "m-uid-b-sess-b", "base-ab", 1);
+        let ready = load_pair_baseline(&paths, &group, "m-uid-b-sess-b", "m-uid-a-sess-1");
+        assert_eq!(ready.ready().unwrap().record_count, normalized.record_count);
+
+        // 归一化版本不符 → 不可验证，不得当成没有基线而「重新建立」。
+        set_pair_base(
+            &mut group,
+            "m-uid-a-sess-1",
+            "m-uid-b-sess-b",
+            "base-ab",
+            NORMALIZATION_VERSION + 1,
+        );
+        match load_pair_baseline(&paths, &group, "m-uid-a-sess-1", "m-uid-b-sess-b") {
+            BaselineState::Unverifiable(reason) => {
+                assert!(reason.contains("归一化版本"), "{reason}")
+            }
+            other => panic!("期望 Unverifiable，实际 {other:?}"),
+        }
+
+        // 引用在但文件损坏 → 不可验证。
+        set_pair_base(&mut group, "m-uid-a-sess-1", "m-uid-b-sess-b", "base-ab", 1);
+        std::fs::write(paths.baselines_dir().join("base-ab.json"), "not-json").unwrap();
+        assert!(matches!(
+            load_pair_baseline(&paths, &group, "m-uid-a-sess-1", "m-uid-b-sess-b"),
+            BaselineState::Unverifiable(_)
+        ));
     }
 }

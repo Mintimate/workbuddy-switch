@@ -95,6 +95,10 @@ pub fn router() -> Router {
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        .route(
+            "/api/session-links/preview",
+            post(api_session_links_preview),
+        )
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
@@ -437,6 +441,11 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
 
     {
         let mut running = SWITCH_RUNNING.lock().unwrap();
@@ -458,6 +467,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             restart,
             share_sessions,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await;
@@ -523,6 +533,33 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     };
     report["variant"] = json!(variant.as_str());
     json_ok(report)
+}
+
+/// POST /api/session-links/preview —— 预览当前账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `session_links_preview` 同形：直接返回 core 的只读预览（`supported` /
+/// `storeStatus` / `groups`），每组的 `defaultChecked` 与 `availableModes` 是前端的
+/// 勾选权限来源。`variant` 缺省取目标账号自身档位。
+async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = match body.get("variant").and_then(Value::as_str) {
+        Some(raw) => WbVariant::parse(Some(raw)),
+        None => account::variant_of(&target),
+    };
+    match session::session_links_preview(variant, &target) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 // ---------------------------------------------------------------------------
