@@ -384,6 +384,25 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
         .show();
 }
 
+/// 投递 core 组装好的自动轮换推迟提示（`rotate::run_rotate_cycle` 返回体里的 `notify`）。
+///
+/// 走系统通知而不是托盘 tooltip：轮换是后台行为，用户此时多半没看着窗口。
+/// 标题与正文都取自 core（文案唯一构造点在 `rotate`），宿主不自造措辞；
+/// 无头 server 不投递，只保留日志与返回字段。
+pub fn notify_rotate_deferred<R: Runtime>(app: &AppHandle<R>, notify: &Value) {
+    let title = notify
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("workbuddy-switch");
+    let Some(body) = notify.get("body").and_then(Value::as_str) else {
+        return;
+    };
+    if body.is_empty() {
+        return;
+    }
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
 /// 是否应弹签到完成通知。
 ///
 /// `inactive`（该档位未开放签到活动，如国际版）不是失败：它既不算成功也不重试，

@@ -19,7 +19,8 @@ fn default_port() -> u16 {
     57890
 }
 
-/// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行。
+/// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行；
+/// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
 fn spawn_background_loops() {
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
@@ -67,6 +68,18 @@ fn spawn_background_loops() {
         loop {
             tokio::time::sleep(travel::TRAVEL_CLAIM_INTERVAL).await;
             let _ = travel::run_travel_claim_cycle().await;
+        }
+    });
+
+    // 限额 hook 信号：轮询 `~/.wb-switch/hook-events.jsonl`，入账后由前端下次拉取可见。
+    // webui 没有 Tauri 事件通道，因此不需要推送回调（桌面端见 src-tauri/src/lib.rs）。
+    wb_switch_core::modules::rate_limit_events::spawn_watcher(|| {});
+
+    // 默认接入：后台线程自动安装 hook（幂等、非阻塞、失败静默）；
+    // 装上了就作废扫描缓存——扫描范围从全量收窄到「未注册的来源」。
+    std::thread::spawn(|| {
+        if wb_switch_core::modules::rate_limit_hook::auto_install_on_startup() {
+            wb_switch_core::modules::limits::invalidate_scan_cache();
         }
     });
 }

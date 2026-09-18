@@ -3,6 +3,10 @@
 //! 对照 server.py `get_checkin_status` / `perform_checkin` /
 //! `checkin_account` / `run_checkin_cycle` / `_checkin_request` /
 //! `_is_unauthorized`。
+//!
+//! 档位策略：签到仅国内版可用（`WbVariant::supports_checkin`）。国际版没有签到
+//! 接口，自动周期、一键签到与单账号签到都在发请求前统一跳过，绝不发起任何请求；
+//! 下游的 inactive / statusUnsupported 判定保留为防御，不依赖它们拦截国际版。
 
 use chrono::Local;
 use serde_json::{json, Value};
@@ -168,9 +172,8 @@ fn status_from_response(resp: &Value) -> Option<Value> {
 /// 查询签到状态：新接口 checkin-activity-status，失败回退 checkin-status。
 ///
 /// `checkin-activity-status` / `checkin-status` 是**国内版专有**接口；国际版没有
-/// 对应实现，请求只会 404。因此国际版不走这两个接口，而是返回
-/// `statusUnsupported: true`，由 `checkin_account` 走「直接提交一次 daily-checkin」
-/// 的有意扩展（见 `decide_from_status`）。
+/// 对应实现（也没有签到本身）。因此国际版不发起任何请求，直接返回
+/// `statusUnsupported: true`；签到链路的其它入口在 `checkin_account` 处统一跳过。
 pub async fn get_checkin_status(account: &Value) -> Value {
     if variant_of(account) == WbVariant::Cn {
         let resp = checkin_request("/checkin-activity-status", account).await;
@@ -241,10 +244,10 @@ pub async fn perform_checkin(account: &Value) -> Value {
 }
 
 fn decide_from_status(status: &Value) -> StatusDecision {
-    // 该档位没有状态查询接口（国际版）时的**有意扩展**：
-    // 允许直接提交一次 daily-checkin，而不是把账号判成失败并让调度反复重试。
-    // 安全性来自 daily-checkin 自身的幂等性——重复提交会返回「已签到」，
-    // 因此这里不可能产生重复签到；结果也不会被伪造成 success。
+    // 没有状态查询接口的档位允许直接提交一次 daily-checkin，而不是把账号判成失败
+    // 并让调度反复重试。安全性来自 daily-checkin 自身的幂等性——重复提交会返回
+    // 「已签到」，因此这里不可能产生重复签到；结果也不会被伪造成 success。
+    // 国际版当前在 `checkin_account` 入口即被跳过，此分支保留为防御。
     if status.get("statusUnsupported").and_then(Value::as_bool) == Some(true) {
         return StatusDecision::Submit;
     }
@@ -269,6 +272,11 @@ pub async fn checkin_account(account: &Value) -> Value {
     let Some(_account_guard) = AccountRunGuard::try_acquire(account) else {
         return json!({"result": "error", "error": "该账号正在签到，请稍后再试"});
     };
+    // 国际版没有签到接口：自动周期、一键签到与单账号签到的公开入口都在这里汇聚，
+    // 统一短路以确保不向任何签到接口发起请求。
+    if !variant_of(account).supports_checkin() {
+        return json!({"result": "skipped", "reason": "unsupported_variant"});
+    }
     let cfg = load_checkin_config();
     let acc = ensure_fresh_token(account.clone(), &cfg).await;
     let variant = variant_of(&acc).as_str();
@@ -344,7 +352,8 @@ pub fn date_str(ts_ms: Option<i64>) -> String {
 
 /// 执行一轮自动签到。启动与周期轮次均逐账号查询服务端状态。
 ///
-/// 并发锁防止与手动签到/上一轮重复运行。
+/// 只遍历支持签到的档位（国际版没有签到接口，绝不发起请求）。并发锁防止与
+/// 手动签到/上一轮重复运行。
 pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"status": "skipped", "reason": "already_running"});
@@ -353,7 +362,10 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
         return json!({"status": "disabled"});
     }
-    let accounts = load_accounts();
+    let accounts: Vec<Value> = load_accounts()
+        .into_iter()
+        .filter(|acc| variant_of(acc).supports_checkin())
+        .collect();
     if accounts.is_empty() {
         return json!({"status": "no_accounts"});
     }
@@ -383,8 +395,8 @@ pub fn all_accounts_checked_in_today() -> bool {
 
 /// 判定「今天是否所有应签到的账号都已签到」。
 ///
-/// 只有把账号计入「待签到集合」的档位（见 `WbVariant::counts_as_pending_checkin`）
-/// 参与判定：国际版账号不会产生签到日志，若把它们算进来，托盘会永远显示「可签到」。
+/// 只有支持签到的档位（见 `WbVariant::supports_checkin`）参与判定：国际版账号不会
+/// 产生签到日志，若把它们算进来，托盘会永远显示「可签到」。
 /// 有账号但没有任何档位需要签到（例如只装了国际版）时视为无需签到，返回 true；
 /// 账号库为空仍返回 false，保留「一键签到」入口。
 pub fn accounts_checked_in_today(accounts: &[Value], logs: &[Value], today: &str) -> bool {
@@ -393,7 +405,7 @@ pub fn accounts_checked_in_today(accounts: &[Value], logs: &[Value], today: &str
     }
     let pending: Vec<&Value> = accounts
         .iter()
-        .filter(|account| variant_of(account).counts_as_pending_checkin())
+        .filter(|account| variant_of(account).supports_checkin())
         .collect();
     if pending.is_empty() {
         return true;
@@ -454,13 +466,17 @@ fn latest_today_result<'a>(logs: &'a [Value], account_id: &str, today: &str) -> 
 ///
 /// `variant = None` 覆盖全部档位（自动周期与设置页「立即签到」语义）；
 /// 显式传入时只处理该档位（账号页按当前档位触发，避免跨档位误签到）。
+/// 无论哪种取值，都只处理支持签到的档位：国际版没有签到接口，绝不发起请求。
 pub async fn run_checkin_all(variant: Option<WbVariant>) -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"accounts": [], "status": "skipped", "reason": "already_running"});
     };
     let accounts: Vec<Value> = load_accounts()
         .into_iter()
-        .filter(|acc| variant.is_none_or(|target| variant_of(acc) == target))
+        .filter(|acc| {
+            let acc_variant = variant_of(acc);
+            acc_variant.supports_checkin() && variant.is_none_or(|target| acc_variant == target)
+        })
         .collect();
     let mut results: Vec<Value> = Vec::new();
     for acc in accounts {
@@ -594,6 +610,21 @@ mod tests {
         assert!(status.get("raw").is_none());
         // 没有产生任何状态查询响应（未发请求）。
         assert!(status.get("todayCheckedIn").is_none());
+    }
+
+    /// 国际版没有签到接口：入口即跳过，绝不发起任何请求。
+    ///
+    /// 守卫位于 `load_checkin_config` / `ensure_fresh_token` / 状态查询之前，
+    /// 因此这里既不会触发 token 刷新，也不会触碰任何签到接口。
+    #[tokio::test]
+    async fn ai_account_checkin_is_skipped_without_requests() {
+        let ai = json!({"id": "ai-skip-checkin", "uid": "u-ai", "variant": "ai"});
+        let result = checkin_account(&ai).await;
+        assert_eq!(result["result"], "skipped");
+        assert_eq!(result["reason"], "unsupported_variant");
+        // 不伪装成成功、失败或 inactive。
+        assert!(result.get("error").is_none());
+        assert!(result.get("inactive").is_none());
     }
 
     /// 状态成功响应解析保持原有结构（国内版零回归）。

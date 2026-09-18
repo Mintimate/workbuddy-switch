@@ -83,6 +83,10 @@ pub fn credit_usage_snapshots_file() -> PathBuf {
     store_dir().join("credit_usage_snapshots.json")
 }
 
+pub fn rate_limit_config_file() -> PathBuf {
+    store_dir().join("rate_limit_config.json")
+}
+
 pub fn official_usage_cache_file() -> PathBuf {
     store_dir().join("official_usage_cache.json")
 }
@@ -516,6 +520,66 @@ pub fn save_travel_cache(cache: &Value) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// 限额监听配置（hook 通路 + IDE 日志扫描的总开关）
+// ---------------------------------------------------------------------------
+
+/// 默认限额监听配置：默认开启（与改造前「账号页自动显示限额」的行为一致）。
+///
+/// `hookOptOut` = 用户点过「卸载 hook」→ 不再自动接入；默认 `false`（默认接入）。
+/// `scanIdeLogs` = 是否扫描两个 CodeBuddy IDE 的日志；默认 `true`（IDE 的 429 不触发事件，
+/// 日志是它唯一的数据源）。关闭只影响 IDE 两源，CLI / WorkBuddy 的 hook 通路与兜底扫描不变。
+pub fn default_rate_limit_config() -> Value {
+    json!({ "enabled": true, "hookOptOut": false, "scanIdeLogs": true })
+}
+
+/// 读取指定的限额监听配置文件（缺失/损坏时合并默认值）。
+///
+/// 与 `load_rate_limit_config` 分离只为注入路径：单测不得触碰真实 `~/.wb-switch`。
+pub fn load_rate_limit_config_at(path: &Path) -> Value {
+    let mut cfg = default_rate_limit_config();
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
+            for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
+                if let Some(value) = map.get(key).and_then(Value::as_bool) {
+                    cfg[key] = json!(value);
+                }
+            }
+        }
+    }
+    cfg
+}
+
+/// 读取限额监听配置（缺失/损坏时合并默认值）。
+pub fn load_rate_limit_config() -> Value {
+    load_rate_limit_config_at(&rate_limit_config_file())
+}
+
+/// 保存限额监听配置到指定路径（只保留已知字段）。
+pub fn save_rate_limit_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
+    let mut merged = default_rate_limit_config();
+    for key in ["enabled", "hookOptOut", "scanIdeLogs"] {
+        if let Some(value) = cfg.get(key).and_then(Value::as_bool) {
+            merged[key] = json!(value);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
+    atomic_write(path, &content)
+}
+
+/// 只改写 `hookOptOut`（保留 `enabled` 等既有字段），返回写入后的完整配置。
+///
+/// 用户点「卸载 hook」置 `true`、「接入 hook」置 `false`；两处都不改动别的开关状态。
+pub fn set_rate_limit_hook_opt_out_at(path: &Path, opt_out: bool) -> std::io::Result<Value> {
+    let mut cfg = load_rate_limit_config_at(path);
+    cfg["hookOptOut"] = json!(opt_out);
+    save_rate_limit_config_at(path, &cfg)?;
+    Ok(load_rate_limit_config_at(path))
+}
+
+// ---------------------------------------------------------------------------
 // 自动轮换配置 / 日志（CodeBuddy CLI 账号轮换）
 // ---------------------------------------------------------------------------
 
@@ -599,6 +663,80 @@ pub fn add_rotate_log(entry: &Value) {
     let mut logs = load_rotate_logs();
     logs.push(entry.clone());
     let _ = save_rotate_logs(&logs);
+}
+
+// ---------------------------------------------------------------------------
+// 轮换推迟提示预算（`~/.wb-switch/auto_rotate_notify.json`）
+// ---------------------------------------------------------------------------
+
+/// 提示预算文件名（`store_dir()/auto_rotate_notify.json`）。
+const ROTATE_NOTIFY_FILE_NAME: &str = "auto_rotate_notify.json";
+
+/// 同一自然日内最多提示几次；超出只写轮换日志，不再打扰用户。
+pub const ROTATE_NOTIFY_DAILY_LIMIT: u32 = 5;
+
+static ROTATE_NOTIFY_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn auto_rotate_notify_file() -> PathBuf {
+    store_dir().join(ROTATE_NOTIFY_FILE_NAME)
+}
+
+/// 本地日期（`YYYY-MM-DD`）：提示预算的跨日重置口径（与签到日志同一套本地时间）。
+fn local_date(at_ms: i64) -> String {
+    Local
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 读当日已用次数：文件缺失 / 损坏 / 日期不是今天（跨日）一律按 0 计。
+fn rotate_notify_count_at(path: &Path, today: &str) -> u32 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return 0;
+    };
+    if value.get("date").and_then(Value::as_str) != Some(today) {
+        return 0;
+    }
+    value
+        .get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
+}
+
+/// 领取一次「轮换推迟提示」配额：`true` = 可以投递（并且已经计数）。
+///
+/// 同自然日上限 [`ROTATE_NOTIFY_DAILY_LIMIT`]，跨日按本地日期清零；读取失败/损坏视为 0，
+/// 不阻塞轮换。预算文件写不进去时不投递——宁可少一条通知，也不要每轮都弹。
+pub fn try_consume_rotate_notify(at_ms: i64) -> bool {
+    let _guard = ROTATE_NOTIFY_LOCK.lock().unwrap();
+    let path = auto_rotate_notify_file();
+    try_consume_rotate_notify_at(&path, &local_date(at_ms))
+}
+
+fn try_consume_rotate_notify_at(path: &Path, today: &str) -> bool {
+    if today.is_empty() {
+        return false;
+    }
+    let used = rotate_notify_count_at(path, today);
+    if used >= ROTATE_NOTIFY_DAILY_LIMIT {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return false;
+        }
+    }
+    let content = serde_json::to_string_pretty(&json!({
+        "date": today,
+        "count": used + 1,
+    }))
+    .unwrap_or_default();
+    atomic_write(path, &content).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,5 +1358,210 @@ mod tests {
         ));
         assert!(!is_route_missing(&json!({"code": 0, "data": {}})));
         assert!(!is_route_missing(&Value::Null));
+    }
+
+    /// 限额监听配置：默认开启、显式 false 生效、损坏/缺字段回默认，且只写已知字段。
+    #[test]
+    fn rate_limit_config_defaults_to_enabled_and_keeps_only_known_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-config-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 文件缺失 → 默认开启、未卸载过、IDE 日志扫描开启。
+        let defaults = load_rate_limit_config_at(&path);
+        assert_eq!(defaults.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            defaults.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            defaults.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式关闭 → 生效。
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "scanIdeLogs": false, "extra": 1}),
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            saved.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "scanIdeLogs 显式 false 必须落盘"
+        );
+        assert!(saved.get("extra").is_none(), "只保留已知字段: {saved}");
+        assert_eq!(
+            saved.as_object().unwrap().len(),
+            3,
+            "只有 enabled + hookOptOut + scanIdeLogs"
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("scanIdeLogs")
+                .and_then(Value::as_bool),
+            Some(false),
+            "读回仍是显式 false（不被默认值冲掉）"
+        );
+
+        // 显式 true 与显式 false 都如实往返（默认值不覆盖显式值）。
+        save_rate_limit_config_at(&path, &json!({"scanIdeLogs": true})).unwrap();
+        let round_trip = load_rate_limit_config_at(&path);
+        assert_eq!(
+            round_trip.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 损坏内容 / 类型不符 → 回默认，不报错。
+        std::fs::write(&path, "not-json").unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("scanIdeLogs")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        std::fs::write(&path, json!({"enabled": "no"}).to_string()).unwrap();
+        assert_eq!(
+            load_rate_limit_config_at(&path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(rate_limit_config_file().ends_with("rate_limit_config.json"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `hookOptOut` 与 `enabled` 并列：只保留已知字段，且单字段改写不动另一个开关。
+    #[test]
+    fn rate_limit_hook_opt_out_survives_known_field_merge() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-rate-limit-opt-out-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rate_limit_config.json");
+
+        // 只保留已知字段：多余键不落盘。
+        save_rate_limit_config_at(
+            &path,
+            &json!({"enabled": false, "hookOptOut": true, "scanIdeLogs": false, "unknown": "x"}),
+        )
+        .unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("hookOptOut").and_then(Value::as_bool), Some(true));
+        assert_eq!(saved.get("enabled").and_then(Value::as_bool), Some(false));
+        assert!(saved.get("unknown").is_none(), "只保留已知字段: {saved}");
+
+        // 单字段改写：置 true / 置 false 都不动 `enabled` 与 `scanIdeLogs`。
+        let after_opt_out = set_rate_limit_hook_opt_out_at(&path, true).unwrap();
+        assert_eq!(
+            after_opt_out.get("hookOptOut").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            after_opt_out.get("enabled").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置限额监听开关"
+        );
+        assert_eq!(
+            after_opt_out.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false),
+            "改写 hookOptOut 不得重置 IDE 日志扫描开关"
+        );
+        let cleared = set_rate_limit_hook_opt_out_at(&path, false).unwrap();
+        assert_eq!(
+            cleared.get("hookOptOut").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(cleared.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            cleared.get("scanIdeLogs").and_then(Value::as_bool),
+            Some(false)
+        );
+        // 配置缺失时也能写入（首次卸载 / 首次接入）。
+        let fresh = dir.join("fresh.json");
+        assert_eq!(
+            set_rate_limit_hook_opt_out_at(&fresh, true)
+                .unwrap()
+                .get("hookOptOut")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            load_rate_limit_config_at(&fresh)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 轮换推迟提示预算：同日第 1..5 次放行、第 6 次拒绝；跨日重置；损坏回退 0。
+    #[test]
+    fn rotate_notify_budget_caps_per_local_day_and_resets_on_a_new_day() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-rotate-notify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(ROTATE_NOTIFY_FILE_NAME);
+        let today = "2026-09-18";
+
+        // 文件不存在 → 从 0 开始，前 5 次都放行。
+        for expected_count in 1..=ROTATE_NOTIFY_DAILY_LIMIT {
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "第 {expected_count} 次应放行"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(expected_count));
+            assert_eq!(saved["date"], json!(today));
+        }
+        // 第 6 次：拒绝，且预算文件不再被改写（仍停在 5）。
+        assert!(!try_consume_rotate_notify_at(&path, today));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["count"], json!(ROTATE_NOTIFY_DAILY_LIMIT));
+
+        // 跨日：日期变化即清零，重新放行。
+        assert!(try_consume_rotate_notify_at(&path, "2026-09-19"));
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["date"], json!("2026-09-19"));
+        assert_eq!(saved["count"], json!(1));
+
+        // 损坏 / 字段缺失 / 类型不符 → 按 0 计（不阻塞轮换）。
+        for broken in [
+            "not-json",
+            "{}",
+            r#"{"date":"2026-09-20","count":"many"}"#,
+            "[]",
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(
+                try_consume_rotate_notify_at(&path, today),
+                "损坏内容应按 0 计: {broken}"
+            );
+            let saved: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["count"], json!(1), "损坏后从 1 重新起算: {broken}");
+            assert_eq!(saved["date"], json!(today));
+        }
+
+        // 空日期视为不可用（不写坏文件）。
+        std::fs::remove_file(&path).unwrap();
+        assert!(!try_consume_rotate_notify_at(&path, ""));
+        assert!(!path.exists());
+        assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

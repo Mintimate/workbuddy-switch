@@ -279,13 +279,13 @@ impl WbVariant {
         matches!(self, Self::Cn)
     }
 
-    /// 该档位的账号是否计入「今天是否全部已签到」的**待签到集合**。
+    /// 该档位是否支持签到，**同时门控请求与待签到集合**。
     ///
-    /// **不门控请求**：签到请求按账号遍历下发，国际版账号仍会尝试 `daily-checkin`
-    /// 并被归类为 `inactive`（见 `checkin::perform_checkin`）。本方法唯一的消费点是
-    /// `checkin::accounts_checked_in_today`：国际版签到未开放、永远不写签到日志，
-    /// 若计入待签到集合，托盘会一直显示「可签到」。
-    pub fn counts_as_pending_checkin(self) -> bool {
+    /// 国际版没有签到接口：签到链路（自动周期、一键签到、单账号）在发起任何请求前
+    /// 一律跳过国际版账号（见 `checkin::checkin_account`）。它们因此永不产生签到
+    /// 日志，也不计入「今天是否全部已签到」的待签到集合，否则托盘会一直显示
+    /// 「可签到」（见 `checkin::accounts_checked_in_today`）。
+    pub fn supports_checkin(self) -> bool {
         matches!(self, Self::Cn)
     }
 
@@ -475,10 +475,9 @@ mod tests {
     fn capability_declarations() {
         assert!(WbVariant::Cn.supports_travel());
         assert!(!WbVariant::Ai.supports_travel());
-        // 国际版无签到活动：不参与「今天是否全部已签到」判定（托盘语义）。
-        // 注意：该方法不门控签到请求，国际版账号仍会尝试 daily-checkin。
-        assert!(WbVariant::Cn.counts_as_pending_checkin());
-        assert!(!WbVariant::Ai.counts_as_pending_checkin());
+        // 国际版无签到接口：既不参与签到请求，也不参与「今天是否全部已签到」判定。
+        assert!(WbVariant::Cn.supports_checkin());
+        assert!(!WbVariant::Ai.supports_checkin());
     }
 
     #[test]

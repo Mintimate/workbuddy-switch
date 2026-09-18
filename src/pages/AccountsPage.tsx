@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
   CalendarCheck,
@@ -43,6 +44,7 @@ import { ImportAccountsDialog } from "@/components/import-accounts-dialog";
 import { OAuthLoginDialog } from "@/components/oauth-login-dialog";
 import { SwitchAccountDialog } from "@/components/switch-account-dialog";
 import * as api from "@/lib/api";
+import { useVisibleInterval } from "@/lib/use-visible-interval";
 import {
   DEFAULT_VARIANT,
   accountVariant,
@@ -55,9 +57,20 @@ import {
   variantSupportsTravel,
   variantUsesIntlCodebuddyIde,
 } from "@/lib/variant";
-import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, TravelConfig, TravelStatus } from "@/lib/types";
+import type { AccountMeta, AppStatus, CheckinConfig, CodeBuddyCliStatus, CodeBuddyCnIdeStatus, CreditExpiry, RateLimitEntry, TravelConfig, TravelStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAccountsStore } from "@/stores/accounts";
+
+/**
+ * 账号页两个轮询的间隔（都经 `useVisibleInterval` 门控，仅主窗口可见时执行）。
+ *
+ * - 旅行：后台派发/领取循环最快 15 分钟变一次状态，1 分钟用于及时反映"到期领取"后的显示；
+ * - 限额：CLI / WorkBuddy 由后端 hook 信号实时入账并推送（`rate-limits-updated`），
+ *   这里只兜底 IDE 日志扫描；后端按同一间隔节流扫描，前端再按 payload 的 `scannedAt`
+ *   判断「距上次扫描 ≥ 5 分钟」才发起，避免可见性切换/页面重挂载把扫描打散。
+ */
+const TRAVEL_REFRESH_INTERVAL_MS = 60 * 1000;
+const RATE_LIMIT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 
 function expiringSoonAmount(credit?: CreditExpiry): number {
   return credit?.ok ? credit.expiringSoonRemaining ?? 0 : 0;
@@ -169,6 +182,13 @@ export default function AccountsPage() {
   const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
+  /** 账号 id -> 当前受限的模型（数据源 = 后端限额台账：hook 信号 + 日志扫描） */
+  const [rateLimitMap, setRateLimitMap] = useState<Record<string, RateLimitEntry[]>>({});
+  /**
+   * 「限额监听」开关（设置页）：关闭后不扫描、不渲染限额 chip。
+   * `null` = 配置尚未读到，不得按默认 true 先扫一轮（关闭开关后进账号页会闪 chip / 误请求）。
+   */
+  const [rateLimitEnabled, setRateLimitEnabled] = useState<boolean | null>(null);
   const [codebuddyCli, setCodebuddyCli] = useState<CodeBuddyCliStatus | null>(null);
   const [codebuddyCliSwitchingId, setCodebuddyCliSwitchingId] = useState<string | null>(null);
   const [codebuddyCnIde, setCodebuddyCnIde] = useState<CodeBuddyCnIdeStatus | null>(null);
@@ -190,6 +210,8 @@ export default function AccountsPage() {
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
   const checkinAvailable = variantSupportsCheckin(variant);
+  /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
+  const refreshCreditsLabel = checkinAvailable ? "签到并刷新全部账号积分" : "刷新全部账号积分";
   const autoCheckinEnabled = autoCheckinConfig?.enabled ?? false;
   const autoTravelEnabled = autoTravelConfig?.enabled ?? false;
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
@@ -311,8 +333,9 @@ export default function AccountsPage() {
   }, [accounts.length, variant]);
 
   // 当前档位账号列表变化后并行查询各账号今日签到状态
+  // 国际版没有签到接口：不查询状态（后端也不发请求）。
   useEffect(() => {
-    if (!visibleAccounts.length) return;
+    if (!visibleAccounts.length || !checkinAvailable) return;
     let cancelled = false;
     void fetchTodayCheckinMap(
       visibleAccounts.map((account) => account.id),
@@ -325,7 +348,7 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [visibleAccounts]);
+  }, [visibleAccounts, checkinAvailable]);
 
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
@@ -334,21 +357,92 @@ export default function AccountsPage() {
     }
   }
 
-  // 当前档位账号列表变化后并行查询旅行状态；后台领取后每 60 秒再拉一次，避免卡片停在「旅行中」。
+  // 当前档位账号列表变化后并行查询旅行状态；之后按 TRAVEL_REFRESH_INTERVAL_MS 周期刷新，
+  // 以反映后台派发/领取循环带来的状态变化。仅主窗口可见时轮询，隐藏时暂停。
   // 成长中心仅国内版开放，国际版不发请求也不展示标签。
+  const travelAccountIds = useMemo(
+    () => visibleAccounts.map((account) => account.id),
+    [visibleAccounts],
+  );
+  useVisibleInterval(
+    () => void loadTravelMap(travelAccountIds),
+    TRAVEL_REFRESH_INTERVAL_MS,
+    travelAvailable && travelAccountIds.length > 0,
+  );
+
+  /**
+   * 模型限额台账（后端合并两条通路）：一次返回全部账号，这里转成「账号 id -> 受限模型」。
+   *
+   * 容错：老版本后端没有该命令、或扫描失败时按「无受限模型」处理（清空映射），
+   * 不弹错误、不影响账号页其它功能。
+   */
+  const lastRateLimitScanRef = useRef(0);
+
+  async function loadRateLimits(options?: { force?: boolean }) {
+    if (rateLimitEnabled !== true) return;
+    const scannedAt = lastRateLimitScanRef.current;
+    if (
+      !options?.force &&
+      scannedAt > 0 &&
+      Date.now() - scannedAt < RATE_LIMIT_REFRESH_INTERVAL_MS
+    ) {
+      return;
+    }
+    try {
+      const payload = await api.getRateLimits();
+      // `scannedAt` 是后端最近一次真实日志扫描的时刻：下一次扫描要等它满 5 分钟。
+      lastRateLimitScanRef.current = payload.scannedAt || Date.now();
+      const next: Record<string, RateLimitEntry[]> = {};
+      for (const entry of payload.accounts ?? []) {
+        if (entry.limited?.length) next[entry.accountId] = entry.limited;
+      }
+      setRateLimitMap(next);
+    } catch {
+      setRateLimitMap({});
+    }
+  }
+
+  const loadRateLimitsRef = useRef(loadRateLimits);
+  loadRateLimitsRef.current = loadRateLimits;
+
+  // 兜底轮询：页面可见且距上次扫描 ≥ 5 分钟时拉一次（IDE 日志扫描在后端按同一间隔节流）。
+  // 图标何时消失由卡片本地按 `resetAt` 每秒判定（跨过官方重置时刻自动消失），不依赖这里的轮询。
+  useVisibleInterval(
+    () => void loadRateLimits(),
+    RATE_LIMIT_REFRESH_INTERVAL_MS,
+    rateLimitEnabled === true,
+  );
+
+  // 后端入账 hook 事件（CLI / WorkBuddy 的 429 当轮）后推送 → 立即拉取，秒级更新。
+  // 这一路不看节流：新状态已经在后端，前端只做拉取。
   useEffect(() => {
-    if (!travelAvailable || !visibleAccounts.length) return;
+    if (api.isWebui()) return;
+    let unlisten: (() => void) | undefined;
+    void listen("rate-limits-updated", () => {
+      void loadRateLimitsRef.current({ force: true });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
+
+  // 「限额监听」开关（设置页）：关闭后不再发起扫描；开关状态来自后端配置文件，
+  // 设置页改完返回账号页会重新挂载并读到新值。
+  useEffect(() => {
     let cancelled = false;
-    const ids = visibleAccounts.map((account) => account.id);
-    void loadTravelMap(ids, () => cancelled);
-    const timer = window.setInterval(() => {
-      void loadTravelMap(ids, () => cancelled);
-    }, 60_000);
+    void api
+      .getRateLimitConfig()
+      .then((config) => {
+        if (!cancelled) setRateLimitEnabled(config.enabled);
+      })
+      .catch(() => {
+        // 旧版本后端没有该命令：按默认开启，不影响账号页其它功能。
+        if (!cancelled) setRateLimitEnabled(true);
+      });
     return () => {
       cancelled = true;
-      window.clearInterval(timer);
     };
-  }, [travelAvailable, visibleAccounts]);
+  }, []);
 
   // 只给尚未缓存的账号拉积分；切回首页不重复请求。点「刷新积分」才强制更新。
   useEffect(() => {
@@ -480,53 +574,54 @@ export default function AccountsPage() {
   }
 
   /**
-   * 批量签到：逐个调用单账号签到（后端按账号自身档位取基址与路径），
-   * 只覆盖传入的账号，即当前档位的账号集合。
-   */
-  /**
-   * 当前档位的批量签到：后端一次调用完成（保留并发保护），国际版账号返回
-   * `inactive`（官方未开放签到活动）时不计成功也不计失败。
+   * 当前档位的批量签到：后端一次调用完成（保留并发保护），只处理支持签到的
+   * 账号；国际版没有签到接口，不参与批量签到。
    */
   async function runBatchCheckin() {
     const res = await api.checkinAll(variant);
     return res.accounts ?? [];
   }
 
-  /** 刷新按钮：先跑一轮当前档位的批量签到并重查今日签到状态，再强制刷新全部积分。 */
+  /**
+   * 刷新按钮：先跑一轮当前档位的批量签到并重查今日签到状态，再强制刷新全部积分。
+   * 国际版没有签到接口：跳过整块签到逻辑，只刷新积分。
+   */
   async function onRefreshCredits() {
     if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
     setCheckinAllRunning(true);
     const ids = visibleAccounts.map((account) => account.id);
     try {
-      try {
-        const entries = await runBatchCheckin();
-        const success = entries.filter((e) => e.result === "success").length;
-        const already = entries.filter((e) => e.result === "already").length;
-        const failed = entries.filter((e) => e.result === "error").length;
-        const inactive = entries.filter((e) => e.inactive === true || e.result === "inactive").length;
-        const parts: string[] = [];
-        if (success > 0) parts.push(`${success} 个签到成功`);
-        if (already > 0) parts.push(`${already} 个已签到`);
-        if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
-        if (failed > 0) parts.push(`${failed} 个失败`);
-        const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
-        const counted = success + already + failed;
-        if (failed > 0 && counted === failed) {
-          toast.error("签到失败", { description: summary });
-        } else if (counted === 0 && inactive > 0) {
-          // 全部是 inactive（官方未开放签到活动）：既不算成功也不算失败，
-          // 不得呈现为绿色成功（design D8）。
-          toast.info("签到未开放", { description: summary });
-        } else {
-          toast.success("签到完成", { description: summary });
+      if (checkinAvailable) {
+        try {
+          const entries = await runBatchCheckin();
+          const success = entries.filter((e) => e.result === "success").length;
+          const already = entries.filter((e) => e.result === "already").length;
+          const failed = entries.filter((e) => e.result === "error").length;
+          const inactive = entries.filter((e) => e.inactive === true || e.result === "inactive").length;
+          const parts: string[] = [];
+          if (success > 0) parts.push(`${success} 个签到成功`);
+          if (already > 0) parts.push(`${already} 个已签到`);
+          if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
+          if (failed > 0) parts.push(`${failed} 个失败`);
+          const summary = parts.length > 0 ? parts.join("，") : "无账号需要签到";
+          const counted = success + already + failed;
+          if (failed > 0 && counted === failed) {
+            toast.error("签到失败", { description: summary });
+          } else if (counted === 0 && inactive > 0) {
+            // 全部是 inactive（官方未开放签到活动）：既不算成功也不算失败，
+            // 不得呈现为绿色成功（design D8）。
+            toast.info("签到未开放", { description: summary });
+          } else {
+            toast.success("签到完成", { description: summary });
+          }
+          // 批量签到后重查当前档位账号的今日签到状态，无需切换页面即反映最新结果
+          const next = await fetchTodayCheckinMap(ids);
+          if (Object.keys(next).length > 0) {
+            setCheckinMap((prev) => ({ ...prev, ...next }));
+          }
+        } catch (e) {
+          toast.error("批量签到失败", { description: api.asError(e) });
         }
-        // 批量签到后重查当前档位账号的今日签到状态，无需切换页面即反映最新结果
-        const next = await fetchTodayCheckinMap(ids);
-        if (Object.keys(next).length > 0) {
-          setCheckinMap((prev) => ({ ...prev, ...next }));
-        }
-      } catch (e) {
-        toast.error("批量签到失败", { description: api.asError(e) });
       }
       await refreshCredits(ids);
       if (travelAvailable) await loadTravelMap(ids);
@@ -544,14 +639,14 @@ export default function AccountsPage() {
   async function confirmSwitchCodebuddyCli() {
     const account = cliSwitchTarget;
     if (!account || codebuddyCliSwitchingId !== null) return;
-    const closeRunningCli = cliSwitchIsRegionChange;
     setCliSwitchTarget(null);
     setCodebuddyCliSwitchingId(account.id);
     const toastId = toast.loading("正在切换 CodeBuddy CLI…", {
       description: `正在将默认账号设为 ${account.nickname || account.email || account.id}`,
     });
     try {
-      const result = await api.switchCodebuddyCliAccount(account.id, closeRunningCli);
+      // 后端一律先关闭正在运行的 CLI 再写状态（`closeRunningCli` 入参已废弃）。
+      const result = await api.switchCodebuddyCliAccount(account.id);
       await refreshCodebuddyCliStatus();
       toast.success("CodeBuddy CLI 默认账号已更新", {
         id: toastId,
@@ -639,15 +734,9 @@ export default function AccountsPage() {
       ? orderedAccounts.find((account) => hasExpiringSoonCredits(creditMap[account.id]))?.id
       : undefined;
   const cliCurrentAccountId = codebuddyCli?.activeAccountId;
-  const cliSwitchIsRegionChange = Boolean(
-    cliSwitchTarget
-    && accountVariant(cliSwitchTarget) !== normalizeVariant(codebuddyCli?.activeAccountVariant),
-  );
   const cliSwitchAccountLabel = cliSwitchTarget
     ? cliSwitchTarget.nickname || cliSwitchTarget.email || cliSwitchTarget.id
     : "";
-  const cliSwitchTargetRegion = cliSwitchTarget ? variantLabel(accountVariant(cliSwitchTarget)) : "";
-  const cliSwitchCurrentRegion = variantLabel(normalizeVariant(codebuddyCli?.activeAccountVariant));
   const workbuddyCurrentName = current
     ? current.nickname || current.email || current.uid || "未知账号"
     : "未登录";
@@ -801,7 +890,7 @@ export default function AccountsPage() {
                     ? "Windows CLI 认证配置与当前账号 Token 已脱节。点击更新认证后写入最新 Token；当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
                     : codebuddyCli.migrationRequired
                       ? "检测到旧版 Windows helper 配置。接入后会改用 settings.json 的 env.CODEBUDDY_AUTH_TOKEN，不再执行 helper。"
-                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token；切换或保活刷新后会自动更新。当前运行会话不会切换，请由 ACP 重新加载会话或重启 CLI 后生效。"
+                      : "Windows 使用 CodeBuddy settings.json 中的认证 Token。保活刷新只更新后续启动使用的 Token；切换账号会先关闭正在运行的 CodeBuddy CLI，重新打开 CLI 后即用新账号。"
                 : codebuddyCli.migrationRequired
                   ? "检测到旧版 helper，请先升级；升级前不会将 CLI 切换显示为已验证。"
                   : codebuddyCli.configured
@@ -925,14 +1014,14 @@ export default function AccountsPage() {
                         className="size-9 rounded-lg"
                         disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
                         onClick={() => void onRefreshCredits()}
-                        aria-label="签到并刷新全部账号积分"
+                        aria-label={refreshCreditsLabel}
                       >
                         <RefreshCw className={refreshingCredits || checkinAllRunning ? "animate-spin" : undefined} />
                       </Button>
                     </DemoAction>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : "签到并刷新全部账号积分"}</TooltipContent>
+                <TooltipContent side="top">{api.isDemoMode() ? "演示模式下不可操作" : refreshCreditsLabel}</TooltipContent>
               </Tooltip>
             </div>
           </TooltipProvider>
@@ -971,6 +1060,7 @@ export default function AccountsPage() {
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
                 travelStatus={travelMap[a.id]}
+                rateLimits={rateLimitEnabled ? rateLimitMap[a.id] : undefined}
                 credit={creditMap[a.id]}
                 creditLoading={creditLoadingMap[a.id]}
                 creditUpdatedAt={creditUpdatedAtMap[a.id]}
@@ -1064,17 +1154,8 @@ export default function AccountsPage() {
           <DialogHeader>
             <DialogTitle>切换 CodeBuddy CLI</DialogTitle>
             <DialogDescription>
-              {cliSwitchIsRegionChange ? (
-                <>
-                  将把默认账号设为「{cliSwitchAccountLabel}」，并从{cliSwitchCurrentRegion}切到{cliSwitchTargetRegion}。
-                  确认后会关闭正在运行的 CodeBuddy CLI，避免旧进程继续打旧站并覆盖站点缓存。当前会话会中断，之后请重新打开 CLI。
-                </>
-              ) : (
-                <>
-                  将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
-                  当前已打开的会话不会换号，重新加载会话或新开会话后生效。
-                </>
-              )}
+              将把 CodeBuddy CLI 默认账号设为「{cliSwitchAccountLabel}」。
+              确认后会关闭正在运行的 CodeBuddy CLI 会话，当前会话会中断；重新打开 CLI 后新账号才会生效。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1082,7 +1163,7 @@ export default function AccountsPage() {
               取消
             </Button>
             <Button onClick={() => void confirmSwitchCodebuddyCli()}>
-              {cliSwitchIsRegionChange ? "关闭 CLI 并切换" : "切换"}
+              关闭 CLI 并切换
             </Button>
           </DialogFooter>
         </DialogContent>

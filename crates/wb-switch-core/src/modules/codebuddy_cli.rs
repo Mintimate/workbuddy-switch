@@ -28,6 +28,14 @@ const LEGACY_HELPER_FILE: &str = "helper.sh";
 const LEGACY_WINDOWS_HELPER_FILE: &str = "helper.cmd";
 const SETTINGS_DIR: &str = ".codebuddy";
 const SETTINGS_FILE: &str = "settings.json";
+/// CLI 运行中会话注册表目录名（`~/.codebuddy/sessions/<pid>.json`）。
+const SESSIONS_DIR_NAME: &str = "sessions";
+/// 会话存活判据：`now - lastHeartbeat <= 该值` 即视为活着。
+///
+/// 对齐客户端 `WORKER_HEARTBEAT_TIMEOUT_MS`（120_000）。客户端心跳是 30s 一次的
+/// 纯定时器（与是否正在对话无关），所以这个判据只回答「有没有活着的 CLI 进程」，
+/// 不回答「用户是否正在用」——不要拿它当"活跃保护"用。
+const LIVE_SESSION_STALE_MS: i64 = 120_000;
 const CODEBUDDY_AUTH_TOKEN: &str = "CODEBUDDY_AUTH_TOKEN";
 const CODEBUDDY_INTERNET_ENVIRONMENT: &str = "CODEBUDDY_INTERNET_ENVIRONMENT";
 const CODEBUDDY_BASE_URL: &str = "CODEBUDDY_BASE_URL";
@@ -60,6 +68,92 @@ fn state_path() -> PathBuf {
 
 fn settings_path() -> PathBuf {
     home_dir().join(SETTINGS_DIR).join(SETTINGS_FILE)
+}
+
+/// CLI 会话注册表目录（`~/.codebuddy/sessions`）。
+///
+/// **唯一**拼接点：轮换的存活门控与限额归因都从这里取路径，不要再各写一份
+/// `home_dir().join(".codebuddy").join("sessions")`。
+pub(crate) fn sessions_dir() -> PathBuf {
+    home_dir().join(SETTINGS_DIR).join(SESSIONS_DIR_NAME)
+}
+
+/// 注册表文件名形态（对齐客户端 `PID_FILE_PATTERN`）：`<pid>.json` 或 `manual-*.json`。
+///
+/// 客户端还会在该目录放别的东西，只有这两种形态才是会话记录。
+fn is_session_registry_file(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    if stem.chars().all(|character| character.is_ascii_digit()) && !stem.is_empty() {
+        return true;
+    }
+    stem.strip_prefix("manual-")
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// 单份注册表是否心跳新鲜；缺 `lastHeartbeat` / 类型不符 → false（跳过）。
+///
+/// `lastHeartbeat` 在未来（时钟回拨、客户端时钟偏差）时 `now - hb` 为负，仍然算活着 ——
+/// 保守侧：宁可不切，也不要关掉一个可能活着的进程。
+fn heartbeat_is_live(value: &Value, now_ms: i64) -> bool {
+    value
+        .get("lastHeartbeat")
+        .and_then(Value::as_i64)
+        .is_some_and(|heartbeat| now_ms - heartbeat <= LIVE_SESSION_STALE_MS)
+}
+
+/// `dir` 下是否存在心跳新鲜的 CLI 会话；`now_ms` 由调用方给定（便于单测与复用同一时刻）。
+///
+/// - 只认 `^(\d+|manual-.+)\.json$`；坏 JSON / 缺 `lastHeartbeat` 的文件跳过；
+/// - 目录不存在 → `false`（不是错误，未接入 CLI 的机器就是这种形态）；
+/// - 目录存在但读不了 → `eprintln!` 告警后 `false`：**不能**因为读不到就永久卡住轮换，
+///   真出现"旧进程还活着"时由归因侧的丢弃兜底。
+///
+/// 刻意**不**做 `kill(pid, 0)` / `ps` 探测：客户端自己会清理死进程的注册表文件，
+/// 心跳过期已经足够，另行探测只会在跨平台用户权限差异上引入新的失败面。
+fn has_live_session_in(dir: &Path, now_ms: i64) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "[codebuddy-cli] 无法读取会话注册表目录 {}：{error}；本次按无会话处理",
+                dir.display()
+            );
+            return false;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_session_registry_file)
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if heartbeat_is_live(&value, now_ms) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 是否存在活着的 CodeBuddy CLI 会话（`~/.codebuddy/sessions/*.json`，心跳新鲜）。
+///
+/// 自动轮换的存活门控用这个判据：只要返回 true 就不切账号（活进程持的是旧 key，
+/// 切了也不生效，还会破坏「活进程 key == 当前账号」的不变式）。
+pub fn has_live_session(now_ms: i64) -> bool {
+    has_live_session_in(&sessions_dir(), now_ms)
 }
 
 fn clean_bearer_token(token: &str) -> &str {
@@ -382,19 +476,68 @@ fn close_running_codebuddy_cli() -> (bool, usize) {
     (true, pids.len())
 }
 
-fn region_switch_message(variant: WbVariant, closed: bool, closed_count: usize) -> String {
+/// 切换结果文案（唯一构造点）：**始终**说明是否关闭了正在运行的 CLI。
+///
+/// 有进程 → 报出关闭数量（用户需要知道当前会话被打断）；
+/// 无进程 → 明说"未发现"，避免用户以为提示语是模板敷衍。
+fn region_switch_message(variant: WbVariant, region_changed: bool, closed_count: usize) -> String {
     let region = if variant == WbVariant::Ai {
         "国际版"
     } else {
         "国内版"
     };
-    if closed {
-        format!(
+    match (region_changed, closed_count) {
+        (true, 0) => format!("已切换到{region}。未发现正在运行的 CodeBuddy CLI，新开会话即可"),
+        (true, closed_count) => format!(
             "已切换到{region}并关闭正在运行的 CodeBuddy CLI（{closed_count} 个进程）。请重新打开 CLI 后再发会话"
-        )
-    } else {
-        format!("已切换到{region}。未发现正在运行的 CodeBuddy CLI，新开会话即可")
+        ),
+        (false, 0) => {
+            "CodeBuddy CLI 默认账号已更新。未发现正在运行的 CodeBuddy CLI，新开会话即可".to_string()
+        }
+        (false, closed_count) => format!(
+            "CodeBuddy CLI 默认账号已更新，并关闭正在运行的 CodeBuddy CLI（{closed_count} 个进程）。请重新打开 CLI 后再发会话"
+        ),
     }
+}
+
+/// 关闭进程之后发生的失败：CLI 已经退出，但账号没切成功。
+///
+/// 关闭不可回滚，所以错误必须显式说明"我已经把你的 CLI 关了"——否则用户只会看到
+/// "写文件失败"，然后奇怪为什么终端里的会话掉了。无进程可关时不追加这句。
+fn after_close_error(error: String, closed_count: usize) -> String {
+    if closed_count == 0 {
+        return error;
+    }
+    format!("{error}；已关闭 {closed_count} 个正在运行的 CodeBuddy CLI，但账号未切换成功，请重试")
+}
+
+/// 切换的写入阶段：**先关闭正在运行的 CLI，再写 `state.json`**。
+///
+/// 顺序不可互换——先写 state 会留下「新 state + 旧进程仍活」的窗口：旧进程仍持旧 key，
+/// 还可能把旧站点缓存写回去。关闭成功与否都不阻断切换（关不掉就只告警计数）。
+///
+/// 抽成函数只为可测：单测注入 `close` 回调与临时路径，断言关闭发生在写入之前。
+fn close_then_write_state<F>(
+    state_file: &Path,
+    content: &str,
+    close: F,
+) -> Result<(bool, usize), String>
+where
+    F: FnOnce() -> (bool, usize),
+{
+    let (closed, closed_count) = close();
+    atomic_write(state_file, content)
+        .map(|_| (closed, closed_count))
+        .map_err(|_| {
+            after_close_error(
+                if cfg!(windows) {
+                    auth_config_error("状态阶段", "无法写入所选 CLI 账号状态，请检查文件权限")
+                } else {
+                    helper_validation_error("状态阶段", "无法写入所选账号状态，请检查文件权限")
+                },
+                closed_count,
+            )
+        })
 }
 
 fn write_settings_env_token(value: &mut Value, token: &str) -> Result<(), String> {
@@ -812,7 +955,7 @@ fn run_helper_command(command: &str) -> Result<Output, String> {
                     return Err(helper_validation_error(
                         "启动阶段",
                         "无法启动 Git Bash shell",
-                    ))
+                    ));
                 }
             }
         }
@@ -831,7 +974,7 @@ fn run_helper_command(command: &str) -> Result<Output, String> {
                     return Err(helper_validation_error(
                         "启动阶段",
                         "无法使用 Node.js 执行 helper",
-                    ))
+                    ));
                 }
             }
         }
@@ -1209,15 +1352,16 @@ pub fn install_helper() -> Result<Value, String> {
     }))
 }
 
-/// 将 CodeBuddy CLI 的当前账号设置为 WorkBuddy 账号库中的目标账号。
-/// 自动轮换走这条路径，不关闭正在运行的 CLI。
-pub fn set_active_account(account_id: &str) -> Result<Value, String> {
-    switch_active_account(account_id, false)
-}
-
-/// 账号页手动切 CLI。`close_running_cli` 为 true 且发生国内/国际跨站时，
-/// 关闭正在运行的 CLI 进程，避免旧进程把国内站缓存写回去。
-pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Result<Value, String> {
+/// 把 CodeBuddy CLI 的当前账号设为账号库中的目标账号（手动切换与自动轮换的唯一入口）。
+///
+/// 顺序固定：**前置校验 → 关闭正在运行的 CLI → 写 `state.json` → 校验 helper/区域环境**。
+/// 先关后写是为了维持不变式「活着的 CLI 进程持有的 key == `state.json` 的 activeAccountId」：
+/// key 是进程级快照，先写 state 就会留下「新 state + 旧进程仍活」的窗口。
+///
+/// 两个细节：
+/// - 关闭失败 / 没有进程都不阻断切换（只影响返回文案里的数量）；
+/// - 关闭**不可回滚**：后续任一阶段失败时，错误里都会说明 CLI 已被关闭。
+pub fn switch_active_account(account_id: &str) -> Result<Value, String> {
     if cfg!(windows) {
         ensure_no_process_env_override()?;
     }
@@ -1238,8 +1382,8 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
     let variant = WbVariant::from_account(&accounts[index]);
     ensure_region_env_compatible(variant)?;
 
-    // Windows 先验证并生成完整 settings，再写独立账号状态，避免无效 JSON、
-    // 缺失 token 等前置错误造成只有 state.json 被修改的半成功。
+    // Windows 先验证并生成完整 settings 值（纯内存，不落盘），避免无效 JSON、
+    // 缺失 token 等前置错误造成"CLI 已关、账号没切"。
     let windows_settings = if cfg!(windows) {
         let settings = settings_path();
         let token = settings_account_token(&accounts[index])?;
@@ -1249,12 +1393,7 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
         None
     };
 
-    let previous_state = std::fs::read_to_string(state_path()).ok();
-    let mut state = load_state();
-    let previous_variant = current_cli_variant(&accounts, &state);
-    state["active"] = json!(index);
-    state["activeAccountId"] = json!(canonical_id);
-    state["updatedAt"] = json!(now_ms());
+    // 目录先建好：写 state 是"关进程之后"的事，那一段里不再留失败点。
     std::fs::create_dir_all(rotate_dir()).map_err(|_| {
         if cfg!(windows) {
             auth_config_error("状态阶段", "无法创建 CLI 账号状态目录，请检查用户目录权限")
@@ -1262,14 +1401,18 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
             helper_validation_error("状态阶段", "无法创建 helper 状态目录，请检查用户目录权限")
         }
     })?;
+
+    let previous_state = std::fs::read_to_string(state_path()).ok();
+    let switched_at = now_ms();
+    let mut state = load_state();
+    let previous_variant = current_cli_variant(&accounts, &state);
+    state["active"] = json!(index);
+    state["activeAccountId"] = json!(canonical_id);
+    state["updatedAt"] = json!(switched_at);
     let content = serde_json::to_string_pretty(&state).map_err(|error| error.to_string())?;
-    atomic_write(&state_path(), &content).map_err(|_| {
-        if cfg!(windows) {
-            auth_config_error("状态阶段", "无法写入所选 CLI 账号状态，请检查文件权限")
-        } else {
-            helper_validation_error("状态阶段", "无法写入所选账号状态，请检查文件权限")
-        }
-    })?;
+    // 顺序关键点：关闭在前、写 state 在后（用例固定这个顺序）。
+    let (cli_closed, closed_count) =
+        close_then_write_state(&state_path(), &content, close_running_codebuddy_cli)?;
 
     if let Some((settings, previous_settings, settings_value, token)) = windows_settings {
         if let Err(error) = commit_settings_env_update(
@@ -1280,36 +1423,22 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
             variant,
         ) {
             restore_file(&state_path(), previous_state.as_deref());
-            return Err(error);
+            return Err(after_close_error(error, closed_count));
         }
     } else {
-        let command = helper_command()
-            .ok_or_else(|| helper_validation_error("配置阶段", "apiKeyHelper 配置为空"))?;
-        if let Err(error) = validate_helper_for_account(&command, &accounts[index]) {
+        // helper 校验必须在 state 写完之后：helper 是照 `state.json` 选 token 的，
+        // 先校验等于拿旧账号去比对新账号。
+        let validation = helper_command()
+            .ok_or_else(|| helper_validation_error("配置阶段", "apiKeyHelper 配置为空"))
+            .and_then(|command| validate_helper_for_account(&command, &accounts[index]))
+            .and_then(|_| persist_cli_region_env(variant));
+        if let Err(error) = validation {
             restore_file(&state_path(), previous_state.as_deref());
-            return Err(error);
-        }
-        if let Err(error) = persist_cli_region_env(variant) {
-            restore_file(&state_path(), previous_state.as_deref());
-            return Err(error);
+            return Err(after_close_error(error, closed_count));
         }
     }
 
     let region_changed = previous_variant != Some(variant);
-    let (cli_closed, closed_count) = if close_running_cli && region_changed {
-        close_running_codebuddy_cli()
-    } else {
-        (false, 0)
-    };
-    let message = if region_changed && close_running_cli {
-        region_switch_message(variant, cli_closed, closed_count)
-    } else if region_changed {
-        "CodeBuddy CLI 默认账号与站点已更新；当前运行会话不会切换，重新加载会话或重启 CLI 后生效"
-            .to_string()
-    } else {
-        "CodeBuddy CLI 默认账号已更新；当前运行会话不会切换，请重新加载会话或新开会话后生效"
-            .to_string()
-    };
 
     Ok(json!({
         "ok": true,
@@ -1322,7 +1451,7 @@ pub fn switch_active_account(account_id: &str, close_running_cli: bool) -> Resul
         "regionChanged": region_changed,
         "cliClosed": cli_closed,
         "closedProcessCount": closed_count,
-        "message": message,
+        "message": region_switch_message(variant, region_changed, closed_count),
     }))
 }
 
@@ -1375,6 +1504,207 @@ mod tests {
     #[test]
     fn empty_accounts_have_no_active_account() {
         assert_eq!(state_account_index(&json!({"active": 0}), &[]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // 会话存活判据（`has_live_session`）
+    // -----------------------------------------------------------------------
+
+    /// 一个临时 sessions 目录；用例结束后删除 `parent()` 之外的兄弟文件。
+    fn sessions_fixture() -> (PathBuf, PathBuf) {
+        let root = helper_test_dir();
+        let dir = root.join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        (root, dir)
+    }
+
+    /// 写一份注册表文件（`<pid>.json` / `manual-*.json` / 其它名字都由 `name` 决定）。
+    fn write_session_file(dir: &Path, name: &str, body: &str) {
+        fs::write(dir.join(name), body).unwrap();
+    }
+
+    /// 心跳为 `heartbeat` 的注册表内容（字段与客户端形态一致）。
+    fn session_json(heartbeat: i64) -> String {
+        json!({
+            "pid": 9312,
+            "sessionId": "01a0aeb3-1f70-7d85-b356-0faa85650c1f",
+            "startedAt": heartbeat,
+            "lastHeartbeat": heartbeat,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn sessions_dir_is_the_single_join_point_under_codebuddy_home() {
+        let dir = sessions_dir();
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some(SESSIONS_DIR_NAME)
+        );
+        assert_eq!(
+            dir.parent().and_then(|parent| parent.file_name()),
+            Some(std::ffi::OsStr::new(SETTINGS_DIR))
+        );
+        assert_eq!(
+            dir.parent().and_then(|parent| parent.parent()),
+            Some(crate::modules::config::home_dir().as_path())
+        );
+    }
+
+    #[test]
+    fn fresh_heartbeat_marks_the_session_alive_and_stale_one_does_not() {
+        let (root, dir) = sessions_fixture();
+        let now = 1_800_000_000_000;
+
+        // 恰好等于阈值：仍算活着（`<=` 与客户端超时判定一致）。
+        write_session_file(
+            &dir,
+            "9312.json",
+            &session_json(now - LIVE_SESSION_STALE_MS),
+        );
+        assert!(has_live_session_in(&dir, now));
+
+        // 超过阈值 1ms：过期。
+        write_session_file(
+            &dir,
+            "9312.json",
+            &session_json(now - LIVE_SESSION_STALE_MS - 1),
+        );
+        assert!(!has_live_session_in(&dir, now));
+
+        // 未来心跳（时钟回拨 / 客户端时钟偏差）：保守视为活着。
+        write_session_file(&dir, "9312.json", &session_json(now + 5 * 60_000));
+        assert!(has_live_session_in(&dir, now));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn manual_session_files_count_and_other_names_are_ignored() {
+        let (root, dir) = sessions_fixture();
+        let now = 1_800_000_000_000;
+        let fresh = now - 1_000;
+
+        // `manual-<name>.json` 是客户端另一种合法形态。
+        write_session_file(&dir, "manual-review.json", &session_json(fresh));
+        assert!(has_live_session_in(&dir, now));
+        fs::remove_file(dir.join("manual-review.json")).unwrap();
+
+        // 其它形态都不认（含空 stem、缺 `-` 后缀、非 .json 扩展名）。
+        for name in [
+            "session.json",
+            "manual-.json",
+            ".json",
+            "9312.json.bak",
+            "9312",
+            "notes.txt",
+        ] {
+            write_session_file(&dir, name, &session_json(fresh));
+        }
+        assert!(!has_live_session_in(&dir, now));
+        // 认形态但内容坏 / 缺字段 → 跳过，不阻塞其它文件。
+        write_session_file(&dir, "9313.json", "not-json");
+        write_session_file(&dir, "9314.json", &json!({"pid": 9314}).to_string());
+        assert!(!has_live_session_in(&dir, now));
+        // 同目录里加一份新鲜的心跳文件 → 活着。
+        write_session_file(&dir, "9315.json", &session_json(fresh));
+        assert!(has_live_session_in(&dir, now));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn missing_sessions_dir_is_not_an_error() {
+        let (root, dir) = sessions_fixture();
+        let missing = root.join("missing-sessions");
+        assert!(!has_live_session_in(&missing, 1_800_000_000_000));
+        assert!(!missing.exists(), "不得因为探测而创建目录");
+        // 路径存在但不是目录（例如同名文件）同样按无会话处理。
+        write_session_file(&root, "not-a-dir", "x");
+        assert!(!has_live_session_in(&root.join("not-a-dir"), 1));
+        assert!(!has_live_session_in(&dir, 1_800_000_000_000));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_sessions_dir_is_reported_as_no_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, dir) = sessions_fixture();
+        write_session_file(&dir, "9312.json", &session_json(1_800_000_000_000));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // root 不受权限位约束（CI 容器常见）：此时构造不出该场景，跳过而不是假失败。
+        if std::fs::read_dir(&dir).is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::remove_dir_all(root).ok();
+            return;
+        }
+        assert!(!has_live_session_in(&dir, 1_800_000_000_000));
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // 切换顺序：先关进程，再写 state.json
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn state_is_written_only_after_the_cli_is_closed() {
+        let root = helper_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        let state_file = root.join("state.json");
+        let order = std::cell::RefCell::new(Vec::new());
+
+        let (closed, count) = close_then_write_state(&state_file, "{\"active\":1}", || {
+            order.borrow_mut().push("close");
+            // 关闭的瞬间不能已经存在新 state：否则旧进程会读到新账号。
+            assert!(!state_file.exists(), "写 state 必须发生在关闭进程之后");
+            (true, 2)
+        })
+        .expect("切换写入");
+        order.borrow_mut().push("write");
+
+        assert_eq!(*order.borrow(), vec!["close", "write"]);
+        assert!(closed);
+        assert_eq!(count, 2);
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), "{\"active\":1}");
+
+        // 生产形态：`state.json` 在上一次切换时就已经存在。此时"没写出新内容"才是顺序证据 ——
+        // 若先写后关，关闭的回调里读到的会是新内容（或至少不再是旧内容）。
+        fs::write(&state_file, "{\"active\":0}").unwrap();
+        let (_, count) = close_then_write_state(&state_file, "{\"active\":2}", || {
+            assert_eq!(
+                fs::read_to_string(&state_file).unwrap(),
+                "{\"active\":0}",
+                "关闭进程时 state.json 必须还是旧内容"
+            );
+            (true, 1)
+        })
+        .expect("切换写入");
+        assert_eq!(count, 1);
+        assert_eq!(fs::read_to_string(&state_file).unwrap(), "{\"active\":2}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn state_write_failure_reports_the_already_closed_cli() {
+        let root = helper_test_dir();
+        fs::create_dir_all(&root).unwrap();
+        // 父路径是普通文件 → 写入必然失败，且失败发生在关闭之后。
+        fs::write(root.join("blocker"), "x").unwrap();
+        let state_file = root.join("blocker").join("state.json");
+
+        let error = close_then_write_state(&state_file, "{}", || (true, 3)).unwrap_err();
+        assert!(
+            error.contains("已关闭 3 个"),
+            "必须说明 CLI 已被关闭: {error}"
+        );
+
+        // 没有关到进程时不追加那句话（错误保持原样）。
+        let error = close_then_write_state(&state_file, "{}", || (false, 0)).unwrap_err();
+        assert!(!error.contains("已关闭"), "无进程可关时不追加: {error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, export_import, oauth, process, refresh, rotate, session, switch, token_stats, travel,
-    update, variant::WbVariant,
+    credits, export_import, limits, oauth, process, rate_limit_events, rate_limit_hook, refresh,
+    rotate, session, switch, token_stats, travel, update, variant::WbVariant,
 };
 
 #[derive(Serialize)]
@@ -94,8 +94,10 @@ pub async fn install_codebuddy_cli_helper() -> Result<Value, String> {
 
 /// POST /api/codebuddy-cli/switch —— 只切换 CodeBuddy CLI，不重启 WorkBuddy。
 ///
-/// `close_running_cli`：账号页确认后的跨站切换会关闭正在运行的 CLI；
-/// 自动轮换不传，保持「下次会话生效」。
+/// 任何切换都会**先关闭正在运行的 CodeBuddy CLI 再写状态**：key 是进程级快照，
+/// 不关进程就会出现"新默认账号 + 旧进程仍持旧 key"的窗口。当前 CLI 会话因此会中断。
+///
+/// `close_running_cli` 入参**已废弃**（保留接受但忽略），仅为不破坏既有调用方。
 ///
 /// async + spawn_blocking：切换会用登录 shell 定位 node 并执行 apiKeyHelper
 /// 校验账号（子进程无超时），同步 command 会阻塞主线程造成 UI 卡顿。
@@ -107,11 +109,10 @@ pub async fn switch_codebuddy_cli_account(
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    tauri::async_runtime::spawn_blocking(move || {
-        codebuddy_cli::switch_active_account(&account_id, close_running_cli.unwrap_or(false))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    let _ = close_running_cli;
+    tauri::async_runtime::spawn_blocking(move || codebuddy_cli::switch_active_account(&account_id))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// GET /api/codebuddy-cn-ide/status —— CodeBuddy IDE 安装/运行/当前账号。
@@ -408,6 +409,78 @@ pub async fn get_token_statistics(days: Option<i64>) -> Result<Value, String> {
         .map_err(|error| format!("扫描 Token 统计失败: {error}"))
 }
 
+/// GET /api/rate-limits —— 模型限额台账（全部账号当前受限的模型与官方恢复时刻）。
+///
+/// 不接收档位参数：扫描本身就是全局的（两档位各扫一遍）。扫描读取本机日志文件，
+/// 放 blocking 线程避免阻塞主线程；无受限模型时返回空数组，不是错误。
+#[tauri::command]
+pub async fn get_rate_limits() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(limits::get_rate_limits)
+        .await
+        .map_err(|error| format!("扫描模型限额失败: {error}"))
+}
+
+/// GET /api/rate-limits/hook-status —— hook 安装状态（脚本 + 三处客户端配置逐项结果）。
+///
+/// 读三个 `settings.json` 与一个脚本文件，放 blocking 线程避免占用主线程。
+#[tauri::command]
+pub async fn get_rate_limit_hook_status() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(with_hook_runtime_fields)
+        .await
+        .map_err(|error| format!("查询限额 hook 状态失败: {error}"))
+}
+
+/// POST /api/rate-limits/install-hook —— 安装 hook（幂等，写前备份；同时清除「卸载过」标记）。
+#[tauri::command]
+pub async fn install_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::install_hook();
+        // 扫描范围随安装结果变化（只对未注册的来源扫日志），缓存必须作废。
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// POST /api/rate-limits/uninstall-hook —— 卸载 hook（移除注册条目，尽量逐字节还原）。
+///
+/// 卸载即用户拒绝自动接入：`install_hook` / `hookOptOut` 的置位在 core 里与安装逻辑同处，
+/// 两个宿主（桌面端 / webui）共用同一语义。
+#[tauri::command]
+pub async fn uninstall_rate_limit_hook() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let result = rate_limit_hook::uninstall_hook();
+        limits::invalidate_scan_cache();
+        result.map(|_| with_hook_runtime_fields())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// hook 状态 + 运行期字段（最近一次 hook 事件时刻）。
+fn with_hook_runtime_fields() -> Value {
+    let mut status = rate_limit_hook::hook_status();
+    status["lastEventAt"] = json!(rate_limit_events::last_event_at());
+    status
+}
+
+/// GET /api/rate-limits/config —— 限额监听开关。
+#[tauri::command]
+pub fn get_rate_limit_config() -> Value {
+    crate::modules::config::load_rate_limit_config()
+}
+
+/// POST /api/rate-limits/config —— 保存限额监听开关。
+///
+/// 走 `limits::save_rate_limit_config`：`scanIdeLogs` 变化时同步清扫描缓存（只清缓存，
+/// 不强制全量），否则关掉 IDE 扫描后下一次还会按旧缓存把两个 IDE 扫一遍。
+#[tauri::command]
+pub fn save_rate_limit_config(config: Value) -> Result<Value, String> {
+    limits::save_rate_limit_config(&config).map_err(|e| e.to_string())?;
+    Ok(crate::modules::config::load_rate_limit_config())
+}
+
 /// POST /api/checkin —— 单账号立即签到。
 #[tauri::command]
 pub async fn checkin(account_id: String) -> Result<Value, String> {
@@ -501,9 +574,14 @@ pub fn rotate_status() -> Value {
 }
 
 /// POST /api/rotate/run —— 手动触发一次轮换检查。
+///
+/// 返回体里的 `notify`（若因存活门控被推迟且未超当日预算）由宿主投递系统通知；
+/// 无头 server 只返回该字段，不投递。
 #[tauri::command]
-pub async fn run_rotate() -> Value {
-    rotate::run_rotate_cycle().await
+pub async fn run_rotate(app: tauri::AppHandle) -> Value {
+    let result = rotate::run_rotate_cycle().await;
+    crate::deliver_rotate_notify(&app, &result);
+    result
 }
 
 /// GET /api/rotate/logs —— 最近轮换日志。

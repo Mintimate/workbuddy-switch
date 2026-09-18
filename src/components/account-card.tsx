@@ -1,5 +1,5 @@
-import { ArrowRight, CalendarCheck2, CalendarDays, Check, CircleCheck, Clock3, Coins, Ellipsis, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { ArrowRight, CalendarCheck2, CalendarDays, Check, CircleCheck, Clock3, Coins, Ellipsis, Gauge, Loader2, PackageOpen, PlaneTakeoff, RefreshCw, Sparkles, Star, Trash2 } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,7 @@ import { CodeBuddyCnIdeMark, CodeBuddyMark, WorkBuddyMark } from "@/components/p
 import { cn } from "@/lib/utils";
 import { creditResourceName } from "@/lib/credit-package-names";
 import { demoModeEnabled } from "@/lib/demo-mode";
-import type { AccountMeta, CreditExpiry, CreditResource, TravelStatus } from "@/lib/types";
+import type { AccountMeta, CreditExpiry, CreditResource, RateLimitEntry, TravelStatus } from "@/lib/types";
 
 const AVATAR_TONES = [
   "bg-emerald-100 text-emerald-800",
@@ -91,24 +91,36 @@ const chipClass = "rounded-md px-1.5 py-0 text-[11px] font-medium";
 
 /**
  * 纯图标状态 chip：状态由图标 + 色调 + tooltip 共同表达，不再占文案宽度。
- * 签到与旅行共用这一份实现（角标样式、`aria-label`、tooltip 位置统一）。
+ * 签到、旅行与模型限额共用这一份实现（角标样式、`aria-label`、tooltip 位置统一）。
  */
 function statusIconChip({
   icon,
   label,
   tooltip,
   variant,
+  count,
 }: {
   icon: ReactNode;
   label: string;
-  tooltip: string;
-  variant: "secondary" | "success";
+  tooltip: ReactNode;
+  variant: "secondary" | "success" | "warning";
+  /** 数量角标；≤1 时不显示（单个受限模型不需要角标）。 */
+  count?: number;
 }) {
+  const badge = count != null && count > 1;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Badge variant={variant} className={cn(chipClass, "px-1")} aria-label={label}>
+        <Badge variant={variant} className={cn(chipClass, "px-1", badge && "gap-0.5")} aria-label={label}>
           {icon}
+          {badge ? (
+            <span
+              aria-hidden="true"
+              className="flex h-3 min-w-3 items-center justify-center rounded-full bg-amber-600 px-0.5 text-[9px] font-semibold leading-none tabular-nums text-white"
+            >
+              {count}
+            </span>
+          ) : null}
         </Badge>
       </TooltipTrigger>
       <TooltipContent side="top">{tooltip}</TooltipContent>
@@ -176,6 +188,64 @@ function travelChip(status: TravelStatus | undefined) {
   }
 }
 
+/** 倒计时：`2h14m 后恢复`；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
+function formatRateLimitRemaining(resetAt: number, now: number): string {
+  const remainingMs = resetAt - now;
+  if (remainingMs <= 0) return "即将恢复";
+  const totalMinutes = Math.max(1, Math.ceil(remainingMs / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (hours > 0 && minutes > 0) return `${hours}h${minutes}m 后恢复`;
+  if (hours > 0) return `${hours}h 后恢复`;
+  return `${minutes}m 后恢复`;
+}
+
+/** 恢复时刻：今天 `17:59`、明天 `明天 09:00`、更远 `9/18 09:00`。 */
+function formatRateLimitClock(resetAt: number, now: number): string {
+  const reset = new Date(resetAt);
+  const time = `${String(reset.getHours()).padStart(2, "0")}:${String(reset.getMinutes()).padStart(2, "0")}`;
+  const midnight = (date: Date) => new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const days = Math.round((midnight(reset) - midnight(new Date(now))) / 86_400_000);
+  if (days <= 0) return time;
+  if (days === 1) return `明天 ${time}`;
+  return `${reset.getMonth() + 1}/${reset.getDate()} ${time}`;
+}
+
+/**
+ * 模型限额 chip：放在旅行图标旁。
+ *
+ * - 该账号当前没有受限模型 → 不渲染（AC1）；
+ * - 悬停按恢复时间**升序**列出全部受限模型（最早的解锁时刻最有行动价值），
+ *   每行是「模型 · 倒计时（恢复时刻）」——倒计时看还剩多久，括号里的时刻看具体什么时候；
+ * - 受限模型数 >1 → 图标带数量角标（AC2.1）；
+ * - `resetAt` 已过本地时钟的条目每秒被过滤掉，全部过期后图标自动消失，不依赖后端刷新；
+ * - 归因失败的模型显示「未知模型」，不猜测。
+ */
+function rateLimitChip(limits: RateLimitEntry[] | undefined, now: number) {
+  const active = (limits ?? [])
+    .filter((limit) => Number.isFinite(limit.resetAt) && limit.resetAt > now)
+    .sort((left, right) => left.resetAt - right.resetAt);
+  if (active.length === 0) return null;
+  const lines = active.map(
+    (limit) =>
+      `${limit.model ?? "未知模型"} · ${formatRateLimitRemaining(limit.resetAt, now)}（${formatRateLimitClock(limit.resetAt, now)}）`,
+  );
+  return statusIconChip({
+    icon: <Gauge className="size-3.5" />,
+    label: `模型限额：${lines.join("；")}`,
+    // 多模型时会有多行，字号比全局 TooltipContent（text-xs）再小一号。
+    tooltip: (
+      <span className="flex flex-col gap-0.5 text-[11px] leading-4">
+        {lines.map((line) => (
+          <span key={line}>{line}</span>
+        ))}
+      </span>
+    ),
+    variant: "warning",
+    count: active.length,
+  });
+}
+
 interface Props {
   account: AccountMeta;
   onDelete: (a: AccountMeta) => void;
@@ -185,6 +255,8 @@ interface Props {
   todayCheckedIn?: boolean;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
   travelStatus?: TravelStatus;
+  /** 该账号当前受限的模型（来自本机日志台账）；空/缺失=无受限，不渲染图标。 */
+  rateLimits?: RateLimitEntry[];
   credit?: CreditExpiry;
   creditLoading?: boolean;
   /** 该账号积分最近一次查询完成时间（时间戳） */
@@ -283,8 +355,18 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  /**
+   * 限额图标要随官方恢复时刻自动消失（AC3），所以本地每秒走一次时钟。
+   * 只在确实有受限模型时才开定时器，普通卡片不引入额外开销。
+   */
+  useEffect(() => {
+    if (!rateLimits?.length) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [rateLimits]);
   const name = account.nickname || account.uid || "未命名账号";
   const expired = typeof account.expiresAt === "number" && account.expiresAt < Date.now();
   const avatarClass = avatarTone(name);
@@ -318,6 +400,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
           variant: todayCheckedIn ? "success" : "secondary",
         })}
       {travelChip(travelStatus)}
+      {rateLimitChip(rateLimits, now)}
       {(account.needsRelogin || expired) && <Badge variant="warning" className={chipClass}>{account.needsRelogin ? "需重新登录" : "Token 已过期"}</Badge>}
       {creditPriority && (
         <Tooltip>

@@ -21,7 +21,7 @@ use crate::modules::config::{backup_dir, now_ms, now_secs, utc_iso};
 use crate::modules::variant::WbVariant;
 
 /// 打开数据库并设置 busy_timeout（对照 Python `sqlite3.connect(timeout=5)`）。
-fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
+pub(crate) fn open_db(path: &Path, read_only: bool) -> Option<Connection> {
     let conn = if read_only {
         Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?
     } else {
@@ -82,7 +82,7 @@ pub fn current_user_uid(variant: WbVariant) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn table_exists(conn: &Connection, name: &str) -> bool {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
         [name],
