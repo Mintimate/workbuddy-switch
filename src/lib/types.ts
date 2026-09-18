@@ -127,6 +127,103 @@ export interface SessionRecoveryReport {
   needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
 }
 
+// ---------------------------------------------------------------------------
+// 会话同步（关联组）：预览与执行契约，与 core / Tauri / HTTP 三端同形
+// ---------------------------------------------------------------------------
+
+/**
+ * 同步判定结果（design §3.2 优先级表）：
+ * `identical` 内容一致、`fastForward` 可快进、`ahead` 仅目标变化、
+ * `diverge` 冲突需显式覆盖、`unknown` 不可验证。
+ */
+export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
+
+/** 同步写入模式：只有后端 `availableModes` 里给出的模式才允许提交。 */
+export type SessionSyncMode = "fastForward" | "overwrite";
+
+/** 关联组成员（不含正文）：`state` 为 active 时才算该账号的有效成员。 */
+export interface SessionLinkMember {
+  memberId: string;
+  uid: string;
+  accountId: string | null;
+  sessionId: string;
+  state: "active" | "stale" | "superseded";
+}
+
+/** 关联组的预览项；`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源。 */
+export interface SessionLinkPreviewGroup {
+  groupId: string;
+  title: string;
+  cwd: string;
+  verdict: SessionSyncVerdict;
+  /** 来源独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraA: number;
+  /** 目标独有记录数（多重集差集，仅用于向用户解释）。 */
+  extraB: number;
+  common: number;
+  defaultChecked: boolean;
+  /** 为空表示该项不可勾选（identical / ahead / unknown / 预览凭据不可用）。 */
+  availableModes: SessionSyncMode[];
+  reason: string;
+  /** 记录数（不是消息数）：不可验证时 source/target 为 0、baseline 为 null。 */
+  recordCount: { source: number; target: number; baseline: number | null };
+  source: SessionLinkMember | null;
+  target: SessionLinkMember | null;
+  /** 勾选时必须原样回传的预览凭据；缺失即不可勾选。 */
+  previewToken?: string;
+}
+
+/** 关联会话预览：`supported` 为 false（或 storeStatus 为 unsupported）时不展示同步区块。 */
+export interface SessionLinksPreview {
+  supported: boolean;
+  storeStatus: "ready" | "missing" | "unavailable" | "unsupported";
+  storeError?: string;
+  sourceUid: string;
+  targetUid: string;
+  groups: SessionLinkPreviewGroup[];
+}
+
+/** 一条同步选择：与预览凭据绑定，执行时后端会重新校验。 */
+export interface SessionSyncSelection {
+  groupId: string;
+  previewToken: string;
+  mode: SessionSyncMode;
+}
+
+/** 已同步的关联组（保留目标 sessionId 与标题）。 */
+export interface SessionSyncResultItem {
+  groupId: string;
+  status: "synced";
+  verdict: SessionSyncVerdict;
+  mode: SessionSyncMode;
+  sourceSessionId: string;
+  targetSessionId: string;
+  recordCount: { source: number; targetBefore: number; target: number };
+  updatedAt: number;
+  /** 本次覆盖前的备份目录（可查看恢复位置）。 */
+  backup: string;
+  backupManifest: string;
+  message: string;
+}
+
+/** 被跳过的关联组：`reasonCode` 为 previewStale 时说明预览已过期，不得显示为成功。 */
+export interface SessionSyncSkippedItem {
+  groupId: string;
+  status: "skipped";
+  reasonCode: string;
+  message: string;
+  verdict: SessionSyncVerdict | null;
+}
+
+/** 同步执行报告；`errors` 里可能是整批被拒（无 groupId）。 */
+export interface SessionSyncReport {
+  synced: SessionSyncResultItem[];
+  skipped: SessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
+  /** 仍有未完成/无法安全恢复的会话写入时为 true。 */
+  needsRecovery?: boolean;
+}
+
 export interface SwitchResult {
   ok: boolean;
   account: string;
@@ -134,6 +231,8 @@ export interface SwitchResult {
   variant?: WbVariant;
   backup: string | null;
   sessionCopy?: SessionCopyReport;
+  /** 本次的会话同步报告（未勾选同步时不返回）；含跳过与失败原因，不只是成功数。 */
+  sessionSync?: SessionSyncReport;
   sessionRecovery?: SessionRecoveryReport;
 }
 

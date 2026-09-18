@@ -16,9 +16,15 @@ import {
 } from "@/components/ui/dialog";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { SessionSyncSection } from "@/components/session-sync-section";
 import * as api from "@/lib/api";
 import { accountVariant, variantAppName } from "@/lib/variant";
-import type { AccountMeta, Session } from "@/lib/types";
+import type {
+  AccountMeta,
+  Session,
+  SessionLinkPreviewGroup,
+  SessionSyncSelection,
+} from "@/lib/types";
 
 interface Props {
   open: boolean;
@@ -41,6 +47,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [error, setError] = useState("");
   const [currentUid, setCurrentUid] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
+  /** 会话同步：勾选结果（默认值来自后端 defaultChecked）与预览组（结果反馈回显用）。 */
+  const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
+  const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
 
   // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
   useEffect(() => {
@@ -70,6 +79,8 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       setSelected(new Set());
       setExpanded(new Set());
       setError("");
+      setSyncSelections([]);
+      setSyncGroups([]);
       setLoadingSessions(true);
       api
         .listSessions(accountVariant(account))
@@ -116,10 +127,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setProgress("正在切换账号…");
     setError("");
     const requestedCopy = copySessions && selected.size > 0;
+    const requestedSync = syncSelections.length > 0;
     try {
       const res = await api.switchAccount({
         accountId: account.id,
         copySessionIds: requestedCopy ? [...selected] : undefined,
+        // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
+        syncSelections: requestedSync ? syncSelections : undefined,
       });
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const parts: string[] = [];
@@ -130,7 +144,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (copiedCount > 0) parts.push(`已复制 ${copiedCount} 个会话`);
       if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个已有副本`);
       if (copyErrors.length > 0) parts.push(`会话复制失败 ${copyErrors.length} 个`);
+      const syncReport = res.sessionSync;
+      const syncedItems = syncReport?.synced ?? [];
+      const skippedItems = syncReport?.skipped ?? [];
+      const syncErrors = syncReport?.errors ?? [];
+      if (syncedItems.length > 0) parts.push(`已同步 ${syncedItems.length} 个会话`);
+      if (skippedItems.length > 0) parts.push(`跳过 ${skippedItems.length} 个会话`);
+      if (syncErrors.length > 0) parts.push(`会话同步失败 ${syncErrors.length} 个`);
       if (res.backup) parts.push(`备份: ${res.backup}`);
+      // 同步备份路径可查看：每个成功项一个唯一目录（恢复位置）。
+      const syncBackups = [...new Set(syncedItems.map((item) => item.backup).filter(Boolean))];
+      if (syncBackups.length > 0) parts.push(`同步备份: ${syncBackups.join("；")}`);
       toast.success(`已切换至「${nickname}」`, {
         description: parts.length ? parts.join("；") : `${variantAppName(accountVariant(account))} 已重启为目标账号。`,
       });
@@ -144,6 +168,33 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       } else if (requestedCopy && !copyReport) {
         toast.warning("会话未复制", {
           description: "后端未返回复制结果：当前档位可能不支持会话复制，账号已切换但未复制会话。",
+        });
+      }
+      // 同步结果：成功、跳过、失败与恢复信息都要能看到，不能只显示成功数。
+      const groupLabel = (groupId: string) =>
+        syncGroups.find((group) => group.groupId === groupId)?.title || groupId;
+      // 失败与跳过合并成一条提示：两者可能同时出现，不能只报其中一类。
+      const syncIssues = [
+        ...syncErrors.map(
+          (item) => `${item.groupId ? groupLabel(item.groupId) : "全部会话"}：${item.error}`,
+        ),
+        // 预览过期/前置条件变化一律跳过并给出原因，绝不显示成已同步。
+        ...skippedItems.map((item) => `${groupLabel(item.groupId)}：${item.message}`),
+      ];
+      if (syncIssues.length > 0) {
+        if (syncErrors.length > 0) {
+          toast.error("部分会话未同步（失败或已跳过）", { description: syncIssues.join("；") });
+        } else {
+          toast.warning("有会话未同步（已跳过）", { description: syncIssues.join("；") });
+        }
+      } else if (requestedSync && !syncReport) {
+        toast.warning("会话同步未执行", {
+          description: "后端未返回同步结果：当前档位可能不支持会话同步，或本次切换未重启。",
+        });
+      }
+      if (syncReport?.needsRecovery) {
+        toast.error("存在未完成的会话同步写入", {
+          description: "已保留操作记录与备份，下次切号会先恢复；恢复完成前不会再写入目标正文。",
         });
       }
       // 未完成的会话写入：可重试项只提示，阻断项由后端直接返回错误。
@@ -375,6 +426,17 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               </div>
             </>
           )}
+
+          {/* 会话同步：与复制同一请求提交；不支持（国际版能力判定不通过）时区块自隐藏。 */}
+          <SessionSyncSection
+            open={open}
+            account={account}
+            disabled={busy}
+            onChange={(state) => {
+              setSyncSelections(state.selections);
+              setSyncGroups(state.groups);
+            }}
+          />
 
           {error && (
             <Alert variant={needsPermission ? "warning" : "destructive"} className="min-w-0 break-all">

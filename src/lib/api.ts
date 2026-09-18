@@ -27,6 +27,8 @@ import type {
   RotateStatus,
   Session,
   SessionCopyReport,
+  SessionLinksPreview,
+  SessionSyncSelection,
   SwitchResult,
   TravelConfig,
   TravelStatus,
@@ -102,6 +104,7 @@ const ROUTES: Record<string, Route> = {
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -326,6 +329,7 @@ export function switchAccount(args: {
   restart?: boolean;
   shareSessions?: boolean;
   copySessionIds?: string[];
+  syncSelections?: SessionSyncSelection[];
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -349,6 +353,21 @@ export function copySessions(
   sessionIds: string[],
 ): Promise<SessionCopyReport & { variant?: WbVariant }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+/**
+ * 预览「当前账号 → 目标账号」可同步的关联会话（只读）。
+ *
+ * 默认勾选与可选模式都来自后端：前端只按 `defaultChecked` / `availableModes` 渲染，
+ * 不自行扩大权限。`variant` 缺省由后端取目标账号自身档位。
+ */
+export function sessionLinksPreview(
+  targetAccountId: string,
+  variant?: WbVariant,
+): Promise<SessionLinksPreview> {
+  const args: Record<string, unknown> = { targetAccountId };
+  if (variant === "ai") args.variant = variant;
+  return call("session_links_preview", args);
 }
 
 /** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
