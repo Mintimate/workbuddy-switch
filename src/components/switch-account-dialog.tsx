@@ -24,6 +24,7 @@ import type {
   Session,
   SessionLinkPreviewGroup,
   SessionSyncSelection,
+  TemporaryFileInfo,
 } from "@/lib/types";
 
 interface Props {
@@ -33,6 +34,25 @@ interface Props {
   account: AccountMeta | null;
   /** 切换完成后刷新列表 */
   onDone?: () => void;
+}
+
+/** 临时备份残留的可读描述：优先标题，其次会话 id，最后操作 id。 */
+function describeTemporaryFile(item: TemporaryFileInfo): string {
+  const label = item.title || item.sessionId || item.operationId;
+  return `${label}：${item.reason}`;
+}
+
+/** 同一操作只保留一条：复制 / 同步 / 恢复三个报告可能重复上报同一残留。 */
+function dedupeTemporaryFiles(items: TemporaryFileInfo[]): TemporaryFileInfo[] {
+  const seen = new Map<string, TemporaryFileInfo>();
+  for (const item of items) {
+    const key = `${item.operationId}:${item.state}`;
+    const existing = seen.get(key);
+    if (!existing || (existing.state === "cleanupPending" && item.state === "needsRecovery")) {
+      seen.set(key, item);
+    }
+  }
+  return [...seen.values()];
 }
 
 /** 切换账号弹窗：可勾选当前账号的会话复制到目标账号（路径 B）。 */
@@ -152,9 +172,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (skippedItems.length > 0) parts.push(`跳过 ${skippedItems.length} 个会话`);
       if (syncErrors.length > 0) parts.push(`会话同步失败 ${syncErrors.length} 个`);
       if (res.backup) parts.push(`备份: ${res.backup}`);
-      // 同步备份路径可查看：每个成功项一个唯一目录（恢复位置）。
-      const syncBackups = [...new Set(syncedItems.map((item) => item.backup).filter(Boolean))];
-      if (syncBackups.length > 0) parts.push(`同步备份: ${syncBackups.join("；")}`);
+      // 成功清理：临时备份已回收，不再展示可还原路径；待清理项单独提示，不写进成功文案。
       toast.success(`已切换至「${nickname}」`, {
         description: parts.length ? parts.join("；") : `${variantAppName(accountVariant(account))} 已重启为目标账号。`,
       });
@@ -162,8 +180,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (copyReport?.error) {
         toast.error("会话复制未执行", { description: copyReport.error });
       } else if (copyErrors.length > 0) {
+        // 失败提示必须带会话标识（能取标题时优先标题），不是只有原因。
+        const sessionLabel = (id: string) =>
+          sessions.find((item) => item.id === id)?.title || id;
         toast.error("部分会话未复制", {
-          description: copyErrors.map((item) => item.error).join("；"),
+          description: copyErrors
+            .map((item) => `${sessionLabel(item.id)}：${item.error}`)
+            .join("；"),
         });
       } else if (requestedCopy && !copyReport) {
         toast.warning("会话未复制", {
@@ -202,6 +225,39 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (recoveryIssues.length > 0) {
         toast.error("存在未完成的会话写入", {
           description: recoveryIssues.map((issue) => issue.reason).join("；"),
+        });
+      }
+      // 临时备份残留：待清理说明重试入口；待恢复说明必须保留材料并给出下一步。
+      const temporaryFiles = dedupeTemporaryFiles([
+        ...(copyReport?.temporaryFiles ?? []),
+        ...(syncReport?.temporaryFiles ?? []),
+        ...(res.sessionRecovery?.temporaryFiles ?? []),
+      ]);
+      const pendingFiles = temporaryFiles.filter((item) => item.state === "cleanupPending");
+      const recoveryFiles = temporaryFiles.filter((item) => item.state === "needsRecovery");
+      // 报告级 temporaryFiles 是权威来源；仅当旧后端没给该字段时，才回退到成功项上的 pending。
+      const pendingCleanupReasons: string[] = [];
+      if (temporaryFiles.length === 0) {
+        for (const item of copyReport?.copied ?? []) {
+          if (item.cleanupState === "pending") {
+            pendingCleanupReasons.push(item.cleanupError ?? "临时文件待清理");
+          }
+        }
+        for (const item of syncedItems) {
+          if (item.cleanupState === "pending") {
+            pendingCleanupReasons.push(item.cleanupError ?? "临时文件待清理");
+          }
+        }
+      }
+      if (pendingCleanupReasons.length > 0 || pendingFiles.length > 0) {
+        const details = [...pendingCleanupReasons, ...pendingFiles.map(describeTemporaryFile)];
+        toast.warning("会话已完成，部分临时文件待清理", {
+          description: `${details.join("；")}。下次切号时会自动重试清理。`,
+        });
+      }
+      if (recoveryFiles.length > 0) {
+        toast.error("有临时备份需要确认", {
+          description: `${recoveryFiles.map(describeTemporaryFile).join("；")}。已保留现场，请按提示处理后重试。`,
         });
       }
       onOpenChange(false);

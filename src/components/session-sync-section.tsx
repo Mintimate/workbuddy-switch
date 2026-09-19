@@ -302,7 +302,7 @@ function GroupRow({
           <span className="mt-1 block rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-900 dark:text-amber-200">
             <span className="block font-medium">勾选即表示你选择「覆盖目标全文」</span>
             <span className="mt-0.5 block">
-              {`覆盖会用来源正文替换目标全文（目标独有 ${group.extraB} 条记录），目标的会话 id 与标题保留。记录数相同或目标独有记录为 0 都不代表顺序无损。`}
+              {`覆盖会用来源正文替换目标全文（目标独有 ${group.extraB} 条记录），目标的会话 id 与标题保留。记录数相同或目标独有记录为 0 都不代表顺序无损；完成后无法通过本工具撤销。`}
             </span>
           </span>
         )}

@@ -93,12 +93,33 @@ export interface Session {
   isPlayground?: boolean;
 }
 
+/** 临时备份的清理状态：cleaned 已回收；pending 已保留待下次维护重试；legacyRetained 旧操作无生命周期记录。 */
+export type SessionBackupCleanupState = "cleaned" | "pending" | "legacyRetained";
+
+/**
+ * 临时备份残留（待清理 / 待恢复）：复制、同步、恢复报告共用同一结构。
+ * `cleanupPending` 表示已完成但本轮没清理成功（下次切号重试）；`needsRecovery`
+ * 表示必须保留材料、需要恢复流程或人工确认。
+ */
+export interface TemporaryFileInfo {
+  operationId: string;
+  sessionId?: string;
+  title?: string;
+  state: "cleanupPending" | "needsRecovery";
+  reason: string;
+}
+
 /** 本次新建的副本（目标 UUID 由后端预分配）。 */
 export interface CopyResult {
   id: string;
   newId: string;
   groupId: string;
-  backup: string;
+  /** 待清理位置（已清理为 null）；仅表示待清理，不是可撤销备份。 */
+  backup: string | null;
+  /** 成功后立即清理：cleaned 已回收 / pending 待下次维护重试；旧后端可能缺字段。 */
+  cleanupState?: SessionBackupCleanupState;
+  /** 清理失败原因（`cleanupState` 为 pending 时有值）。 */
+  cleanupError?: string;
 }
 
 /** 目标账号上已有真实有效的副本：复用而不是重复复制。 */
@@ -117,6 +138,8 @@ export interface SessionCopyReport {
   errors?: { id: string; error: string }[];
   /** 仍有未完成的会话写入时为 true（失败项可重试，不会产生第二个副本）。 */
   needsRecovery?: boolean;
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
   error?: string;
 }
 
@@ -125,6 +148,8 @@ export interface SessionRecoveryReport {
   recovered: number;
   abandoned: number;
   needsRecovery: { operationId: string; reason: string; retryable: boolean }[];
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
 }
 
 // ---------------------------------------------------------------------------
@@ -200,9 +225,12 @@ export interface SessionSyncResultItem {
   targetSessionId: string;
   recordCount: { source: number; targetBefore: number; target: number };
   updatedAt: number;
-  /** 本次覆盖前的备份目录（可查看恢复位置）。 */
-  backup: string;
-  backupManifest: string;
+  /** 待清理位置（已清理为 null）；旧操作可能仍返回目录路径。 */
+  backup: string | null;
+  backupManifest: string | null;
+  /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
+  cleanupState?: SessionBackupCleanupState;
+  cleanupError?: string;
   message: string;
 }
 
@@ -222,6 +250,20 @@ export interface SessionSyncReport {
   errors: { groupId?: string; error: string }[];
   /** 仍有未完成/无法安全恢复的会话写入时为 true。 */
   needsRecovery?: boolean;
+  /** 临时备份残留（待清理/待恢复）；无异常时为空数组。 */
+  temporaryFiles?: TemporaryFileInfo[];
+}
+
+/**
+ * 应用内通知存档条目：toast 只存活几秒，这里保存最近 100 条供事后回看
+ * （支持排障与验收核对，例如切号成功后到底提示了什么）。
+ */
+export interface AppNotification {
+  level: "success" | "error" | "warning" | "info";
+  title: string;
+  description?: string;
+  /** 毫秒时间戳。 */
+  at: number;
 }
 
 export interface SwitchResult {
