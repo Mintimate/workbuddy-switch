@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
   AccountRecord,
+  AppNotification,
   AppStatus,
   AutoRotateConfig,
   CodeBuddyCliInstallResult,
@@ -120,6 +121,9 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  list_notifications: { method: "GET", path: "/api/notifications" },
+  record_notification: { method: "POST", path: "/api/notifications/record" },
+  clear_notifications: { method: "POST", path: "/api/notifications/clear" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
   save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
@@ -642,4 +646,30 @@ export function asError(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/** 记录一条应用内提示（由 `lib/notify.ts` 统一调用；失败不影响提示本身）。 */
+export function recordNotification(
+  level: AppNotification["level"],
+  title: string,
+  description?: string,
+): Promise<{ recorded: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ recorded: false });
+  return call("record_notification", { level, title, description });
+}
+
+/** 读取最近的通知（新的在前，最多 100 条）。 */
+export function listNotifications(): Promise<{ items: AppNotification[] }> {
+  if (demoModeEnabled) return Promise.resolve({ items: [] });
+  return call("list_notifications");
+}
+
+/** 清空通知存档。 */
+export function clearNotifications(): Promise<{ cleared: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ cleared: false });
+  return call("clear_notifications");
 }
