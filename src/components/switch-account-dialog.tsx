@@ -39,6 +39,9 @@ interface Props {
 const TAB_TRIGGER_CLASS =
   "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
 
+/** 两侧 tab 共用同一视口高度，切换不跳。max-h-full：矮窗口或常驻提示出现时随父级收缩，滚动只发生在这一层。 */
+const TAB_SCROLL_CLASS = "h-[min(26rem,46vh)] max-h-full overflow-y-auto";
+
 /** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
 function tabCount(count: number) {
   return count > 0 ? (
@@ -396,7 +399,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
         </p>
       ) : (
-        <div className="max-h-[min(22rem,45vh)] overflow-y-auto pr-1">
+        <div>
           {buildSessionTree(sessions).map((kind) => {
             const kindOpen = expanded.has(kind.key);
             const kindSel = selectionState(kind.sessions, selected);
@@ -512,12 +515,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           </div>
         )}
 
-        {/* 外层 min-h-0：矮窗口下仍可被 Dialog max-h 压缩，避免裁切页脚。内层 min-h：两侧 tab 高度不同时不跳。 */}
-        <div className="min-h-0 overflow-x-hidden overflow-y-auto">
-          <div className="min-h-[min(20rem,40vh)] space-y-3">
+        {/* min-h-0：矮窗口下压缩本区而不是裁切页脚。tab 区随剩余高度收缩，滚动只发生在 tab 内容区；仅当常驻提示自身超过剩余空间时本层才出现滚动。 */}
+        <div className="flex min-h-0 flex-col gap-3 overflow-x-hidden overflow-y-auto">
           {/* 常驻提示区：切换错误 / 权限 / 关联检查失败不随 tab 切换隐藏。 */}
           {error && (
-            <Alert variant={needsPermission ? "warning" : "destructive"} className="min-w-0 break-all">
+            <Alert variant={needsPermission ? "warning" : "destructive"} className="min-w-0 shrink-0 break-all">
               <AlertDescription className="min-w-0 break-all">
                 <div className="min-w-0 break-all">{error}</div>
                 {needsPermission && (
@@ -556,14 +558,14 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             </Alert>
           )}
           {linksMeta?.error && (
-            <Alert variant="destructive" className="min-w-0">
+            <Alert variant="destructive" className="min-w-0 shrink-0">
               <CircleAlert />
               <AlertTitle>无法检查会话</AlertTitle>
               <AlertDescription className="min-w-0 break-all">{linksMeta.error}</AlertDescription>
             </Alert>
           )}
           {linksMeta?.storeStatus === "unavailable" && (
-            <Alert variant="warning" className="min-w-0">
+            <Alert variant="warning" className="min-w-0 shrink-0">
               <CircleAlert />
               <AlertTitle>同步记录不可用</AlertTitle>
               <AlertDescription className="min-w-0 break-all">
@@ -576,9 +578,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             <Tabs
               value={tab}
               onValueChange={(value) => setTab(value as "links" | "copy")}
-              className="gap-3"
+              className="flex min-h-0 flex-col gap-3 overflow-hidden"
             >
-              <TabsList className="h-auto w-full justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+              <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
                 <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
                   关联会话
                   {tabCount(linksMeta?.groupCount ?? 0)}
@@ -592,31 +594,36 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               <TabsContent
                 value="links"
                 forceMount
-                className="data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+                className="min-h-0 overflow-hidden data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
-                <SessionSyncSection
-                  open={open}
-                  account={account}
-                  disabled={busy}
-                  onChange={(state) => {
-                    setSyncSelections(state.selections);
-                    setSyncGroups(state.groups);
-                  }}
-                  onMetaChange={setLinksMeta}
-                />
+                <div className={TAB_SCROLL_CLASS}>
+                  <SessionSyncSection
+                    open={open}
+                    account={account}
+                    disabled={busy}
+                    onChange={(state) => {
+                      setSyncSelections(state.selections);
+                      setSyncGroups(state.groups);
+                    }}
+                    onMetaChange={setLinksMeta}
+                  />
+                </div>
               </TabsContent>
               <TabsContent
                 value="copy"
                 forceMount
-                className="space-y-2 data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+                className="min-h-0 overflow-hidden data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
-                {copyTabContent}
+                <div className={`${TAB_SCROLL_CLASS} space-y-2`}>
+                  {copyTabContent}
+                </div>
               </TabsContent>
             </Tabs>
           ) : (
-            <div className="space-y-2">{copyTabContent}</div>
+            <div className="min-h-0 overflow-hidden">
+              <div className={`${TAB_SCROLL_CLASS} space-y-2`}>{copyTabContent}</div>
+            </div>
           )}
-          </div>
         </div>
 
         <DialogFooter className="shrink-0 sm:justify-between">
