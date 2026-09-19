@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, export_import, limits, oauth, process, rate_limit_events, rate_limit_hook, refresh,
-    rotate, session, switch, token_stats, travel, update, variant::WbVariant,
+    credits, export_import, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    variant::WbVariant,
 };
 
 #[derive(Serialize)]
@@ -771,4 +772,30 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
         let _ = enabled;
         Err("当前平台不支持开机自启".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// 记录一条应用内提示；前端所有 toast 都会同步写一份，失败不影响提示本身。
+#[tauri::command]
+pub async fn record_notification(
+    level: String,
+    title: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    notifications::record(&level, &title, description.as_deref())
+}
+
+/// 读取最近的通知（新的在前，最多 100 条）。
+#[tauri::command]
+pub async fn list_notifications() -> Result<Value, String> {
+    Ok(json!({ "items": notifications::list()? }))
+}
+
+/// 清空通知存档。
+#[tauri::command]
+pub async fn clear_notifications() -> Result<(), String> {
+    notifications::clear()
 }

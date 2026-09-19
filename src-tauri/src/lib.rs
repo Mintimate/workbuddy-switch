@@ -229,6 +229,9 @@ pub fn run() {
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
+            commands::record_notification,
+            commands::list_notifications,
+            commands::clear_notifications,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
