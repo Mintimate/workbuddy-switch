@@ -411,7 +411,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                   />
                   <button
                     type="button"
-                    className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
+                    className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
                     onClick={() => toggleExpanded(kind.key)}
                     aria-expanded={kindOpen}
                     aria-label={`${kindOpen ? "折叠" : "展开"}${kind.label}`}
@@ -454,7 +454,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                           />
                           <button
                             type="button"
-                            className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
+                            className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
                             onClick={() => toggleExpanded(folder.key)}
                             aria-expanded={folderOpen}
                             aria-label={`${folderOpen ? "折叠" : "展开"}文件夹 ${folder.label}`}
@@ -512,7 +512,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           </div>
         )}
 
-        <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
+        {/* 外层 min-h-0：矮窗口下仍可被 Dialog max-h 压缩，避免裁切页脚。内层 min-h：两侧 tab 高度不同时不跳。 */}
+        <div className="min-h-0 overflow-x-hidden overflow-y-auto">
+          <div className="min-h-[min(20rem,40vh)] space-y-3">
           {/* 常驻提示区：切换错误 / 权限 / 关联检查失败不随 tab 切换隐藏。 */}
           {error && (
             <Alert variant={needsPermission ? "warning" : "destructive"} className="min-w-0 break-all">
@@ -587,7 +589,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                 </TabsTrigger>
               </TabsList>
               {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
-              <TabsContent value="links" forceMount className="data-[state=inactive]:hidden">
+              <TabsContent
+                value="links"
+                forceMount
+                className="data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+              >
                 <SessionSyncSection
                   open={open}
                   account={account}
@@ -599,13 +605,18 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
                   onMetaChange={setLinksMeta}
                 />
               </TabsContent>
-              <TabsContent value="copy" forceMount className="space-y-2 data-[state=inactive]:hidden">
+              <TabsContent
+                value="copy"
+                forceMount
+                className="space-y-2 data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+              >
                 {copyTabContent}
               </TabsContent>
             </Tabs>
           ) : (
             <div className="space-y-2">{copyTabContent}</div>
           )}
+          </div>
         </div>
 
         <DialogFooter className="shrink-0 sm:justify-between">
@@ -656,7 +667,7 @@ function TreeCheckbox({
   return (
     <input
       type="checkbox"
-      className="size-3.5 shrink-0 accent-primary"
+      className="size-3.5 shrink-0 cursor-pointer accent-primary"
       checked={allOn}
       ref={(el) => {
         if (el) el.indeterminate = someOn;
@@ -684,7 +695,7 @@ function SessionPickRow({
     >
       <input
         type="checkbox"
-        className="size-3.5 shrink-0 accent-primary"
+        className="size-3.5 shrink-0 cursor-pointer accent-primary"
         checked={checked}
         onChange={onToggle}
       />
