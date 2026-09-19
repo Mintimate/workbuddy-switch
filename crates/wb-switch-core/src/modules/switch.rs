@@ -36,10 +36,12 @@ pub const COPY_WITHOUT_RESTART_MESSAGE: &str =
 pub const SYNC_WITHOUT_RESTART_MESSAGE: &str =
     "本次切换未重启 WorkBuddy（restart=false），已拒绝会话同步请求；如需同步请勾选重启切换";
 
-/// 恢复报告里是否存在阻碍启动的问题：不可重试的中间产物异常必须先处理。
+/// 恢复报告里是否存在阻碍启动的问题：未恢复一致的中间产物必须先处理。
 ///
 /// 拿不到档位锁、或中间产物被改动/丢失都属此类（design §4 / §5）：此时继续写认证并
 /// 启动 App 会让 Official App 在最坏状态下打开会话，因此暂停切换与启动。
+/// `retryable=true` 沿用复制侧「可延后重试且不阻断启动」的约定；同步恢复失败必须
+/// 返回 false，即使故障只是暂时的，也不能带着半完成的正文/数据库/基线启动。
 pub fn recovery_blocks_startup(report: &RecoveryReport) -> bool {
     report.needs_recovery.iter().any(|issue| !issue.retryable)
 }
@@ -157,8 +159,8 @@ pub fn switch_account(
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
-        // 关进程后先尽力恢复未完成的会话写入：恢复成功或只是可重试的失败都不阻断
-        // 切换；拿不到档位锁、或中间产物被改动/丢失，都暂停启动（design §4 / §5）。
+        // 关进程后先恢复未完成的会话写入：恢复成功或复制侧可安全延后重试的失败
+        // 不阻断切换；同步仍未完成、拿不到锁或中间产物异常则暂停启动（design §4 / §5）。
         let recovery = match session::recover_pending_session_operations(variant) {
             Ok(report) => report,
             Err(error) => {

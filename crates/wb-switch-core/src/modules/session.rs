@@ -25,7 +25,7 @@
 //! 清单补完（复用同一目标 UUID 与新基线引用），不把未完成的写入报告成 `synced`。
 
 use rusqlite::backup::{Backup, StepResult};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1999,11 +1999,21 @@ fn verify_db_snapshot(path: &Path) -> Result<(), String> {
 }
 
 /// 读取一行会话的覆盖前快照（含标题类列）。
-fn read_session_row(conn: &Connection, cid: &str) -> Option<SyncBackupRow> {
-    if !table_exists(conn, "sessions") {
-        return None;
+fn read_session_row(conn: &Connection, cid: &str) -> Result<Option<SyncBackupRow>, String> {
+    // Schema errors are not evidence that the target was deleted. Keep custom_title optional
+    // for older databases, but propagate every failure while inspecting the schema.
+    let mut statement = conn
+        .prepare("PRAGMA table_info(sessions)")
+        .map_err(|error| format!("会话表结构读取失败：{error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("会话表结构读取失败：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("会话表结构读取失败：{error}"))?;
+    if columns.is_empty() {
+        return Err("会话数据库缺少 sessions 表，无法读取目标会话行".to_string());
     }
-    let sql = if column_exists(conn, "sessions", "custom_title") {
+    let sql = if columns.iter().any(|column| column == "custom_title") {
         "SELECT id, user_id, title, custom_title, updated_at, deleted_at \
          FROM sessions WHERE id = ?1"
     } else {
@@ -2019,12 +2029,14 @@ fn read_session_row(conn: &Connection, cid: &str) -> Option<SyncBackupRow> {
             deleted_at: row.get(5)?,
         })
     })
-    .ok()
+    .optional()
+    .map_err(|error| format!("目标会话行读取失败：{error}"))
 }
 
-/// 会话行的覆盖前快照（独立打开连接，供写入前记录清单用）。
-fn session_row_snapshot(paths: &SessionPaths, cid: &str) -> Option<SyncBackupRow> {
-    let conn = open_db(&paths.workbuddy_db(), true)?;
+/// 会话行的覆盖前快照；只有成功查询且没有命中时才返回 None。
+fn session_row_snapshot(paths: &SessionPaths, cid: &str) -> Result<Option<SyncBackupRow>, String> {
+    let conn = open_db(&paths.workbuddy_db(), true)
+        .ok_or_else(|| "会话数据库无法打开，无法读取目标会话行".to_string())?;
     read_session_row(&conn, cid)
 }
 
@@ -2161,7 +2173,7 @@ fn create_sync_backup(
         db: SyncBackupDb {
             snapshot_file: db_rel,
             method: DB_SNAPSHOT_METHOD.to_string(),
-            target_row: session_row_snapshot(paths, &plan.target_member.session_id),
+            target_row: session_row_snapshot(paths, &plan.target_member.session_id)?,
             new_updated_at,
         },
         new_baseline_ref: new_baseline_ref.to_string(),
@@ -2301,7 +2313,7 @@ fn update_target_session_row(
             "目标会话行归属校验失败：会话不存在、不属于目标账号或已被删除，未报告成功".to_string(),
         );
     }
-    match (read_session_row(&tx, &target.session_id), before) {
+    match (read_session_row(&tx, &target.session_id)?, before) {
         (None, _) => return Err("目标会话行写入后不可见，未报告成功".to_string()),
         (Some(after), Some(before)) => {
             if after.session_id != before.session_id
@@ -2659,7 +2671,8 @@ enum RecoverOutcome {
     NeedsRecovery {
         id: String,
         reason: String,
-        /// 重试可能成功（例如映射库暂不可用），不阻断账号切换。
+        /// 既有宿主契约：true 允许账号切换和 App 启动，不能仅表示故障可重试。
+        /// 同步尚未恢复一致时必须为 false，即使稍后重试可能成功。
         retryable: bool,
     },
 }
@@ -2718,7 +2731,7 @@ fn recover_operation(
 ///
 /// 顺序：备份必须完好 → 目标正文只能是「本次写入的」或「覆盖前的」→ 目标行归属与
 /// 更新时间必须可安全识别 → 复用同一段阶段代码补完。任一项不满足即停止并上报
-/// needsRecovery（不可重试，宿主据此暂停启动 App）。
+/// needsRecovery（阻断启动，宿主必须等待恢复一致后才能启动 App）。
 fn recover_sync_operation(
     paths: &SessionPaths,
     variant: WbVariant,
@@ -2775,7 +2788,10 @@ fn recover_sync_operation(
     }
 
     // 3) 目标行：归属与更新时间必须可安全识别。
-    let row = session_row_snapshot(paths, &operation.target.session_id);
+    let row = match session_row_snapshot(paths, &operation.target.session_id) {
+        Ok(row) => row,
+        Err(reason) => return needs(reason, false),
+    };
     let row_absent = match &row {
         None => true,
         // 已删除的会话（软删除）同样没有可更新的行：会话在 App 里已经不存在。
@@ -2827,7 +2843,8 @@ fn recover_sync_operation(
         Ok(()) => RecoverOutcome::Recovered(operation_id),
         Err(error) => {
             fail_operation(paths, &mut operation, &error);
-            needs(error, true)
+            // Retry may succeed later, but the unfinished sync must block startup now.
+            needs(error, false)
         }
     }
 }
@@ -5856,6 +5873,16 @@ mod tests {
         );
         assert_eq!(env.body_files().len(), 2);
 
+        // 历史同步恢复仍失败时也必须阻断启动，不能仅依赖本轮新增 pending 差集。
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert_eq!(recovery.needs_recovery.len(), 1);
+        assert!(recovery.recovered.is_empty());
+        assert!(recovery.abandoned.is_empty());
+        assert!(crate::modules::switch::recovery_blocks_startup(&recovery));
+        assert_eq!(sync_operations(&env)[0].phase, OpPhase::BodyWritten);
+        assert_eq!(session_row(&env, &target_id), row_before);
+        assert_eq!(pair_snapshot(&env), pairs_before);
+
         // 解除故障后恢复：补完数据库与组表，仍复用同一份清单与同一条操作记录。
         drop_block_update_trigger(&env);
         let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
@@ -6088,6 +6115,107 @@ mod tests {
             session_link::pending_operations(&env.paths, WbVariant::Cn).len(),
             1
         );
+    }
+
+    /// 已提交基线后数据库不可读：不能当作删除回滚正文或丢弃操作。
+    #[test]
+    fn sync_recovery_preserves_committed_state_on_database_read_failure() {
+        for fault in ["open", "schema", "query"] {
+            let env = ready_env(&format!("sync-read-failure-{fault}"));
+            let (group_id, token, target_id) = fast_forward_scene(&env);
+            let report = sync(
+                &env,
+                "uid-b",
+                &[selection(&group_id, &token, SyncMode::FastForward)],
+            );
+            assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+            // 模拟基线已落盘、Completed 阶段日志尚未保存时中断。
+            let mut operation = sync_operations(&env).remove(0);
+            operation.phase = OpPhase::LinksCommitted;
+            session_link::save_operation(&env.paths, &operation).unwrap();
+            let body_before = body_bytes(&env, &target_id);
+            let row_before = session_row(&env, &target_id);
+            let pairs_before = pair_snapshot(&env);
+            let baselines_before = env.baseline_files();
+            let db = env.paths.workbuddy_db();
+            let saved_db = db.with_extension("saved");
+            match fault {
+                "open" => std::fs::rename(&db, &saved_db).unwrap(),
+                "schema" => Connection::open(&db)
+                    .unwrap()
+                    .execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+                    .unwrap(),
+                "query" => Connection::open(&db)
+                    .unwrap()
+                    .execute_batch(
+                        "ALTER TABLE sessions RENAME COLUMN updated_at TO unavailable_updated_at",
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let existing_db = if fault == "open" { &saved_db } else { &db };
+            let db_before = std::fs::read(existing_db).unwrap();
+            let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+            assert!(recovery.recovered.is_empty(), "{fault}");
+            assert!(recovery.abandoned.is_empty(), "{fault}");
+            assert_eq!(recovery.needs_recovery.len(), 1, "{fault}");
+            assert!(
+                crate::modules::switch::recovery_blocks_startup(&recovery),
+                "{fault}"
+            );
+            assert_eq!(body_bytes(&env, &target_id), body_before, "{fault}");
+            assert_eq!(std::fs::read(existing_db).unwrap(), db_before, "{fault}");
+            assert_eq!(pair_snapshot(&env), pairs_before, "{fault}");
+            assert_eq!(env.baseline_files(), baselines_before, "{fault}");
+            let pending = session_link::pending_operations(&env.paths, WbVariant::Cn);
+            assert_eq!(pending.len(), 1, "{fault}");
+            assert_eq!(pending[0].operation_id, operation.operation_id);
+            assert_eq!(pending[0].phase, OpPhase::LinksCommitted);
+
+            match fault {
+                "open" => std::fs::rename(&saved_db, &db).unwrap(),
+                "schema" => Connection::open(&db)
+                    .unwrap()
+                    .execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions")
+                    .unwrap(),
+                "query" => Connection::open(&db)
+                    .unwrap()
+                    .execute_batch(
+                        "ALTER TABLE sessions RENAME COLUMN unavailable_updated_at TO updated_at",
+                    )
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+            assert!(
+                recovery.is_clean(),
+                "{fault}: {:?}",
+                recovery.needs_recovery
+            );
+            assert_eq!(recovery.recovered, vec![operation.operation_id]);
+            assert_eq!(body_bytes(&env, &target_id), body_before);
+            assert_eq!(session_row(&env, &target_id), row_before);
+            assert_eq!(pair_snapshot(&env), pairs_before);
+            assert_eq!(env.baseline_files(), baselines_before);
+            assert_eq!(sync_operations(&env)[0].phase, OpPhase::Completed);
+        }
+    }
+
+    #[test]
+    fn sync_row_snapshot_supports_legacy_schema_and_distinguishes_missing_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(read_session_row(&conn, "session").is_err());
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT, user_id TEXT, title TEXT, updated_at INTEGER, deleted_at INTEGER);
+             INSERT INTO sessions VALUES ('session', 'uid', 'title', 123, NULL);",
+        ).unwrap();
+        let row = read_session_row(&conn, "session").unwrap().unwrap();
+        assert_eq!(row.custom_title, None);
+        assert_eq!(row.title.as_deref(), Some("title"));
+        assert!(read_session_row(&conn, "absent").unwrap().is_none());
+        conn.execute_batch("UPDATE sessions SET updated_at = 'invalid'")
+            .unwrap();
+        assert!(read_session_row(&conn, "session").is_err());
     }
 
     /// 目标行已不存在（硬删除）→ 无法补完，按备份回滚正文，不留无行的半成品。
