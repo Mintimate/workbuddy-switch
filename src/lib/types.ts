@@ -158,8 +158,8 @@ export interface SessionRecoveryReport {
 
 /**
  * 同步判定结果（design §3.2 优先级表）：
- * `identical` 内容一致、`fastForward` 可快进、`ahead` 仅目标变化、
- * `diverge` 冲突需显式覆盖、`unknown` 不可验证。
+ * `identical` 两边一致、`fastForward` 有新增可同步、`ahead` 仅目标账号有更新、
+ * `diverge` 两边都改过需显式覆盖、`unknown` 无法确认。
  */
 export type SessionSyncVerdict = "identical" | "fastForward" | "ahead" | "diverge" | "unknown";
 

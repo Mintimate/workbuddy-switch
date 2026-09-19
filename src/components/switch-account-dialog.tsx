@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight, ExternalLink, Folder, Loader2 } from "lucide-react";
+import { ChevronDown, ChevronRight, CircleAlert, ExternalLink, Folder, Loader2 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 
-import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,9 +14,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Separator } from "@/components/ui/separator";
-import { Switch } from "@/components/ui/switch";
-import { SessionSyncSection } from "@/components/session-sync-section";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-sync-section";
 import * as api from "@/lib/api";
 import { accountVariant, variantAppName } from "@/lib/variant";
 import type {
@@ -34,6 +33,17 @@ interface Props {
   account: AccountMeta | null;
   /** 切换完成后刷新列表 */
   onDone?: () => void;
+}
+
+/** 设计稿的 tab 样式：下划线指示 + 可选计数徽标。 */
+const TAB_TRIGGER_CLASS =
+  "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
+
+/** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
+function tabCount(count: number) {
+  return count > 0 ? (
+    <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
+  ) : null;
 }
 
 /** 临时备份残留的可读描述：优先标题，其次会话 id，最后操作 id。 */
@@ -59,7 +69,6 @@ function dedupeTemporaryFiles(items: TemporaryFileInfo[]): TemporaryFileInfo[] {
 export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Props) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
-  const [copySessions, setCopySessions] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** 展开的节点：任务 / 空间 / 文件夹。默认全部收起。 */
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -70,6 +79,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   /** 会话同步：勾选结果（默认值来自后端 defaultChecked）与预览组（结果反馈回显用）。 */
   const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
   const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
+  /** 当前 tab：默认关联会话；该 tab 不可用时回落到复制会话。 */
+  const [tab, setTab] = useState<"links" | "copy">("links");
+  /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
+  const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
 
   // 监听后端切换进度：桌面端走 Tauri 事件，webui 走 HTTP 轮询
   useEffect(() => {
@@ -95,12 +108,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   // 打开时按目标账号档位加载当前账号会话（会话列表按档位取自各自的登录态）
   useEffect(() => {
     if (open && account) {
-      setCopySessions(false);
       setSelected(new Set());
       setExpanded(new Set());
       setError("");
       setSyncSelections([]);
       setSyncGroups([]);
+      setLinksMeta(null);
+      setTab("links");
       setLoadingSessions(true);
       api
         .listSessions(accountVariant(account))
@@ -146,7 +160,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setBusy(true);
     setProgress("正在切换账号…");
     setError("");
-    const requestedCopy = copySessions && selected.size > 0;
+    const requestedCopy = selected.size > 0;
     const requestedSync = syncSelections.length > 0;
     try {
       const res = await api.switchAccount({
@@ -162,7 +176,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       const linkedCount = copyReport?.alreadyLinked?.length ?? 0;
       const copyErrors = copyReport?.errors ?? [];
       if (copiedCount > 0) parts.push(`已复制 ${copiedCount} 个会话`);
-      if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个已有副本`);
+      if (linkedCount > 0) parts.push(`已关联 ${linkedCount} 个之前复制过的会话`);
       if (copyErrors.length > 0) parts.push(`会话复制失败 ${copyErrors.length} 个`);
       const syncReport = res.sessionSync;
       const syncedItems = syncReport?.synced ?? [];
@@ -190,7 +204,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         });
       } else if (requestedCopy && !copyReport) {
         toast.warning("会话未复制", {
-          description: "后端未返回复制结果：当前档位可能不支持会话复制，账号已切换但未复制会话。",
+          description: "没有收到复制结果：当前版本可能不支持复制会话；账号已切换，但会话没有复制。",
         });
       }
       // 同步结果：成功、跳过、失败与恢复信息都要能看到，不能只显示成功数。
@@ -206,24 +220,24 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       ];
       if (syncIssues.length > 0) {
         if (syncErrors.length > 0) {
-          toast.error("部分会话未同步（失败或已跳过）", { description: syncIssues.join("；") });
+          toast.error("部分会话没有同步（失败或已跳过）", { description: syncIssues.join("；") });
         } else {
-          toast.warning("有会话未同步（已跳过）", { description: syncIssues.join("；") });
+          toast.warning("有会话没有同步（已跳过）", { description: syncIssues.join("；") });
         }
       } else if (requestedSync && !syncReport) {
         toast.warning("会话同步未执行", {
-          description: "后端未返回同步结果：当前档位可能不支持会话同步，或本次切换未重启。",
+          description: "没有收到同步结果：当前版本可能不支持同步会话，或本次切换没有重启应用。",
         });
       }
       if (syncReport?.needsRecovery) {
-        toast.error("存在未完成的会话同步写入", {
-          description: "已保留操作记录与备份，下次切号会先恢复；恢复完成前不会再写入目标正文。",
+        toast.error("有会话同步没有完成", {
+          description: "已保留操作记录与备份，下次切换会先恢复；恢复完成前不会再改动目标账号的内容。",
         });
       }
       // 未完成的会话写入：可重试项只提示，阻断项由后端直接返回错误。
       const recoveryIssues = res.sessionRecovery?.needsRecovery ?? [];
       if (recoveryIssues.length > 0) {
-        toast.error("存在未完成的会话写入", {
+        toast.error("有会话操作没有完成", {
           description: recoveryIssues.map((issue) => issue.reason).join("；"),
         });
       }
@@ -319,7 +333,25 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     };
   }, [error]);
 
-  const copyCount = copySessions ? selected.size : 0;
+  const copyCount = selected.size;
+  const syncCount = syncSelections.length;
+  /** 覆盖项数量：底部摘要据此提示风险。 */
+  const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
+  const linksAvailable = linksMeta?.available ?? true;
+  const summaryMain =
+    copyCount > 0 && syncCount > 0
+      ? `本次将复制 ${copyCount} 个、同步 ${syncCount} 个会话`
+      : copyCount > 0
+        ? `本次将复制 ${copyCount} 个会话`
+        : syncCount > 0
+          ? `本次将同步 ${syncCount} 个会话`
+          : "本次仅切换账号";
+  const summarySub =
+    overwriteCount > 0
+      ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
+      : copyCount === 0 && syncCount === 0
+        ? "不复制或同步会话"
+        : null;
   const needsPermission = error.includes("无权限");
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
@@ -330,7 +362,130 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         ? currentUid
           ? "当前账号暂无会话，无法复制"
           : "未检测到当前登录账号，无法列出会话"
-        : "将当前账号勾选的会话以新 id 复制给目标账号（云端归属目标）；已有副本不会重复复制";
+        : "把当前账号勾选的会话复制给目标账号（复制后归属目标账号）；已经复制过的不会重复复制";
+
+  // 关联 tab 不可用（国际版能力判定不通过）时回落到复制会话，避免停在空 tab。
+  useEffect(() => {
+    if (!linksAvailable && tab === "links") setTab("copy");
+  }, [linksAvailable, tab]);
+
+  // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
+  const copyTabContent = (
+    <>
+      {!loadingSessions && (
+        <p
+          className={
+            sessionsEmpty
+              ? "px-1 text-xs text-amber-700 dark:text-amber-400"
+              : "px-1 text-xs text-muted-foreground"
+          }
+        >
+          {copyHint}
+        </p>
+      )}
+      {loadingSessions ? (
+        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+          <Loader2 className="animate-spin" /> 加载会话…
+        </div>
+      ) : sessions.length === 0 ? (
+        <p className="py-4 text-center text-sm text-muted-foreground">
+          {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
+        </p>
+      ) : (
+        <div className="max-h-[min(22rem,45vh)] overflow-y-auto pr-1">
+          {buildSessionTree(sessions).map((kind) => {
+            const kindOpen = expanded.has(kind.key);
+            const kindSel = selectionState(kind.sessions, selected);
+            return (
+              <div key={kind.key} className="mb-0.5">
+                <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
+                  <TreeCheckbox
+                    allOn={kindSel.allOn}
+                    someOn={kindSel.someOn}
+                    onChange={() => toggleFolder(kind.sessions.map((s) => s.id))}
+                    ariaLabel={`选择${kind.label}`}
+                  />
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
+                    onClick={() => toggleExpanded(kind.key)}
+                    aria-expanded={kindOpen}
+                    aria-label={`${kindOpen ? "折叠" : "展开"}${kind.label}`}
+                  >
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                      {kind.label}
+                      <span className="ml-1 font-normal text-muted-foreground">
+                        ({kind.count})
+                      </span>
+                    </span>
+                    {kindOpen ? (
+                      <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+                    ) : (
+                      <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                    )}
+                  </button>
+                </div>
+                {kindOpen && kind.key === "task" &&
+                  kind.sessions.map((s) => (
+                    <SessionPickRow
+                      key={s.id}
+                      session={s}
+                      checked={selected.has(s.id)}
+                      indentClass="pl-7"
+                      onToggle={() => toggleSession(s.id)}
+                    />
+                  ))}
+                {kindOpen &&
+                  kind.folders?.map((folder) => {
+                    const folderOpen = expanded.has(folder.key);
+                    const folderSel = selectionState(folder.sessions, selected);
+                    return (
+                      <div key={folder.key}>
+                        <div className="flex items-center gap-1.5 px-1.5 py-0.5 pl-7">
+                          <TreeCheckbox
+                            allOn={folderSel.allOn}
+                            someOn={folderSel.someOn}
+                            onChange={() => toggleFolder(folder.sessions.map((s) => s.id))}
+                            ariaLabel={`选择文件夹 ${folder.label}`}
+                          />
+                          <button
+                            type="button"
+                            className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
+                            onClick={() => toggleExpanded(folder.key)}
+                            aria-expanded={folderOpen}
+                            aria-label={`${folderOpen ? "折叠" : "展开"}文件夹 ${folder.label}`}
+                          >
+                            <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                            <span className="min-w-0 flex-1 truncate text-sm">
+                              {folder.label}
+                            </span>
+                            {folderOpen ? (
+                              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                            )}
+                          </button>
+                        </div>
+                        {folderOpen &&
+                          folder.sessions.map((s) => (
+                            <SessionPickRow
+                              key={s.id}
+                              session={s}
+                              checked={selected.has(s.id)}
+                              indentClass="pl-12"
+                              onToggle={() => toggleSession(s.id)}
+                            />
+                          ))}
+                      </div>
+                    );
+                  })}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </>
+  );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -340,9 +495,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       >
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
-          <DialogDescription>
-            切换会关闭并重启 {variantAppName(accountVariant(account))}，认证文件将写入目标账号。
-          </DialogDescription>
+          <DialogDescription>切换时将重启 {variantAppName(accountVariant(account))}。</DialogDescription>
         </DialogHeader>
 
         {busy && (
@@ -356,144 +509,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         )}
 
         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
-          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">复制会话到目标账号</div>
-              <div
-                className={
-                  sessionsEmpty
-                    ? "text-xs text-amber-700 dark:text-amber-400"
-                    : "text-xs text-muted-foreground"
-                }
-              >
-                {copyHint}
-              </div>
-            </div>
-            <Switch
-              checked={copySessions}
-              onCheckedChange={setCopySessions}
-              disabled={loadingSessions || sessions.length === 0}
-            />
-          </div>
-
-          {copySessions && (
-            <>
-              <Separator />
-              <div className="max-h-[min(20rem,45vh)] overflow-y-auto pr-1">
-                {loadingSessions ? (
-                  <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
-                    <Loader2 className="animate-spin" /> 加载会话…
-                  </div>
-                ) : sessions.length === 0 ? (
-                  <p className="py-4 text-center text-sm text-muted-foreground">
-                    {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
-                  </p>
-                ) : (
-                  buildSessionTree(sessions).map((kind) => {
-                    const kindOpen = expanded.has(kind.key);
-                    const kindSel = selectionState(kind.sessions, selected);
-                    return (
-                      <div key={kind.key} className="mb-0.5">
-                        <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
-                          <TreeCheckbox
-                            allOn={kindSel.allOn}
-                            someOn={kindSel.someOn}
-                            onChange={() => toggleFolder(kind.sessions.map((s) => s.id))}
-                            ariaLabel={`选择${kind.label}`}
-                          />
-                          <button
-                            type="button"
-                            className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                            onClick={() => toggleExpanded(kind.key)}
-                            aria-expanded={kindOpen}
-                            aria-label={`${kindOpen ? "折叠" : "展开"}${kind.label}`}
-                          >
-                            <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                              {kind.label}
-                              <span className="ml-1 font-normal text-muted-foreground">
-                                ({kind.count})
-                              </span>
-                            </span>
-                            {kindOpen ? (
-                              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                            ) : (
-                              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                            )}
-                          </button>
-                        </div>
-                        {kindOpen && kind.key === "task" &&
-                          kind.sessions.map((s) => (
-                            <SessionPickRow
-                              key={s.id}
-                              session={s}
-                              checked={selected.has(s.id)}
-                              indentClass="pl-7"
-                              onToggle={() => toggleSession(s.id)}
-                            />
-                          ))}
-                        {kindOpen &&
-                          kind.folders?.map((folder) => {
-                            const folderOpen = expanded.has(folder.key);
-                            const folderSel = selectionState(folder.sessions, selected);
-                            return (
-                              <div key={folder.key}>
-                                <div className="flex items-center gap-1.5 px-1.5 py-0.5 pl-7">
-                                  <TreeCheckbox
-                                    allOn={folderSel.allOn}
-                                    someOn={folderSel.someOn}
-                                    onChange={() => toggleFolder(folder.sessions.map((s) => s.id))}
-                                    ariaLabel={`选择文件夹 ${folder.label}`}
-                                  />
-                                  <button
-                                    type="button"
-                                    className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                                    onClick={() => toggleExpanded(folder.key)}
-                                    aria-expanded={folderOpen}
-                                    aria-label={`${folderOpen ? "折叠" : "展开"}文件夹 ${folder.label}`}
-                                  >
-                                    <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                                    <span className="min-w-0 flex-1 truncate text-sm">
-                                      {folder.label}
-                                    </span>
-                                    {folderOpen ? (
-                                      <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                                    ) : (
-                                      <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                                    )}
-                                  </button>
-                                </div>
-                                {folderOpen &&
-                                  folder.sessions.map((s) => (
-                                    <SessionPickRow
-                                      key={s.id}
-                                      session={s}
-                                      checked={selected.has(s.id)}
-                                      indentClass="pl-12"
-                                      onToggle={() => toggleSession(s.id)}
-                                    />
-                                  ))}
-                              </div>
-                            );
-                          })}
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </>
-          )}
-
-          {/* 会话同步：与复制同一请求提交；不支持（国际版能力判定不通过）时区块自隐藏。 */}
-          <SessionSyncSection
-            open={open}
-            account={account}
-            disabled={busy}
-            onChange={(state) => {
-              setSyncSelections(state.selections);
-              setSyncGroups(state.groups);
-            }}
-          />
-
+          {/* 常驻提示区：切换错误 / 权限 / 关联检查失败不随 tab 切换隐藏。 */}
           {error && (
             <Alert variant={needsPermission ? "warning" : "destructive"} className="min-w-0 break-all">
               <AlertDescription className="min-w-0 break-all">
@@ -533,15 +549,74 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               </AlertDescription>
             </Alert>
           )}
+          {linksMeta?.error && (
+            <Alert variant="destructive" className="min-w-0">
+              <CircleAlert />
+              <AlertTitle>无法检查会话</AlertTitle>
+              <AlertDescription className="min-w-0 break-all">{linksMeta.error}</AlertDescription>
+            </Alert>
+          )}
+          {linksMeta?.storeStatus === "unavailable" && (
+            <Alert variant="warning" className="min-w-0">
+              <CircleAlert />
+              <AlertTitle>同步记录不可用</AlertTitle>
+              <AlertDescription className="min-w-0 break-all">
+                {`${linksMeta.storeError || "原因未知"}；本次不会同步任何会话，请处理后重试。`}
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {linksAvailable ? (
+            <Tabs
+              value={tab}
+              onValueChange={(value) => setTab(value as "links" | "copy")}
+              className="gap-3"
+            >
+              <TabsList className="h-auto w-full justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+                <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
+                  关联会话
+                  {tabCount(linksMeta?.groupCount ?? 0)}
+                </TabsTrigger>
+                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
+                  复制会话
+                  {tabCount(copyCount)}
+                </TabsTrigger>
+              </TabsList>
+              {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
+              <TabsContent value="links" forceMount className="data-[state=inactive]:hidden">
+                <SessionSyncSection
+                  open={open}
+                  account={account}
+                  disabled={busy}
+                  onChange={(state) => {
+                    setSyncSelections(state.selections);
+                    setSyncGroups(state.groups);
+                  }}
+                  onMetaChange={setLinksMeta}
+                />
+              </TabsContent>
+              <TabsContent value="copy" forceMount className="space-y-2 data-[state=inactive]:hidden">
+                {copyTabContent}
+              </TabsContent>
+            </Tabs>
+          ) : (
+            <div className="space-y-2">{copyTabContent}</div>
+          )}
         </div>
 
-        <DialogFooter className="shrink-0">
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
-            取消
-          </Button>
-          <Button onClick={doSwitch} disabled={busy || (copySessions && copyCount === 0)}>
-            {busy ? "切换中…" : "确认切换"}
-          </Button>
+        <DialogFooter className="shrink-0 sm:justify-between">
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-sm font-medium">{summaryMain}</div>
+            {summarySub && <div className="text-xs text-muted-foreground">{summarySub}</div>}
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+              取消
+            </Button>
+            <Button onClick={doSwitch} disabled={busy}>
+              {busy ? "切换中…" : "确认切换"}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -614,7 +689,7 @@ function SessionPickRow({
       </span>
       {session.hasHistory && (
         <Badge variant="outline" className="shrink-0 text-[10px]">
-          有正文
+          有内容
         </Badge>
       )}
     </label>
