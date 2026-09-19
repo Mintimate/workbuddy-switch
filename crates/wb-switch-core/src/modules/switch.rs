@@ -47,13 +47,15 @@ pub fn recovery_blocks_startup(report: &RecoveryReport) -> bool {
 }
 
 /// 阻碍启动的原因汇总（用于错误文案）。
+///
+/// 必须带操作标识：阻断分支只返回 Err 字符串，前端 catch 不能只看到原因。
 pub fn recovery_blocking_detail(report: &RecoveryReport) -> String {
     report
         .needs_recovery
         .iter()
         .filter(|issue| !issue.retryable)
-        .map(|issue| issue.reason.as_str())
-        .collect::<Vec<&str>>()
+        .map(|issue| format!("{}：{}", issue.operation_id, issue.reason))
+        .collect::<Vec<String>>()
         .join("；")
 }
 
@@ -71,6 +73,8 @@ pub fn recovery_report_json(report: &RecoveryReport) -> Value {
                 "retryable": issue.retryable,
             }))
             .collect::<Vec<Value>>(),
+        // 待清理/待恢复的临时备份残留：与复制/同步报告同一结构。
+        "temporaryFiles": report.temporary_files,
     })
 }
 
@@ -95,15 +99,19 @@ fn newly_unfinished_writes(before: &BTreeSet<String>, after: Vec<Operation>) -> 
     created
 }
 
-/// 未完成写入的说明文案：优先用操作记录里的失败原因。
+/// 未完成写入的说明文案：会话标识 + 操作标识 + 原因。
 fn unfinished_writes_detail(writes: &[Operation]) -> String {
     writes
         .iter()
         .map(|operation| {
-            operation
+            let reason = operation
                 .last_error
                 .clone()
-                .unwrap_or_else(|| format!("操作 {} 尚未完成", operation.operation_id))
+                .unwrap_or_else(|| "尚未完成".to_string());
+            format!(
+                "{}（操作 {}）：{reason}",
+                operation.target.session_id, operation.operation_id
+            )
         })
         .collect::<Vec<String>>()
         .join("；")
@@ -299,7 +307,8 @@ mod tests {
 
     use super::*;
     use crate::modules::session_link::{
-        save_operation, OpPhase, OperationMember, RecoveryIssue, OPERATION_VERSION,
+        save_operation, OpPhase, OperationMember, RecoveryIssue, TemporaryFileIssue,
+        OPERATION_VERSION,
     };
 
     struct TempDir(std::path::PathBuf);
@@ -351,6 +360,8 @@ mod tests {
             expected_record_count: 1,
             phase,
             backup: None,
+            lifecycle_version: None,
+            cleanup_state: None,
             last_error: error.map(str::to_string),
             created_at,
             updated_at: created_at,
@@ -361,6 +372,7 @@ mod tests {
         RecoveryReport {
             recovered: Vec::new(),
             abandoned: Vec::new(),
+            temporary_files: Vec::new(),
             needs_recovery: vec![RecoveryIssue {
                 operation_id: "op-1".to_string(),
                 reason: "目标正文与操作记录不一致，已停止恢复".to_string(),
@@ -375,7 +387,9 @@ mod tests {
         assert!(recovery_blocks_startup(&report_with(false)));
         assert!(!recovery_blocks_startup(&report_with(true)));
         assert!(!recovery_blocks_startup(&RecoveryReport::default()));
-        assert!(recovery_blocking_detail(&report_with(false)).contains("已停止恢复"));
+        let blocking = recovery_blocking_detail(&report_with(false));
+        assert!(blocking.contains("op-1"), "{blocking}");
+        assert!(blocking.contains("已停止恢复"), "{blocking}");
         assert!(recovery_blocking_detail(&report_with(true)).is_empty());
     }
 
@@ -390,6 +404,28 @@ mod tests {
         assert_eq!(value["abandoned"], 1);
         assert_eq!(value["needsRecovery"][0]["operationId"], "op-1");
         assert_eq!(value["needsRecovery"][0]["retryable"], false);
+        assert_eq!(value["temporaryFiles"], json!([]));
+    }
+
+    /// 只有临时备份残留时也不能当成「恢复什么都没做」：宿主必须把 sessionRecovery 带给前端。
+    #[test]
+    fn recovery_is_not_empty_when_only_temporary_files_remain() {
+        let mut report = RecoveryReport::default();
+        report
+            .temporary_files
+            .push(TemporaryFileIssue::cleanup_pending(
+                "op-cleanup".to_string(),
+                Some("sess-1".to_string()),
+                Some("标题".to_string()),
+                "临时目录删除失败：权限不足".to_string(),
+            ));
+        assert!(!report.is_empty());
+        assert!(report.is_clean(), "待清理不得变成启动阻断");
+        let value = recovery_report_json(&report);
+        assert_eq!(value["temporaryFiles"][0]["operationId"], "op-cleanup");
+        assert_eq!(value["temporaryFiles"][0]["state"], "cleanupPending");
+        assert_eq!(value["temporaryFiles"][0]["sessionId"], "sess-1");
+        assert_eq!(value["temporaryFiles"][0]["title"], "标题");
     }
 
     /// 本次新留下的未完成写入必须被识别出来：历史残留不算在本次头上，已完成的也不算。

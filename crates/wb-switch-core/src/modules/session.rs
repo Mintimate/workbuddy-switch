@@ -33,8 +33,12 @@ use std::time::{Duration, Instant};
 
 use crate::modules::account;
 use crate::modules::auth_file;
-use crate::modules::config::{atomic_write, now_ms, now_secs, store_dir, utc_iso};
+use crate::modules::config::{now_ms, now_secs, store_dir};
 use crate::modules::process;
+use crate::modules::session_backup::{
+    self, BackupLifecycle, CleanupOutcome, CLEANUP_STATE_SAFE_TERMINATED,
+    OPERATION_LIFECYCLE_VERSION,
+};
 use crate::modules::session_link::{
     self, full_digest_of, BaselineState, ContentSnapshot, ContentState, LinkGroup, LinkMember,
     LinkStore, MemberState, NormalizedContent, OpPhase, Operation, OperationMember, PreviewBinding,
@@ -366,15 +370,6 @@ fn backup_workbuddy_db(paths: &SessionPaths, backup_root: &Path) -> Result<PathB
     Ok(backup_root.join("workbuddy.db"))
 }
 
-/// 会话数据库复制前的一次性备份目录（按档位分目录，两档位不互相覆盖）。
-fn session_backup_root(paths: &SessionPaths, variant: WbVariant) -> PathBuf {
-    paths
-        .backup_root()
-        .join("sessions")
-        .join(variant.as_str())
-        .join(utc_iso())
-}
-
 /// 数据库插入结果：`No*` 与 `SourceRowMissing` 都不允许被当成成功。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbCopyOutcome {
@@ -417,6 +412,8 @@ fn insert_session_copy(
     if !table_exists(&conn, "sessions") {
         return Ok(DbCopyOutcome::NoSessionsTable);
     }
+    // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
+    session_backup::ensure_full_synchronous(&conn)?;
     let mut src_stmt = conn
         .prepare("SELECT * FROM sessions WHERE id = ?1 AND user_id = ?2")
         .map_err(|e| e.to_string())?;
@@ -504,6 +501,9 @@ fn register_edge_sync_mapping(
     };
     if !table_exists(&conn, "edge_sync_mapping") {
         return MappingOutcome::Unavailable("云端映射库缺少 edge_sync_mapping 表".to_string());
+    }
+    if let Err(reason) = session_backup::ensure_full_synchronous(&conn) {
+        return MappingOutcome::Unavailable(reason);
     }
     let result = conn.execute(
         "INSERT OR REPLACE INTO edge_sync_mapping \
@@ -646,12 +646,21 @@ fn copy_sessions_for_switch_at(
                     new_id,
                     group_id,
                     backup,
-                }) => copied.push(json!({
-                    "id": cid,
-                    "newId": new_id,
-                    "groupId": group_id,
-                    "backup": backup,
-                })),
+                    cleanup_state,
+                    cleanup_error,
+                }) => {
+                    let mut item = json!({
+                        "id": cid,
+                        "newId": new_id,
+                        "groupId": group_id,
+                        "backup": backup,
+                        "cleanupState": cleanup_state,
+                    });
+                    if let Some(error) = cleanup_error {
+                        item["cleanupError"] = json!(error);
+                    }
+                    copied.push(item);
+                }
                 Ok(CopyOutcome::AlreadyLinked {
                     session_id,
                     group_id,
@@ -680,6 +689,13 @@ fn copy_sessions_for_switch_at(
     if unusable {
         report["needsRecovery"] = json!(true);
     }
+    // 本轮复制之后再扫一遍：当前项的清理失败/保护残留必须出现在报告里，
+    // 不能只用请求开始时的维护快照（否则成功项 pending 只在 copied[] 上）。
+    // 维护可能补清成功：成功项上的 pending 路径必须改写成 null，避免虚假可还原位置。
+    report["temporaryFiles"] = json!(session_backup::maintain(paths, variant));
+    if let Some(items) = report.get_mut("copied").and_then(Value::as_array_mut) {
+        reconcile_reported_cleanup(items);
+    }
     Ok(report)
 }
 
@@ -699,7 +715,10 @@ enum CopyOutcome {
     Copied {
         new_id: String,
         group_id: String,
-        backup: String,
+        /// 待清理位置（已清理为 None）；仅表示待清理，不是可撤销备份。
+        backup: Option<String>,
+        cleanup_state: String,
+        cleanup_error: Option<String>,
     },
     AlreadyLinked {
         session_id: String,
@@ -779,7 +798,9 @@ fn write_copy_body(
         return Err("目标正文已存在同名文件，已停止复制".to_string());
     }
     let text = snapshot.text.replace(cid, new_cid);
-    atomic_write(&dest, &text).map_err(|error| format!("副本正文写入失败：{error}"))?;
+    // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
+    session_backup::durable_write_str(&dest, &text)
+        .map_err(|error| format!("副本正文写入失败：{error}"))?;
     match session_link::read_content_snapshot(&dest, new_cid) {
         ContentState::Ready(read_back)
             if read_back.normalized.total_digest == snapshot.normalized.total_digest =>
@@ -853,20 +874,37 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         });
     }
 
-    // 预分配：任何副本写入之前先持久化目标 UUID，失败恢复复用同一个 UUID。
-    ensure_link_store_ready(paths)?;
+    // 预分配身份：维护记录（allocating）先于任何备份与业务写入（design §3）。
+    // 任何副本写入之前，生命周期身份必须已可靠落盘，恢复/补清理才有依据。
     let new_cid = uuid::Uuid::new_v4().to_string();
-    let operation_id = uuid::Uuid::new_v4().to_string();
     let group_id = resolution
         .group_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let backup_root = session_backup_root(paths, context.variant);
-    let backup = backup_workbuddy_db(paths, &backup_root)?;
+    let mut lifecycle = session_backup::begin_operation(
+        paths,
+        context.variant,
+        OPERATION_KIND_COPY,
+        Some(new_cid.clone()),
+        None,
+    )?;
+    let backup_dir =
+        session_backup::transaction_dir(paths, context.variant, &lifecycle.operation_id)?;
+    let backup = match backup_workbuddy_db(paths, &backup_dir) {
+        Ok(backup) => backup,
+        Err(error) => {
+            // 受控失败分支：契约保证 protected 之前不发生业务写入，可安全回收残留。
+            session_backup::reclaim_unwritten(paths, context.variant, &mut lifecycle, &error);
+            return Err(error);
+        }
+    };
+    // 备份完备先转 protected：此步失败禁止任何业务写入，残留保守保留待下次维护。
+    session_backup::mark_protected(paths, &mut lifecycle)?;
+    ensure_link_store_ready(paths)?;
 
     let mut operation = Operation {
         version: OPERATION_VERSION,
-        operation_id: operation_id.clone(),
+        operation_id: lifecycle.operation_id.clone(),
         kind: OPERATION_KIND_COPY.to_string(),
         variant: context.variant,
         group_id: group_id.clone(),
@@ -884,6 +922,8 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         expected_record_count: snapshot.normalized.record_count,
         phase: OpPhase::Prepared,
         backup: Some(backup.to_string_lossy().to_string()),
+        lifecycle_version: Some(OPERATION_LIFECYCLE_VERSION),
+        cleanup_state: None,
         last_error: None,
         created_at: now_ms(),
         updated_at: now_ms(),
@@ -905,11 +945,77 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         context.variant,
         session_link::KEEP_COMPLETED_OPERATIONS,
     );
+    // 业务可靠完成之后才授权清理；清理失败不回滚业务、不报告复制失败。
+    let cleanup = finish_backup_cleanup(paths, context.variant, &mut lifecycle);
+    let (backup, cleanup_state, cleanup_error) = report_cleanup(&cleanup, &backup_dir);
     Ok(CopyOutcome::Copied {
         new_id: new_cid,
         group_id,
-        backup: backup.to_string_lossy().to_string(),
+        backup,
+        cleanup_state: cleanup_state.to_string(),
+        cleanup_error,
     })
+}
+
+/// 业务完成后的收尾：可靠转 cleanupPending 再回收；失败只报告，不改业务结果。
+fn finish_backup_cleanup(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    lifecycle: &mut BackupLifecycle,
+) -> CleanupOutcome {
+    if let Err(error) = session_backup::mark_cleanup_pending(paths, lifecycle, None) {
+        // 业务已完成、维护记录仍是 protected：下次维护按 Completed 补转后清理。
+        return CleanupOutcome::Pending {
+            reason: format!("清理状态推进失败（{error}）"),
+        };
+    }
+    session_backup::cleanup_after_success(paths, variant, lifecycle)
+}
+
+/// 维护入口补清成功后，把仍写着 pending 路径的成功项改成 cleaned / null。
+///
+/// `symlink_metadata` 把符号链接也视为「还在」，避免把拒绝删除的链接目标标成已清理。
+fn reconcile_reported_cleanup(items: &mut [Value]) {
+    for item in items {
+        if item.get("cleanupState").and_then(Value::as_str) != Some("pending") {
+            continue;
+        }
+        let still_there = item
+            .get("backup")
+            .and_then(Value::as_str)
+            .is_some_and(|path| std::fs::symlink_metadata(path).is_ok());
+        if still_there {
+            continue;
+        }
+        item["backup"] = json!(null);
+        if item.get("backupManifest").is_some() {
+            item["backupManifest"] = json!(null);
+        }
+        item["cleanupState"] = json!("cleaned");
+        if let Some(object) = item.as_object_mut() {
+            object.remove("cleanupError");
+        }
+    }
+}
+
+/// 清理结果到报告字段的投影：已清理不展示路径；待清理保留位置与原因。
+fn report_cleanup(
+    cleanup: &CleanupOutcome,
+    dir: &Path,
+) -> (Option<String>, &'static str, Option<String>) {
+    match cleanup {
+        CleanupOutcome::Cleaned => (None, "cleaned", None),
+        CleanupOutcome::Pending { reason } => (
+            Some(dir.to_string_lossy().to_string()),
+            "pending",
+            Some(reason.clone()),
+        ),
+        CleanupOutcome::Protected { reason } => (
+            Some(dir.to_string_lossy().to_string()),
+            "pending",
+            Some(reason.clone()),
+        ),
+    }
 }
 
 /// 从「源快照已确认」开始推进复制：写正文 → 写数据库行 → 登记映射 → 提交关联与基线。
@@ -972,6 +1078,9 @@ fn finish_copy_from_body(
 
 /// 推进操作阶段。阶段只能前进：已经走到更靠后的阶段时不回写（恢复路径不得把
 /// `LinksCommitted`/`Completed` 写回 `DbWritten`）。
+///
+/// 先保存候选副本、成功后才替换内存状态：保存失败时内存阶段不变，随后的
+/// `fail_operation` 不会把未落盘的阶段写回磁盘（design §3）。
 fn advance_operation(
     paths: &SessionPaths,
     operation: &mut Operation,
@@ -980,9 +1089,12 @@ fn advance_operation(
     if operation.phase >= phase {
         return Ok(());
     }
-    operation.phase = phase;
-    operation.updated_at = now_ms();
-    session_link::save_operation(paths, operation)
+    let mut candidate = operation.clone();
+    candidate.phase = phase;
+    candidate.updated_at = now_ms();
+    session_link::save_operation(paths, &candidate)?;
+    *operation = candidate;
+    Ok(())
 }
 
 fn fail_operation(paths: &SessionPaths, operation: &mut Operation, error: &str) {
@@ -1811,6 +1923,11 @@ fn sync_sessions_for_switch_at(
     if needs_recovery {
         report["needsRecovery"] = json!(true);
     }
+    // 本轮同步之后再扫一遍：当前项的清理失败/保护残留必须出现在报告里。
+    report["temporaryFiles"] = json!(session_backup::maintain(paths, variant));
+    if let Some(items) = report.get_mut("synced").and_then(Value::as_array_mut) {
+        reconcile_reported_cleanup(items);
+    }
     Ok(report)
 }
 
@@ -1820,8 +1937,6 @@ fn sync_sessions_for_switch_at(
 
 /// 同步备份清单格式版本；读到其它版本一律视为不可用。
 pub const SYNC_BACKUP_VERSION: u32 = 1;
-/// 备份目录名（按档位 + operationId 唯一）。
-const SYNC_BACKUP_DIR_NAME: &str = "session-sync";
 /// 数据库快照方法（清单里如实记录，恢复方据此选择恢复方法）。
 const DB_SNAPSHOT_METHOD: &str = "sqliteBackupApi";
 /// 数据库快照的分页步长与超时：App 已关闭，超时说明库被其它进程占用。
@@ -1831,13 +1946,15 @@ const DB_BACKUP_TIMEOUT: Duration = Duration::from_secs(30);
 const OPERATION_KIND_COPY: &str = "copy";
 const OPERATION_KIND_SYNC: &str = "sync";
 
-/// 一次同步的备份目录：`backups/session-sync/{variant}/{operationId}`（唯一，不复用）。
-fn sync_backup_dir(paths: &SessionPaths, variant: WbVariant, operation_id: &str) -> PathBuf {
-    paths
-        .backup_root()
-        .join(SYNC_BACKUP_DIR_NAME)
-        .join(variant.as_str())
-        .join(operation_id)
+/// 一次同步的备份目录：`backups/session-transactions/{variant}/{operationId}`。
+///
+/// 身份由调用方（生命周期记录）预分配，目录用 `create_dir` 拒绝复用。
+fn sync_backup_dir(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    operation_id: &str,
+) -> Result<PathBuf, String> {
+    session_backup::transaction_dir(paths, variant, operation_id)
 }
 
 fn sync_manifest_file(dir: &Path) -> PathBuf {
@@ -1913,7 +2030,7 @@ struct SyncBackupManifest {
     old_baseline_ref: Option<String>,
     /// 提交成功后目标成员的 lastSyncedAt。
     last_synced_at: i64,
-    /// 恢复方法（人类可读；备份路径可查看，design §6 / R6）。
+    /// 恢复方法（人类可读；清单只在未完成/待清理期间保留，成功清理后随目录删除）。
     restore_steps: Vec<String>,
 }
 
@@ -1937,7 +2054,8 @@ fn backup_file_with_digest(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("备份目录创建失败：{error}"))?;
     }
-    std::fs::write(dest, &bytes).map_err(|error| format!("备份写入失败：{error}"))?;
+    session_backup::durable_write(dest, &bytes)
+        .map_err(|error| format!("备份写入失败：{error}"))?;
     let read_back = std::fs::read(dest).map_err(|error| format!("备份回读失败：{error}"))?;
     if full_digest_of(&read_back) != expected_raw_digest {
         return Err("备份写后核验不一致，未报告备份成功".to_string());
@@ -2098,18 +2216,22 @@ fn validated_target_body_path(
 /// 创建本次同步的备份：唯一目录 + 覆盖前正文 + 待写入正文 + 数据库一致性快照 + 清单。
 ///
 /// 全过程只读目标、只写备份目录；任何一步失败都返回 Err，调用方必须零写入
-/// （不碰目标正文、不改数据库、不提交基线）。
+/// （不碰目标正文、不改数据库、不提交基线）。`operation_id` 由生命周期记录预分配。
+#[allow(clippy::too_many_arguments)] // 与 rotate.rs 同口径：参数都是本次备份的显式输入
 fn create_sync_backup(
     paths: &SessionPaths,
     variant: WbVariant,
+    operation_id: &str,
     plan: &SyncWritePlan,
     target_body_path: &Path,
     new_updated_at: i64,
     new_baseline_ref: &str,
     last_synced_at: i64,
 ) -> Result<SyncBackup, String> {
-    let operation_id = uuid::Uuid::new_v4().to_string();
-    let dir = sync_backup_dir(paths, variant, &operation_id);
+    let dir = sync_backup_dir(paths, variant, operation_id)?;
+    if !dir.is_dir() {
+        return Err("操作专属目录不存在，未创建备份".to_string());
+    }
     std::fs::create_dir_all(dir.join("bodies"))
         .map_err(|error| format!("同步备份目录创建失败：{error}"))?;
 
@@ -2139,7 +2261,7 @@ fn create_sync_backup(
 
     let manifest = SyncBackupManifest {
         version: SYNC_BACKUP_VERSION,
-        operation_id: operation_id.clone(),
+        operation_id: operation_id.to_string(),
         variant,
         group_id: plan.group_id.clone(),
         mode: plan.mode,
@@ -2193,7 +2315,7 @@ fn create_sync_backup(
     // 4) 清单落盘并回读核验：备份必须可验证恢复，读不回来的清单不算备份成功。
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
     let manifest_file = sync_manifest_file(&dir);
-    atomic_write(&manifest_file, &content)
+    session_backup::durable_write_str(&manifest_file, &content)
         .map_err(|error| format!("同步备份清单写入失败：{error}"))?;
     match load_sync_manifest(&dir) {
         Some(read_back) if read_back == manifest => {}
@@ -2250,7 +2372,9 @@ fn write_sync_body(
     text: &str,
     expected_digest: &str,
 ) -> Result<NormalizedContent, String> {
-    atomic_write(target_body_path, text).map_err(|error| format!("同步正文写入失败：{error}"))?;
+    // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
+    session_backup::durable_write_str(target_body_path, text)
+        .map_err(|error| format!("同步正文写入失败：{error}"))?;
     match session_link::read_content_snapshot(target_body_path, target_session_id) {
         ContentState::Ready(read_back) if read_back.normalized.total_digest == expected_digest => {
             Ok(read_back.normalized)
@@ -2298,6 +2422,8 @@ fn update_target_session_row(
     if !table_exists(&conn, "sessions") {
         return Err("会话数据库缺少 sessions 表，未同步".to_string());
     }
+    // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
+    session_backup::ensure_full_synchronous(&conn)?;
     let tx = conn
         .transaction()
         .map_err(|error| format!("会话数据库事务开启失败：{error}"))?;
@@ -2433,7 +2559,8 @@ fn restore_sync_backup_body(
     let text =
         String::from_utf8(bytes).map_err(|_| "备份正文不是合法 UTF-8，未回滚".to_string())?;
     let target_body_path = validated_target_body_path(paths, manifest)?;
-    atomic_write(&target_body_path, &text).map_err(|error| format!("目标正文回滚失败：{error}"))
+    session_backup::durable_write_str(&target_body_path, &text)
+        .map_err(|error| format!("目标正文回滚失败：{error}"))
 }
 
 /// 阶段化写入：正文 → 数据库 → 组表 → completed；每步先落阶段再推进，可恢复。
@@ -2533,20 +2660,40 @@ fn execute_sync_item(
     let new_updated_at = now_ms();
     let last_synced_at = now_ms();
     let new_baseline_ref = uuid::Uuid::new_v4().to_string();
-    // 备份是一道门禁：备份不可信就零写入（不碰正文、不改数据库、不提交基线）。
-    let backup = create_sync_backup(
+    // 预分配身份：维护记录（allocating）先于备份与业务写入（design §3）。
+    let target_title =
+        session_row_info(paths, &plan.target_member.session_id).map(|(title, _)| title);
+    let mut lifecycle = session_backup::begin_operation(
         paths,
         context.variant,
+        OPERATION_KIND_SYNC,
+        Some(plan.target_member.session_id.clone()),
+        target_title,
+    )?;
+    // 备份是一道门禁：备份不可信就零写入（不碰正文、不改数据库、不提交基线）。
+    let backup = match create_sync_backup(
+        paths,
+        context.variant,
+        &lifecycle.operation_id,
         plan,
         &target_body_path,
         new_updated_at,
         &new_baseline_ref,
         last_synced_at,
-    )?;
+    ) {
+        Ok(backup) => backup,
+        Err(error) => {
+            // 受控失败分支：protected 之前未写业务，可安全回收准备残留。
+            session_backup::reclaim_unwritten(paths, context.variant, &mut lifecycle, &error);
+            return Err(error);
+        }
+    };
+    // 备份完备先转 protected：此步失败禁止业务写入，残留保守保留待下次维护。
+    session_backup::mark_protected(paths, &mut lifecycle)?;
 
     let mut operation = Operation {
         version: OPERATION_VERSION,
-        operation_id: backup.manifest.operation_id.clone(),
+        operation_id: lifecycle.operation_id.clone(),
         kind: OPERATION_KIND_SYNC.to_string(),
         variant: context.variant,
         group_id: plan.group_id.clone(),
@@ -2564,6 +2711,8 @@ fn execute_sync_item(
         expected_record_count: plan.incoming.record_count,
         phase: OpPhase::Prepared,
         backup: Some(backup.manifest_file.to_string_lossy().to_string()),
+        lifecycle_version: Some(OPERATION_LIFECYCLE_VERSION),
+        cleanup_state: None,
         last_error: None,
         created_at: now_ms(),
         updated_at: now_ms(),
@@ -2592,7 +2741,13 @@ fn execute_sync_item(
         context.variant,
         session_link::KEEP_COMPLETED_OPERATIONS,
     );
-    Ok(json!({
+    // 业务可靠完成后才授权清理；清理失败不回滚业务、不报告同步失败。
+    let cleanup = finish_backup_cleanup(paths, context.variant, &mut lifecycle);
+    let (backup_path, cleanup_state, cleanup_error) = report_cleanup(&cleanup, &backup.dir);
+    let manifest_path = backup_path
+        .as_ref()
+        .map(|path| format!("{path}/manifest.json"));
+    let mut item = json!({
         "groupId": plan.group_id,
         "status": "synced",
         "verdict": verdict.as_str(),
@@ -2605,10 +2760,15 @@ fn execute_sync_item(
             "target": plan.incoming.record_count,
         },
         "updatedAt": backup.manifest.db.new_updated_at,
-        "backup": backup.dir.to_string_lossy(),
-        "backupManifest": backup.manifest_file.to_string_lossy(),
+        "backup": backup_path,
+        "backupManifest": manifest_path,
+        "cleanupState": cleanup_state,
         "message": plan.reason,
-    }))
+    });
+    if let Some(error) = cleanup_error {
+        item["cleanupError"] = json!(error);
+    }
+    Ok(item)
 }
 
 // ---------------------------------------------------------------------------
@@ -2625,6 +2785,17 @@ pub fn recover_pending_session_operations_at(
 ) -> RecoveryReport {
     let mut report = RecoveryReport::default();
     let scan = session_link::scan_operations(paths);
+    // 扫描不完整（目录不可读/枚举失败）不能按「没有未完成操作」继续写：与解析失败
+    // 同口径阻断，避免绕过 pending 去重后写出第二个副本。
+    if !scan.complete {
+        report.needs_recovery.push(RecoveryIssue {
+            operation_id: "operation-scan".to_string(),
+            reason: format!(
+                "{UNPARSEABLE_OPERATION_REASON}（操作日志目录不可读或枚举失败），已停止恢复以免产生重复副本"
+            ),
+            retryable: false,
+        });
+    }
     for problem in scan.problems {
         report.needs_recovery.push(RecoveryIssue {
             operation_id: problem.clone(),
@@ -2655,6 +2826,8 @@ pub fn recover_pending_session_operations_at(
             }
         }
     }
+    // 恢复之后补清理：回收可安全回收的临时备份残留，保护其余并上报（design §6）。
+    report.temporary_files = session_backup::maintain(paths, variant);
     report
 }
 
@@ -2989,6 +3162,7 @@ fn recover_copy_operation(
     if let Err(error) = advance_operation(paths, &mut operation, OpPhase::Completed) {
         return needs(error, true);
     }
+    cleanup_finished_operation(paths, variant, &operation);
     RecoverOutcome::Recovered(operation_id)
 }
 
@@ -3001,11 +3175,28 @@ fn abandon_operation(paths: &SessionPaths, operation: &mut Operation) {
 }
 
 /// 放弃一个未写入任何会话内容的操作（阶段置 Abandoned，不算成功）。
+///
+/// `cleanupState = safeTerminated` 是「已验证安全终止」的持久标记：只有带标记的
+/// Abandoned 才允许维护入口回收对应临时备份（design §3）。
 fn abandon_operation_with(paths: &SessionPaths, operation: &mut Operation, reason: &str) {
     operation.phase = OpPhase::Abandoned;
+    operation.cleanup_state = Some(CLEANUP_STATE_SAFE_TERMINATED.to_string());
     operation.last_error = Some(reason.to_string());
     operation.updated_at = now_ms();
     let _ = session_link::save_operation(paths, operation);
+}
+
+/// 恢复/放弃完成后立即回收该操作的临时备份（待清理推进失败时留给下次维护补转）。
+fn cleanup_finished_operation(paths: &SessionPaths, variant: WbVariant, operation: &Operation) {
+    let Ok(Some(mut record)) =
+        session_backup::load_lifecycle(paths, variant, &operation.operation_id)
+    else {
+        // 没有维护记录（旧操作/记录损坏）：维护扫描会按自身口径上报，这里不猜测。
+        return;
+    };
+    if session_backup::mark_cleanup_pending(paths, &mut record, None).is_ok() {
+        let _ = session_backup::cleanup_after_success(paths, variant, &record);
+    }
 }
 
 #[cfg(test)]
@@ -3479,6 +3670,118 @@ mod tests {
             .members
             .iter()
             .any(|member| member.uid == "uid-a" && member.session_id == "sess-1"));
+
+        // 成功清理：临时备份已回收，报告不展示可还原路径，也没有维护记录残留。
+        assert!(report["copied"][0]["backup"].is_null(), "{report}");
+        assert_eq!(report["copied"][0]["cleanupState"], "cleaned", "{report}");
+        assert_eq!(report["temporaryFiles"], json!([]), "{report}");
+        let operation_id = session_link::scan_operations(&env.paths)
+            .operations
+            .first()
+            .expect("操作日志必须保留")
+            .operation_id
+            .clone();
+        assert!(
+            !session_backup::transaction_dir(&env.paths, WbVariant::Cn, &operation_id)
+                .unwrap()
+                .exists(),
+            "成功路径必须回收本次操作专属目录"
+        );
+        assert!(session_backup::scan_lifecycle(&env.paths)
+            .records
+            .is_empty());
+    }
+
+    /// 批量复制逐项清理：进入下一项之前，上一成功项的临时目录已经消失（不累积备份）。
+    #[test]
+    fn batch_copy_cleans_each_backup_before_next_item() {
+        let env = ready_env("batch-cleanup");
+        env.add_session("sess-2", "uid-a", "标题二");
+        env.add_body("sess-2", &body_text("sess-2"));
+
+        let report = copy(&env, "uid-b", &["sess-1", "sess-2"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 2, "{report}");
+        for item in report["copied"].as_array().unwrap() {
+            assert!(item["backup"].is_null(), "{report}");
+            assert_eq!(item["cleanupState"], "cleaned", "{report}");
+        }
+        // 两个成功项都不留目录与维护记录：连续操作不累积成功备份。
+        let transactions = env
+            .paths
+            .backup_root()
+            .join(session_backup::TRANSACTIONS_DIR_NAME)
+            .join(WbVariant::Cn.as_str());
+        let leftovers = std::fs::read_dir(&transactions)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(leftovers, 0, "成功批次不得累积操作专属目录");
+        assert!(session_backup::scan_lifecycle(&env.paths)
+            .records
+            .is_empty());
+        assert_eq!(env.body_files().len(), 4, "两条来源正文与两个副本正文都在");
+    }
+
+    /// 归属不可验证（临时目录路径被替换为符号链接）：业务成功保持不变、材料保留并上报，
+    /// 解除异常后由维护入口补清理。
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_protects_business_success_when_transaction_path_is_symlinked() {
+        let env = ready_env("cleanup-symlink");
+        let transactions = env
+            .paths
+            .backup_root()
+            .join(session_backup::TRANSACTIONS_DIR_NAME);
+        std::fs::create_dir_all(&transactions).unwrap();
+        let target = env.root.join("redirected-transactions");
+        std::fs::create_dir_all(&target).unwrap();
+        // 档位目录被替换为符号链接：删除前校验必须拒绝，且不得跟随链接删除。
+        std::os::unix::fs::symlink(&target, transactions.join(WbVariant::Cn.as_str())).unwrap();
+
+        let report = copy(&env, "uid-b", &["sess-1"]);
+        assert_eq!(report["copied"].as_array().unwrap().len(), 1, "{report}");
+        let new_id = env.first_copy_id(&report);
+        // 业务成功不变：正文与数据库行都在，报告仍报成功，只是临时文件待处理。
+        assert!(env.body_path(&new_id).exists());
+        assert_eq!(env.rows_for("uid-b"), vec![new_id.clone()]);
+        assert_eq!(report["copied"][0]["cleanupState"], "pending", "{report}");
+        assert!(
+            report["copied"][0]["backup"].as_str().is_some(),
+            "待清理必须保留位置：{report}"
+        );
+        assert!(
+            report["copied"][0]["cleanupError"]
+                .as_str()
+                .unwrap()
+                .contains("符号链接"),
+            "{report}"
+        );
+        let temporary_files = report["temporaryFiles"].as_array().expect("temporaryFiles");
+        assert!(
+            !temporary_files.is_empty(),
+            "本轮清理受阻必须出现在报告级 temporaryFiles：{report}"
+        );
+        assert!(
+            temporary_files.iter().any(|item| item["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("符号链接"))),
+            "{report}"
+        );
+        assert_eq!(session_backup::scan_lifecycle(&env.paths).records.len(), 1);
+
+        // 解除异常后：维护入口补清理，业务结果不变；链接目标不被当作本操作材料删除。
+        std::fs::remove_file(transactions.join(WbVariant::Cn.as_str())).unwrap();
+        let recovery = recover_pending_session_operations_at(&env.paths, WbVariant::Cn);
+        assert!(recovery.is_clean(), "{:?}", recovery.needs_recovery);
+        assert!(session_backup::scan_lifecycle(&env.paths)
+            .records
+            .is_empty());
+        assert!(env.body_path(&new_id).exists());
+        assert_eq!(
+            session_link::scan_operations(&env.paths).operations[0]
+                .cleanup_state
+                .as_deref(),
+            Some(session_backup::CLEANUP_STATE_CLEANED)
+        );
     }
 
     #[test]
@@ -4175,6 +4478,8 @@ mod tests {
                 expected_record_count: 1,
                 phase: crate::modules::session_link::OpPhase::Prepared,
                 backup: None,
+                lifecycle_version: None,
+                cleanup_state: None,
                 last_error: None,
                 created_at: 1,
                 updated_at: 1,
@@ -5497,54 +5802,35 @@ mod tests {
         assert_eq!(synced[0]["recordCount"]["targetBefore"], 2);
         assert_eq!(synced[0]["recordCount"]["target"], 5);
 
-        // 备份可查看：唯一目录 + 清单 + 一致性快照 + 正文备份与摘要在清单里。
-        let backup_dir = PathBuf::from(synced[0]["backup"].as_str().unwrap());
-        let manifest_file = PathBuf::from(synced[0]["backupManifest"].as_str().unwrap());
-        assert!(backup_dir.is_dir());
-        assert_eq!(
-            manifest_file,
-            backup_dir.join("manifest.json"),
-            "清单是恢复的唯一依据"
-        );
-        let manifest = load_sync_manifest(&backup_dir).expect("备份清单必须可读");
+        // 成功清理：不展示可还原路径，本次临时目录与维护记录都已回收。
+        assert!(synced[0]["backup"].is_null(), "{report}");
+        assert!(synced[0]["backupManifest"].is_null(), "{report}");
+        assert_eq!(synced[0]["cleanupState"], "cleaned", "{report}");
+        assert_ne!(body_bytes(&env, &target_id), target_body_before);
+        let operations = sync_operations(&env);
+        assert_eq!(operations.len(), 1);
+        let operation_id = operations[0].operation_id.clone();
         assert!(
-            backup_dir.ends_with(&manifest.operation_id),
-            "备份目录按 operationId 唯一"
+            !session_backup::transaction_dir(&env.paths, WbVariant::Cn, &operation_id)
+                .unwrap()
+                .exists(),
+            "成功路径必须回收本次操作专属目录"
         );
-        assert_ne!(manifest.operation_id, group_id);
-        assert_eq!(manifest.group_id, group_id);
-        assert_eq!(manifest.variant, WbVariant::Cn);
-        assert_eq!(manifest.mode, SyncMode::FastForward);
-        assert_eq!(manifest.verdict, SyncVerdict::FastForward);
-        assert_eq!(manifest.source.uid, "uid-a");
-        assert_eq!(manifest.source.session_id, "sess-1");
-        assert_eq!(manifest.source.body_file, None);
-        assert_eq!(manifest.target.uid, "uid-b");
-        assert_eq!(manifest.target.session_id, target_id);
+        assert!(
+            session_backup::scan_lifecycle(&env.paths)
+                .records
+                .is_empty(),
+            "成功路径不得残留维护记录"
+        );
         assert_eq!(
-            manifest.target_body_path,
-            env.body_path(&target_id).to_string_lossy()
+            operations[0].cleanup_state.as_deref(),
+            Some(session_backup::CLEANUP_STATE_CLEANED),
+            "业务日志标注备份已清理"
         );
-        assert!(backup_dir.join(&manifest.db.snapshot_file).is_file());
-        assert_eq!(manifest.db.method, DB_SNAPSHOT_METHOD);
-        // 恢复清单：路径、目标行、备份位置、恢复方法。
-        let before_row = manifest.db.target_row.as_ref().expect("必须记录目标行");
-        assert_eq!(before_row.session_id, target_id);
-        assert_eq!(before_row.user_id, "uid-b");
-        assert_eq!(before_row.title.as_deref(), Some("改名后的标题"));
-        assert_eq!(before_row.custom_title.as_deref(), Some("自定义名"));
-        assert_eq!(before_row.updated_at, row_before.3);
-        assert_eq!(before_row.deleted_at, None);
-        let original_backup = backup_dir.join(manifest.target.body_file.clone().unwrap());
-        assert_eq!(std::fs::read(&original_backup).unwrap(), target_body_before);
-        assert_eq!(
-            full_digest_of(&std::fs::read(&original_backup).unwrap()),
-            manifest.target.body_raw_digest
+        assert!(
+            operations[0].backup.is_none(),
+            "已清理的操作不再展示备份位置"
         );
-        assert_eq!(manifest.target.record_count, 2);
-        assert_eq!(manifest.incoming.record_count, 5);
-        assert!(manifest.restore_steps.len() >= 4);
-        verify_sync_backup(&backup_dir, &manifest).expect("备份必须可核验");
 
         // 目标正文被替换为来源内容（本副本 sessionId 换成目标 id）；来源正文不动。
         let expected = incoming_text(&env, "sess-1", &target_id);
@@ -5562,28 +5848,25 @@ mod tests {
         assert_eq!(row_after.0, row_before.0);
         assert_eq!(row_after.1, row_before.1);
         assert_eq!(row_after.2, row_before.2);
-        assert_eq!(row_after.3, Some(manifest.db.new_updated_at));
+        assert_eq!(row_after.3, Some(synced[0]["updatedAt"].as_i64().unwrap()));
         assert!(row_after.3.unwrap() > row_before.3.unwrap());
         assert_eq!(row_after.4, None);
 
-        // 组表：A/B 基线推进到新引用，目标成员 lastSyncedAt 更新。
+        // 组表：A/B 基线推进到本次写入内容，目标成员 lastSyncedAt 更新。
+        let incoming_normalized =
+            session_link::normalize_jsonl(&expected, &target_id).expect("正文可归一化");
         let group = group_snapshot(&env, &group_id);
         let pair_ref_after = pair_ref_of(&group, "uid-a", "uid-b");
         assert_ne!(pair_ref_after, pair_ref_before);
-        assert_eq!(pair_ref_after, manifest.new_baseline_ref);
         assert_eq!(env.baseline_files(), baselines_before + 1);
         let baseline = session_link::load_baseline(&env.paths, &pair_ref_after).unwrap();
-        assert_eq!(
-            baseline.total_digest,
-            manifest.incoming.body_normalized_digest
-        );
+        assert_eq!(baseline.total_digest, incoming_normalized.total_digest);
         assert_eq!(baseline.record_count, 5);
-        assert_eq!(
-            session_link::active_member_for(&group, "uid-b")
-                .unwrap()
-                .last_synced_at,
-            Some(manifest.last_synced_at)
-        );
+        let last_synced = session_link::active_member_for(&group, "uid-b")
+            .unwrap()
+            .last_synced_at
+            .expect("目标成员必须记录本次同步时间");
+        assert!(last_synced >= row_after.3.unwrap());
         assert!(session_link::active_member_for(&group, "uid-a")
             .unwrap()
             .last_synced_at
@@ -5595,15 +5878,89 @@ mod tests {
             edge_db_before
         );
         assert_eq!(env.body_files().len(), 2);
-        let operations = sync_operations(&env);
-        assert_eq!(operations.len(), 1);
         assert_eq!(operations[0].phase, OpPhase::Completed);
         assert_eq!(operations[0].target.session_id, target_id);
-        assert_eq!(
-            operations[0].backup.as_deref(),
-            Some(&*manifest_file.to_string_lossy())
-        );
         assert!(session_link::pending_operations(&env.paths, WbVariant::Cn).is_empty());
+    }
+
+    /// 故障状态下的备份必须保持完整可核验：清单、一致性快照、覆盖前/待写入正文与摘要
+    /// 齐全，位于本版专属临时目录根，且维护记录仍能追踪（design §8：安全断言保留在
+    /// 准备/故障阶段验证，而不是在成功路径上）。
+    #[test]
+    fn pending_sync_backup_stays_verifiable_until_recovery() {
+        let env = ready_env("sync-backup-verify-on-failure");
+        let (group_id, token, target_id) = fast_forward_scene(&env);
+        set_row_meta(&env, &target_id, "改名后的标题", Some("自定义名"));
+        let row_before = session_row(&env, &target_id);
+        let target_body_before = body_bytes(&env, &target_id);
+
+        install_block_update_trigger(&env);
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert_eq!(report["needsRecovery"], true, "{report}");
+        drop_block_update_trigger(&env);
+
+        let operation = session_link::pending_operations(&env.paths, WbVariant::Cn)
+            .into_iter()
+            .next()
+            .expect("故障后必须保留未完成操作");
+        let manifest_file = PathBuf::from(operation.backup.clone().expect("必须记录备份位置"));
+        let backup_dir = manifest_file.parent().unwrap().to_path_buf();
+        assert_eq!(
+            manifest_file,
+            backup_dir.join("manifest.json"),
+            "清单是恢复的唯一依据"
+        );
+        let manifest = load_sync_manifest(&backup_dir).expect("备份清单必须可读");
+        assert_eq!(
+            backup_dir.file_name().unwrap().to_string_lossy(),
+            manifest.operation_id,
+            "备份目录按 operationId 唯一"
+        );
+        assert_eq!(manifest.group_id, group_id);
+        assert_eq!(manifest.variant, WbVariant::Cn);
+        assert_eq!(manifest.mode, SyncMode::FastForward);
+        assert_eq!(manifest.verdict, SyncVerdict::FastForward);
+        assert_eq!(manifest.source.uid, "uid-a");
+        assert_eq!(manifest.source.session_id, "sess-1");
+        assert_eq!(manifest.source.body_file, None);
+        assert_eq!(manifest.target.uid, "uid-b");
+        assert_eq!(manifest.target.session_id, target_id);
+        assert_eq!(
+            manifest.target_body_path,
+            env.body_path(&target_id).to_string_lossy()
+        );
+        assert!(backup_dir.join(&manifest.db.snapshot_file).is_file());
+        assert_eq!(manifest.db.method, DB_SNAPSHOT_METHOD);
+        let before_row = manifest.db.target_row.as_ref().expect("必须记录目标行");
+        assert_eq!(before_row.session_id, target_id);
+        assert_eq!(before_row.user_id, "uid-b");
+        assert_eq!(before_row.title.as_deref(), Some("改名后的标题"));
+        assert_eq!(before_row.custom_title.as_deref(), Some("自定义名"));
+        assert_eq!(before_row.updated_at, row_before.3);
+        let original_backup = backup_dir.join(manifest.target.body_file.clone().unwrap());
+        assert_eq!(std::fs::read(&original_backup).unwrap(), target_body_before);
+        assert_eq!(
+            full_digest_of(&std::fs::read(&original_backup).unwrap()),
+            manifest.target.body_raw_digest
+        );
+        assert_eq!(manifest.target.record_count, 2);
+        assert_eq!(manifest.incoming.record_count, 5);
+        assert!(manifest.restore_steps.len() >= 4);
+        verify_sync_backup(&backup_dir, &manifest).expect("备份必须可核验");
+        // 备份位于本版专属临时目录根，维护记录仍能追踪同一 operationId。
+        assert!(backup_dir.starts_with(
+            env.paths
+                .backup_root()
+                .join(session_backup::TRANSACTIONS_DIR_NAME)
+        ));
+        assert!(session_backup::scan_lifecycle(&env.paths)
+            .records
+            .iter()
+            .any(|record| record.operation_id == manifest.operation_id));
     }
 
     /// 显式覆盖：目标全文被替换为来源内容（目标独有记录不再保留），仍然保留 SID/标题。
@@ -5726,13 +6083,14 @@ mod tests {
         let baselines_before = env.baseline_files();
         let pairs_before = pair_snapshot(&env);
 
-        // 备份目录的父路径被占成普通文件 → 备份目录创建失败。
+        // 临时目录根被占成普通文件 → 操作专属目录创建失败。
         std::fs::create_dir_all(env.paths.backup_root()).unwrap();
-        std::fs::write(
-            env.paths.backup_root().join(SYNC_BACKUP_DIR_NAME),
-            b"occupied",
-        )
-        .unwrap();
+        let transactions_root = env
+            .paths
+            .backup_root()
+            .join(session_backup::TRANSACTIONS_DIR_NAME);
+        let _ = std::fs::remove_dir_all(&transactions_root);
+        std::fs::write(&transactions_root, b"occupied").unwrap();
 
         let report = sync(
             &env,
@@ -5741,7 +6099,7 @@ mod tests {
         );
         assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("同步备份目录创建失败"), "{error}");
+        assert!(error.contains("临时目录创建失败"), "{error}");
 
         // 零写入：正文、数据库行、基线、关联版本原样保留。
         assert_eq!(body_bytes(&env, &target_id), target_before);
@@ -6117,22 +6475,17 @@ mod tests {
         );
     }
 
-    /// 已提交基线后数据库不可读：不能当作删除回滚正文或丢弃操作。
+    /// 恢复期间数据库不可读：不覆盖正文/行/基线，保留 pending 并暂停启动；解除后恢复成功。
     #[test]
     fn sync_recovery_preserves_committed_state_on_database_read_failure() {
         for fault in ["open", "schema", "query"] {
             let env = ready_env(&format!("sync-read-failure-{fault}"));
-            let (group_id, token, target_id) = fast_forward_scene(&env);
-            let report = sync(
-                &env,
-                "uid-b",
-                &[selection(&group_id, &token, SyncMode::FastForward)],
-            );
-            assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
-            // 模拟基线已落盘、Completed 阶段日志尚未保存时中断。
-            let mut operation = sync_operations(&env).remove(0);
-            operation.phase = OpPhase::LinksCommitted;
-            session_link::save_operation(&env.paths, &operation).unwrap();
+            // 写入阶段被故障中断：操作未完成、临时备份按契约保留（只在完成后才清理）。
+            let (target_id, _, _) = interrupted_sync_scene(&env);
+            let operation = session_link::pending_operations(&env.paths, WbVariant::Cn)
+                .into_iter()
+                .next()
+                .expect("故障后必须保留未完成操作");
             let body_before = body_bytes(&env, &target_id);
             let row_before = session_row(&env, &target_id);
             let pairs_before = pair_snapshot(&env);
@@ -6170,7 +6523,7 @@ mod tests {
             let pending = session_link::pending_operations(&env.paths, WbVariant::Cn);
             assert_eq!(pending.len(), 1, "{fault}");
             assert_eq!(pending[0].operation_id, operation.operation_id);
-            assert_eq!(pending[0].phase, OpPhase::LinksCommitted);
+            assert_eq!(pending[0].phase, OpPhase::BodyWritten);
 
             match fault {
                 "open" => std::fs::rename(&saved_db, &db).unwrap(),
@@ -6192,12 +6545,28 @@ mod tests {
                 "{fault}: {:?}",
                 recovery.needs_recovery
             );
-            assert_eq!(recovery.recovered, vec![operation.operation_id]);
+            assert_eq!(recovery.recovered, vec![operation.operation_id.clone()]);
             assert_eq!(body_bytes(&env, &target_id), body_before);
-            assert_eq!(session_row(&env, &target_id), row_before);
-            assert_eq!(pair_snapshot(&env), pairs_before);
-            assert_eq!(env.baseline_files(), baselines_before);
+            // 补完之后才更新目标行与基线：只改 updated_at，身份/标题不动。
+            let row_after = session_row(&env, &target_id);
+            assert_eq!(row_after.0, row_before.0);
+            assert_eq!(row_after.1, row_before.1);
+            assert_eq!(row_after.2, row_before.2);
+            assert!(row_after.3.unwrap() > row_before.3.unwrap());
+            assert_eq!(row_after.4, None);
+            assert_eq!(env.baseline_files(), baselines_before + 1);
+            assert_ne!(pair_snapshot(&env), pairs_before);
             assert_eq!(sync_operations(&env)[0].phase, OpPhase::Completed);
+            assert!(
+                !session_backup::transaction_dir(
+                    &env.paths,
+                    WbVariant::Cn,
+                    &operation.operation_id
+                )
+                .unwrap()
+                .exists(),
+                "{fault}: 恢复完成后必须回收临时备份"
+            );
         }
     }
 
@@ -6313,6 +6682,8 @@ mod tests {
                 expected_record_count: 1,
                 phase: OpPhase::Prepared,
                 backup: None,
+                lifecycle_version: None,
+                cleanup_state: None,
                 last_error: None,
                 created_at: 1,
                 updated_at: 1,
@@ -6370,10 +6741,12 @@ mod tests {
                 backup: Some(
                     env.paths
                         .backup_root()
-                        .join("session-sync/cn/does-not-exist/manifest.json")
+                        .join("session-transactions/cn/does-not-exist/manifest.json")
                         .to_string_lossy()
                         .to_string(),
                 ),
+                lifecycle_version: Some(OPERATION_LIFECYCLE_VERSION),
+                cleanup_state: None,
                 last_error: None,
                 created_at: 1,
                 updated_at: 1,

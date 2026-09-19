@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use crate::modules::config::{atomic_write, now_ms};
 use crate::modules::session::SessionPaths;
+use crate::modules::session_backup;
 use crate::modules::variant::WbVariant;
 
 // ---------------------------------------------------------------------------
@@ -46,6 +47,8 @@ pub const OPERATION_VERSION: u32 = 1;
 pub const SESSION_ID_MARKER: &str = "__wb_switch_session_id__";
 /// 每档位保留的已完成操作日志条数（未完成的一律保留）。
 pub const KEEP_COMPLETED_OPERATIONS: usize = 20;
+/// 操作日志扫描不完整时的上报前缀（扫描失败不等于「没有」）。
+pub const OP_SCAN_PROBLEM_PREFIX: &str = "操作记录扫描不完整：";
 /// 存储锁的最长等待（存储锁只用于短时读改写）。
 const STORE_LOCK_RETRY: usize = 25;
 const STORE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
@@ -586,6 +589,12 @@ pub struct Operation {
     pub phase: OpPhase,
     #[serde(default)]
     pub backup: Option<String>,
+    /// 本版生命周期标记；只有带标记的可靠终态才授权回收备份（design §3）。
+    #[serde(default)]
+    pub lifecycle_version: Option<u32>,
+    /// `cleaned`（备份已回收）| `safeTerminated`（已验证安全终止，允许回收）。
+    #[serde(default)]
+    pub cleanup_state: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
     pub created_at: i64,
@@ -634,10 +643,14 @@ pub enum StoreState {
 }
 
 /// 操作日志扫描结果：解析失败的文件必须显式上报，不能当成没有。
+///
+/// `complete` 为 false 表示目录不可读或存在枚举失败：此时调用方不得把扫描结果
+/// 当作「不存在对应操作」来授权删除（design §5）。
 #[derive(Debug, Default, Clone)]
 pub struct OperationScan {
     pub operations: Vec<Operation>,
     pub problems: Vec<String>,
+    pub complete: bool,
 }
 
 /// 恢复/异常项上报。
@@ -650,6 +663,56 @@ pub struct RecoveryIssue {
     pub retryable: bool,
 }
 
+/// 临时备份残留的只读上报项（复制/同步/恢复报告共用同一结构）。
+///
+/// `state` 为 `cleanupPending`（待清理，下次维护入口重试）或 `needsRecovery`
+/// （待恢复/状态不可验证，需人工确认）。待清理不是错误，不设置报告级 needsRecovery。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemporaryFileIssue {
+    pub operation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub state: String,
+    pub reason: String,
+}
+
+impl TemporaryFileIssue {
+    /// 待清理：业务已确认完成，只是本轮没清理成功。
+    pub fn cleanup_pending(
+        operation_id: String,
+        session_id: Option<String>,
+        title: Option<String>,
+        reason: String,
+    ) -> Self {
+        Self {
+            operation_id,
+            session_id,
+            title,
+            state: "cleanupPending".to_string(),
+            reason,
+        }
+    }
+
+    /// 待恢复：材料必须保留，需要用户/恢复流程处理。
+    pub fn needs_recovery(
+        operation_id: String,
+        session_id: Option<String>,
+        title: Option<String>,
+        reason: String,
+    ) -> Self {
+        Self {
+            operation_id,
+            session_id,
+            title,
+            state: "needsRecovery".to_string(),
+            reason,
+        }
+    }
+}
+
 /// 恢复报告。
 #[derive(Debug, Default, Clone)]
 pub struct RecoveryReport {
@@ -659,6 +722,8 @@ pub struct RecoveryReport {
     pub abandoned: Vec<String>,
     /// 需要人工处理（中间产物被改动/丢失），不得盲目重放。
     pub needs_recovery: Vec<RecoveryIssue>,
+    /// 临时备份残留：待清理与待恢复（不改变 `is_clean`/启动阻断口径）。
+    pub temporary_files: Vec<TemporaryFileIssue>,
 }
 
 impl RecoveryReport {
@@ -668,7 +733,10 @@ impl RecoveryReport {
 
     /// 本次恢复是否什么都没做（宿主据此决定是否回报详情）。
     pub fn is_empty(&self) -> bool {
-        self.recovered.is_empty() && self.abandoned.is_empty() && self.needs_recovery.is_empty()
+        self.recovered.is_empty()
+            && self.abandoned.is_empty()
+            && self.needs_recovery.is_empty()
+            && self.temporary_files.is_empty()
     }
 }
 
@@ -926,7 +994,8 @@ pub fn with_link_store_write<T>(
     if let Some(parent) = paths.session_links_file().parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    atomic_write(&paths.session_links_file(), &content).map_err(|error| {
+    // 共享关联表属于业务完成门禁：走会话专用持久化写（design §4）。
+    session_backup::durable_write_str(&paths.session_links_file(), &content).map_err(|error| {
         if !existed {
             format!("关联存储首次写入失败：{error}")
         } else {
@@ -1064,7 +1133,8 @@ pub fn save_baseline(
     }
     std::fs::create_dir_all(paths.baselines_dir()).map_err(|error| error.to_string())?;
     let content = serde_json::to_string_pretty(&record).map_err(|error| error.to_string())?;
-    atomic_write(&baseline_file(paths, baseline_ref), &content)
+    // 基线属于业务完成门禁：必须走会话专用持久化写（design §4）。
+    session_backup::durable_write_str(&baseline_file(paths, baseline_ref), &content)
         .map_err(|error| error.to_string())?;
     Ok(record)
 }
@@ -1348,21 +1418,40 @@ fn operation_file(paths: &SessionPaths, operation_id: &str) -> PathBuf {
     paths.operations_dir().join(format!("{operation_id}.json"))
 }
 
-/// 原子写入操作日志。
+/// 原子写入操作日志（临时文件 + 持久化屏障 + rename + 父目录持久化）。
 pub fn save_operation(paths: &SessionPaths, operation: &Operation) -> Result<(), String> {
     std::fs::create_dir_all(paths.operations_dir()).map_err(|error| error.to_string())?;
     let content = serde_json::to_string_pretty(operation).map_err(|error| error.to_string())?;
-    atomic_write(&operation_file(paths, &operation.operation_id), &content)
+    session_backup::durable_write_str(&operation_file(paths, &operation.operation_id), &content)
         .map_err(|error| format!("操作记录写入失败：{error}"))
 }
 
 /// 扫描全部操作日志（不区分档位）；解析失败的文件作为问题上报。
 pub fn scan_operations(paths: &SessionPaths) -> OperationScan {
-    let mut scan = OperationScan::default();
-    let Ok(entries) = std::fs::read_dir(paths.operations_dir()) else {
-        return scan;
+    let mut scan = OperationScan {
+        operations: Vec::new(),
+        problems: Vec::new(),
+        complete: true,
     };
-    for entry in entries.flatten() {
+    let entries = match std::fs::read_dir(paths.operations_dir()) {
+        Ok(entries) => entries,
+        // 尚无任何操作日志：空结果且完整（首次使用）。
+        Err(error) if error.kind() == ErrorKind::NotFound => return scan,
+        Err(error) => {
+            scan.complete = false;
+            scan.problems.push(format!("操作日志目录不可读：{error}"));
+            return scan;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan.complete = false;
+                scan.problems.push(format!("操作日志目录枚举失败：{error}"));
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -1410,12 +1499,26 @@ pub fn find_pending_operation<'a>(
 }
 
 /// 清理已完成/已放弃的历史操作日志，每档位保留最近 `keep` 条。
+///
+/// 仍被维护记录引用的日志一律不裁剪：它们是补清理/补转的唯一依据（design §6）。
 pub fn prune_operations(paths: &SessionPaths, variant: WbVariant, keep: usize) -> usize {
     let scan = scan_operations(paths);
+    if !scan.complete {
+        return 0;
+    }
+    // 维护记录扫描不完整（损坏/未知版本/归属不一致）时状态不明：一律不裁剪。
+    let referenced = match session_backup::referenced_operation_ids(paths) {
+        Ok(referenced) => referenced,
+        Err(_) => return 0,
+    };
     let mut finished: Vec<&Operation> = scan
         .operations
         .iter()
-        .filter(|operation| operation.variant == variant && !operation.phase.is_unfinished())
+        .filter(|operation| {
+            operation.variant == variant
+                && !operation.phase.is_unfinished()
+                && !referenced.contains(&operation.operation_id)
+        })
         .collect();
     if finished.len() <= keep {
         return 0;
@@ -1508,6 +1611,8 @@ mod tests {
             expected_record_count: 1,
             phase,
             backup: None,
+            lifecycle_version: None,
+            cleanup_state: None,
             last_error: None,
             created_at: 1,
             updated_at: 1,
@@ -2038,6 +2143,74 @@ mod tests {
         }
         assert!(prune_operations(&paths, WbVariant::Cn, 2) >= 4);
         assert!(paths.operations_dir().join("op-cn.json").exists());
+    }
+
+    /// 仍被维护记录引用的操作日志不得被数量裁剪丢弃：补清理的唯一依据必须保留。
+    #[test]
+    fn prune_operations_keeps_logs_referenced_by_lifecycle_records() {
+        let dir = TempDir::new("prune-lifecycle");
+        let paths = temp_paths(&dir);
+        let kept_id = uuid::Uuid::new_v4().to_string();
+        let drop_id = uuid::Uuid::new_v4().to_string();
+        save_operation(
+            &paths,
+            &operation(&kept_id, OpPhase::Completed, "uid-b", "s1"),
+        )
+        .unwrap();
+        save_operation(
+            &paths,
+            &operation(&drop_id, OpPhase::Completed, "uid-b", "s2"),
+        )
+        .unwrap();
+        session_backup::save_lifecycle(
+            &paths,
+            &session_backup::BackupLifecycle {
+                version: session_backup::LIFECYCLE_VERSION,
+                operation_id: kept_id.clone(),
+                variant: WbVariant::Cn,
+                kind: "copy".to_string(),
+                state: session_backup::BackupState::CleanupPending,
+                created_at: 1,
+                updated_at: 1,
+                last_error: Some("临时目录删除失败：权限不足".to_string()),
+                session_id: None,
+                title: None,
+            },
+        )
+        .unwrap();
+
+        // keep = 0：普通已完成日志被裁剪，带维护记录的那条必须留下。
+        let removed = prune_operations(&paths, WbVariant::Cn, 0);
+        assert_eq!(removed, 1);
+        let ids: Vec<String> = scan_operations(&paths)
+            .operations
+            .into_iter()
+            .map(|operation| operation.operation_id)
+            .collect();
+        assert_eq!(ids, vec![kept_id]);
+    }
+
+    /// 维护记录损坏时状态不明：不得把「解析失败的记录」当成未引用而去裁剪日志。
+    #[test]
+    fn prune_operations_skips_when_lifecycle_scan_is_incomplete() {
+        let dir = TempDir::new("prune-damaged");
+        let paths = temp_paths(&dir);
+        let drop_id = uuid::Uuid::new_v4().to_string();
+        save_operation(
+            &paths,
+            &operation(&drop_id, OpPhase::Completed, "uid-b", "s1"),
+        )
+        .unwrap();
+        let lifecycle_dir = session_backup::lifecycle_root(&paths, WbVariant::Cn);
+        std::fs::create_dir_all(&lifecycle_dir).unwrap();
+        std::fs::write(lifecycle_dir.join("broken.json"), b"{not json").unwrap();
+
+        let removed = prune_operations(&paths, WbVariant::Cn, 0);
+        assert_eq!(removed, 0, "扫描不完整时不得裁剪任何操作日志");
+        assert!(paths
+            .operations_dir()
+            .join(format!("{drop_id}.json"))
+            .exists());
     }
 
     /// 锁失败文案前缀常量与 [`LockError::message`] 的输出一致：宿主据此判断锁失败，
