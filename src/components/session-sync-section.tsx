@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link2, Loader2, RotateCw } from "lucide-react";
+import { ChevronRight, CircleAlert, Link2, Loader2, RotateCw } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -46,10 +46,10 @@ export interface SessionLinksMeta {
 
 /** 判定结果的中文标签（与 core 的 verdict 一一对应，只表达状态，动作交给摘要句）。 */
 const VERDICT_LABEL: Record<SessionSyncVerdict, string> = {
-  fastForward: "有新内容",
-  diverge: "两边都改过",
+  fastForward: "可同步",
+  diverge: "双方都有更新",
   ahead: "目标账号有更新",
-  identical: "两边一致",
+  identical: "内容一致",
   unknown: "无法确认",
 };
 
@@ -68,6 +68,11 @@ function primaryMode(group: SessionLinkPreviewGroup): SessionSyncMode | null {
 
 function isActionable(group: SessionLinkPreviewGroup): boolean {
   return primaryMode(group) !== null && Boolean(group.previewToken);
+}
+
+/** 可直接同步项：全选只作用于这类会话，覆盖必须单独勾选。 */
+function isDirectlySyncable(group: SessionLinkPreviewGroup): boolean {
+  return isActionable(group) && primaryMode(group) === "fastForward";
 }
 
 /**
@@ -90,26 +95,26 @@ function buildSelections(
 function summarySentence(group: SessionLinkPreviewGroup, targetLabel: string): string {
   switch (group.verdict) {
     case "fastForward":
-      return `当前账号有 ${group.extraA} 条新内容，可以直接同步。`;
+      return `将当前账号的新内容同步到「${targetLabel}」`;
     case "diverge":
-      return `两边都有改动；同步会替换「${targetLabel}」的完整内容。`;
+      return "勾选将用当前账号内容覆盖目标全文。";
     case "ahead":
-      return `「${targetLabel}」中的此会话已有新内容，本次保留，不同步。`;
+      return "保留目标内容，本次不同步";
     case "identical":
-      return "两边内容一致，无需同步。";
+      return "无需同步";
     case "unknown":
-      return "暂时无法确认两边内容，本次不会同步。";
+      return "暂时无法确认两边内容，本次不会同步";
   }
 }
 
 const RECORD_COUNT_HINT = "按会话内容的条数统计，不是对话轮数；条数相同也不代表内容顺序完全一致。";
 
 /**
- * 切号弹窗「关联会话」tab 的内容：说明卡 + 会话卡片（判定徽标 + 一句摘要 + 折叠详情）。
+ * 切号弹窗「关联会话」tab 的内容：说明卡 + 会话列表（判定徽标 + 一句摘要 + 折叠详情）。
  *
  * - 默认勾选与可选模式全部来自后端：`defaultChecked` 为 true 才预先勾选，
  *   `availableModes` 为空（identical / ahead / unknown / 预览凭据不可用）一律禁选。
- * - `diverge` 默认不勾，需用户显式选择覆盖；勾选后详情强制展开并显示覆盖警告。
+ * - `diverge` 默认不勾，需用户显式选择覆盖；覆盖风险常驻行内，不依赖展开或勾选。
  * - 错误与存储不可用由父组件在 tab 之上常驻提示，本组件只保留对应的空态与重试入口。
  */
 export function SessionSyncSection({ account, open, disabled, onChange, onMetaChange }: Props) {
@@ -177,6 +182,20 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     // onMetaChange 只做状态回写，不进依赖。
   }, [unsupported, groups.length, error, preview?.storeStatus, preview?.storeError]);
 
+  const syncable = groups.filter(isDirectlySyncable);
+  const selectedCount = groups.filter((group) => isActionable(group) && checked.has(group.groupId)).length;
+  const selectedSyncableCount = syncable.filter((group) => checked.has(group.groupId)).length;
+  const allSyncableSelected = syncable.length > 0 && selectedSyncableCount === syncable.length;
+
+  /** 全选/取消全选：只作用于可直接同步的会话；覆盖项必须单独勾选。 */
+  function toggleAllSyncable() {
+    const updated = new Set(checked);
+    if (allSyncableSelected) syncable.forEach((group) => updated.delete(group.groupId));
+    else syncable.forEach((group) => updated.add(group.groupId));
+    setChecked(updated);
+    onChange({ selections: buildSelections(groups, updated), groups });
+  }
+
   function toggleGroup(group: SessionLinkPreviewGroup, next: boolean) {
     const updated = new Set(checked);
     if (next) updated.add(group.groupId);
@@ -199,7 +218,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         <div className="min-w-0 space-y-0.5">
           <div className="text-sm font-medium">什么是关联会话？</div>
           <p className="text-xs text-muted-foreground">
-            通过本工具复制到其他账号的会话，会自动建立关联。切换账号时，可以把当前账号的后续内容同步到对应会话。
+            通过本工具复制到其他账号的会话，会自动建立关联。切换时，可选择将当前账号的后续内容同步到对应会话。
           </p>
         </div>
       </div>
@@ -243,23 +262,38 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
 
       {!pending && !error && groups.length > 0 && (
         <div className="space-y-2">
-          {groups.map((group) => (
-            <SessionLinkCard
-              key={group.groupId}
-              group={group}
-              targetLabel={targetLabel}
-              checked={checked.has(group.groupId) && isActionable(group)}
-              disabled={disabled}
-              onToggle={(next) => toggleGroup(group, next)}
+          <div className="flex items-center gap-2.5 px-1">
+            <Checkbox
+              checked={allSyncableSelected ? true : selectedSyncableCount > 0 ? "indeterminate" : false}
+              disabled={disabled || syncable.length === 0}
+              onCheckedChange={() => toggleAllSyncable()}
+              aria-label="全选可直接同步的会话"
             />
-          ))}
+            <span className="min-w-0 flex-1 text-sm font-medium">全选可直接同步的会话</span>
+            <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+              {`已选 ${selectedCount} / ${groups.length}`}
+            </span>
+          </div>
+          <div className="max-h-[min(24rem,50vh)] divide-y overflow-y-auto rounded-md border">
+            {groups.map((group) => (
+              <SessionLinkCard
+                key={group.groupId}
+                group={group}
+                targetLabel={targetLabel}
+                checked={checked.has(group.groupId) && isActionable(group)}
+                disabled={disabled}
+                onToggle={(next) => toggleGroup(group, next)}
+              />
+            ))}
+          </div>
+          <p className="px-1 text-xs text-muted-foreground">全选仅包含可直接同步的会话，覆盖需单独勾选。</p>
         </div>
       )}
     </section>
   );
 }
 
-/** 会话卡片：标题 + 判定徽标 + 一句摘要 + 折叠详情（条数 / 原因 / 覆盖警告）。 */
+/** 会话行：勾选框 + 标题 + 一句摘要 + 判定徽标 + 折叠箭头（路径 / 条数 / 原因）。 */
 function SessionLinkCard({
   group,
   targetLabel,
@@ -274,28 +308,14 @@ function SessionLinkCard({
   onToggle: (next: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const mode = primaryMode(group);
   const canSelect = isActionable(group);
-  const overwrite = mode === "overwrite";
-  // 勾选覆盖时详情必须展开并显示警告，不允许把高风险提示藏在折叠后。
-  const forceOpen = overwrite && checked;
-  const expanded = forceOpen || open;
+  const overwrite = primaryMode(group) === "overwrite";
   const title = group.title || "(无标题)";
 
   return (
-    <Collapsible
-      open={expanded}
-      onOpenChange={(next) => {
-        if (!forceOpen) setOpen(next);
-      }}
-      className={cn(
-        "space-y-1 rounded-md border px-3 py-2.5",
-        canSelect && "hover:bg-accent/30",
-        !canSelect && "bg-muted/30",
-      )}
-    >
+    <Collapsible open={open} onOpenChange={setOpen} className="px-3 py-2.5">
       <div className="flex items-start gap-2.5">
-        {canSelect && (
+        {canSelect ? (
           <Checkbox
             className="mt-0.5"
             checked={checked}
@@ -303,6 +323,8 @@ function SessionLinkCard({
             onCheckedChange={(state) => onToggle(state === true)}
             aria-label={`同步会话 ${title}`}
           />
+        ) : (
+          <span className="mt-0.5 size-3.5 shrink-0" aria-hidden />
         )}
         <div className="min-w-0 flex-1 space-y-0.5">
           <div className="flex items-center gap-2">
@@ -312,20 +334,25 @@ function SessionLinkCard({
             <Badge variant={VERDICT_BADGE[group.verdict]} className="shrink-0 text-[10px]">
               {VERDICT_LABEL[group.verdict]}
             </Badge>
+            <CollapsibleTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6 shrink-0 text-muted-foreground"
+                aria-label="查看详情"
+              >
+                <ChevronRight className={cn("size-4 transition-transform", open && "rotate-90")} />
+              </Button>
+            </CollapsibleTrigger>
           </div>
           <p className="text-xs text-muted-foreground">{summarySentence(group, targetLabel)}</p>
+          {overwrite && (
+            <p className="flex items-start gap-1 text-xs text-amber-700 dark:text-amber-400">
+              <CircleAlert className="mt-px size-3.5 shrink-0" />
+              <span>{`目标独有 ${group.extraB} 条记录将被替换，无法通过本工具撤销。`}</span>
+            </p>
+          )}
         </div>
-        <CollapsibleTrigger asChild>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="shrink-0 text-xs text-muted-foreground"
-            disabled={forceOpen}
-            aria-expanded={expanded}
-          >
-            {expanded && !forceOpen ? "收起详情" : "查看详情"}
-          </Button>
-        </CollapsibleTrigger>
       </div>
 
       <CollapsibleContent className="space-y-1.5 pt-1 text-xs text-muted-foreground">
@@ -347,14 +374,6 @@ function SessionLinkCard({
           </TooltipContent>
         </Tooltip>
         <span className="block">{group.reason}</span>
-        {overwrite && (
-          <span className="block rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-amber-900 dark:text-amber-200">
-            <span className="block font-medium">勾选后会替换目标账号的完整内容</span>
-            <span className="mt-0.5 block">
-              {`会用当前账号的内容替换目标账号这条会话的全部内容（其中目标账号独有的 ${group.extraB} 条会被替换掉），会话标题保持不变。条数相同也不代表内容顺序完全一致；完成后无法在本工具中撤销。`}
-            </span>
-          </span>
-        )}
       </CollapsibleContent>
     </Collapsible>
   );

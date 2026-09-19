@@ -340,18 +340,22 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const linksAvailable = linksMeta?.available ?? true;
   const summaryMain =
     copyCount > 0 && syncCount > 0
-      ? `本次将复制 ${copyCount} 个、同步 ${syncCount} 个会话`
+      ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
       : copyCount > 0
-        ? `本次将复制 ${copyCount} 个会话`
+        ? `将复制 ${copyCount} 个会话`
         : syncCount > 0
-          ? `本次将同步 ${syncCount} 个会话`
+          ? `将同步 ${syncCount} 个关联会话`
           : "本次仅切换账号";
   const summarySub =
     overwriteCount > 0
       ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
       : copyCount === 0 && syncCount === 0
-        ? "不复制或同步会话"
-        : null;
+        ? "未选择复制或同步会话"
+        : copyCount === 0
+          ? "未选择复制会话"
+          : syncCount === 0
+            ? "未选择同步会话"
+            : null;
   const needsPermission = error.includes("无权限");
   const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
