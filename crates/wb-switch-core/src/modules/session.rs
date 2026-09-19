@@ -1234,7 +1234,7 @@ fn committed_links_present(paths: &SessionPaths, operation: &Operation) -> Resul
                 .iter()
                 .find(|group| group.id == operation.group_id)
             else {
-                return Err("同步关系缺失，已停止恢复".to_string());
+                return Err("会话的关联关系缺失，已停止恢复".to_string());
             };
             let has_source = session_link::find_member(
                 group,
@@ -1674,7 +1674,7 @@ fn plan_sync_selection(
     let binding = &token.binding;
     if binding.variant != variant || binding.group_id != selection.group_id {
         return SyncItemOutcome::Rejected {
-            message: "检查结果与所选同步关系不匹配，已拒绝".to_string(),
+            message: "检查结果与所选会话不匹配，已拒绝".to_string(),
         };
     }
     let skip = |message: String| SyncItemOutcome::Skipped {
@@ -1694,7 +1694,7 @@ fn plan_sync_selection(
         .iter()
         .find(|group| group.id == selection.group_id && group.variant == variant)
     else {
-        return skip("同步关系已不存在，检查结果已失效".to_string());
+        return skip("会话的关联关系已不存在，检查结果已失效".to_string());
     };
     let (Some(source_member), Some(target_member)) = (
         session_link::active_member_for(group, source_uid),
@@ -2477,7 +2477,7 @@ fn commit_sync_baseline(
             .iter_mut()
             .find(|group| group.id == manifest.group_id && group.variant == variant)
         else {
-            return Err("同步关系已不存在，未提交同步结果".to_string());
+            return Err("会话的关联关系已不存在，未提交同步结果".to_string());
         };
         if !group
             .members
@@ -2520,7 +2520,7 @@ fn verify_sync_baseline_committed(
                 .iter()
                 .find(|group| group.id == manifest.group_id)
             else {
-                return Err("同步关系缺失，已停止恢复".to_string());
+                return Err("会话的关联关系缺失，已停止恢复".to_string());
             };
             let Some(pair) = session_link::find_pair_base(
                 group,
