@@ -274,7 +274,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               {`已选 ${selectedCount} / ${groups.length}`}
             </span>
           </div>
-          <div className="divide-y rounded-md border">
+          <div className="max-h-[min(24rem,50vh)] divide-y overflow-y-auto rounded-md border">
             {groups.map((group) => (
               <SessionLinkCard
                 key={group.groupId}

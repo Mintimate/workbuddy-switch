@@ -39,9 +39,6 @@ interface Props {
 const TAB_TRIGGER_CLASS =
   "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
 
-/** 两侧 tab 共用同一视口高度，切换不跳。max-h-full：矮窗口或常驻提示出现时随父级收缩，滚动只发生在这一层。 */
-const TAB_SCROLL_CLASS = "h-[min(26rem,46vh)] max-h-full overflow-y-auto";
-
 /** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
 function tabCount(count: number) {
   return count > 0 ? (
@@ -399,7 +396,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
         </p>
       ) : (
-        <div>
+        <div className="max-h-[min(22rem,45vh)] overflow-y-auto pr-1">
           {buildSessionTree(sessions).map((kind) => {
             const kindOpen = expanded.has(kind.key);
             const kindSel = selectionState(kind.sessions, selected);
@@ -515,7 +512,7 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           </div>
         )}
 
-        {/* min-h-0：矮窗口下压缩本区而不是裁切页脚。tab 区随剩余高度收缩，滚动只发生在 tab 内容区；仅当常驻提示自身超过剩余空间时本层才出现滚动。 */}
+        {/* min-h-0：矮窗口下压缩本区而不是裁切页脚。列表按自身 max-h 滚动；矮窗口或权限大卡时 tab 内容区可滚，避免裁切。仅当常驻提示超过剩余空间时本层滚动。 */}
         <div className="flex min-h-0 flex-col gap-3 overflow-x-hidden overflow-y-auto">
           {/* 常驻提示区：切换错误 / 权限 / 关联检查失败不随 tab 切换隐藏。 */}
           {error && (
@@ -594,35 +591,29 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
               <TabsContent
                 value="links"
                 forceMount
-                className="min-h-0 overflow-hidden data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+                className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
-                <div className={TAB_SCROLL_CLASS}>
-                  <SessionSyncSection
-                    open={open}
-                    account={account}
-                    disabled={busy}
-                    onChange={(state) => {
-                      setSyncSelections(state.selections);
-                      setSyncGroups(state.groups);
-                    }}
-                    onMetaChange={setLinksMeta}
-                  />
-                </div>
+                <SessionSyncSection
+                  open={open}
+                  account={account}
+                  disabled={busy}
+                  onChange={(state) => {
+                    setSyncSelections(state.selections);
+                    setSyncGroups(state.groups);
+                  }}
+                  onMetaChange={setLinksMeta}
+                />
               </TabsContent>
               <TabsContent
                 value="copy"
                 forceMount
-                className="min-h-0 overflow-hidden data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+                className="min-h-0 space-y-2 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
-                <div className={`${TAB_SCROLL_CLASS} space-y-2`}>
-                  {copyTabContent}
-                </div>
+                {copyTabContent}
               </TabsContent>
             </Tabs>
           ) : (
-            <div className="min-h-0 overflow-hidden">
-              <div className={`${TAB_SCROLL_CLASS} space-y-2`}>{copyTabContent}</div>
-            </div>
+            <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
           )}
         </div>
 
