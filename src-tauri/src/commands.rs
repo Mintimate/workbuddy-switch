@@ -9,8 +9,9 @@ use serde_json::{json, Value};
 use tauri::Emitter;
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
-    credits, export_import, limits, oauth, process, rate_limit_events, rate_limit_hook, refresh,
-    rotate, session, switch, token_stats, travel, update, variant::WbVariant,
+    credits, export_import, limits, notifications, oauth, process, rate_limit_events,
+    rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
+    variant::WbVariant,
 };
 
 #[derive(Serialize)]
@@ -306,7 +307,9 @@ pub fn reveal_app_in_finder() -> Result<(), String> {
     Ok(())
 }
 
-/// POST /api/switch —— 切换账号（备份 → 关进程 → 复制会话 → 写认证 → 重启）。
+/// POST /api/switch —— 切换账号（备份 → 关进程 → 恢复/复制/同步会话 → 写认证 → 重启）。
+///
+/// `syncSelections` 与 HTTP 端同形（`[{groupId, previewToken, mode}]`）。
 ///
 /// async + spawn_blocking：切换中关闭/启动 WorkBuddy 会阻塞数十秒，
 /// 若在同步 command（主线程）执行会卡死整个 UI（loading 遮罩无法渲染）。
@@ -317,6 +320,7 @@ pub async fn switch_account(
     restart: Option<bool>,
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
+    sync_selections: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -324,6 +328,9 @@ pub async fn switch_account(
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
+    // 不在命令层做业务判定。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
     let progress: switch::ProgressFn = Box::new(move |message| {
         let _ = app.emit("switch-progress", json!({ "message": message }));
     });
@@ -334,6 +341,7 @@ pub async fn switch_account(
             restart,
             share_sessions,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await
@@ -369,6 +377,32 @@ pub async fn copy_sessions(
         let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
         // 档位取目标账号自身（copy_sessions_for_switch 内部判定）。
         session::copy_sessions_for_switch(&target, &session_ids)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 预览「当前账号 → 目标账号」的关联会话同步项（桌面端 command）。
+///
+/// 只读：返回 `supported / storeStatus / groups`，其中每组的 `defaultChecked` 与
+/// `availableModes` 是前端勾选权限的唯一来源，前端不得自行扩大。
+/// `variant` 缺省取目标账号自身档位：来源 uid 从该档位的登录态读取，目标与来源必须在
+/// 同一档位内比较（与 `copy_sessions` 的档位约定一致）。与 `POST /api/session-links/preview` 同形。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_links_preview(
+    target_account_id: String,
+    variant: Option<String>,
+) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        let variant = variant
+            .as_deref()
+            .map(|raw| WbVariant::parse(Some(raw)))
+            .unwrap_or_else(|| account::variant_of(&target));
+        session::session_links_preview(variant, &target)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -738,4 +772,30 @@ pub fn set_launch_at_login_enabled(_app: tauri::AppHandle, enabled: bool) -> Res
         let _ = enabled;
         Err("当前平台不支持开机自启".to_string())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// 记录一条应用内提示；前端所有 toast 都会同步写一份，失败不影响提示本身。
+#[tauri::command]
+pub async fn record_notification(
+    level: String,
+    title: String,
+    description: Option<String>,
+) -> Result<(), String> {
+    notifications::record(&level, &title, description.as_deref())
+}
+
+/// 读取最近的通知（新的在前，最多 100 条）。
+#[tauri::command]
+pub async fn list_notifications() -> Result<Value, String> {
+    Ok(json!({ "items": notifications::list()? }))
+}
+
+/// 清空通知存档。
+#[tauri::command]
+pub async fn clear_notifications() -> Result<(), String> {
+    notifications::clear()
 }

@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
-    credit_usage, credits, export_import, limits, oauth, process, rate_limit_events,
+    credit_usage, credits, export_import, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
     variant::WbVariant,
 };
@@ -95,6 +95,10 @@ pub fn router() -> Router {
         .route("/api/switch/progress", get(api_switch_progress))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/copy", post(api_copy_sessions))
+        .route(
+            "/api/session-links/preview",
+            post(api_session_links_preview),
+        )
         .route("/api/checkin/status", get(api_checkin_status))
         .route("/api/credits", post(api_credits))
         .route("/api/credits/stats", get(api_credit_statistics))
@@ -123,6 +127,9 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route("/api/notifications", get(api_notifications))
+        .route("/api/notifications/record", post(api_record_notification))
+        .route("/api/notifications/clear", post(api_clear_notifications))
         .route("/api/travel/status", get(api_travel_status))
         .route(
             "/api/travel/config",
@@ -437,6 +444,11 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
                 .collect()
         })
         .unwrap_or_default();
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
 
     {
         let mut running = SWITCH_RUNNING.lock().unwrap();
@@ -458,6 +470,7 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             restart,
             share_sessions,
             &copy_ids,
+            &sync_selections,
         )
     })
     .await;
@@ -514,20 +527,42 @@ async fn api_copy_sessions(Json(body): Json<Value>) -> Response {
     };
     // 档位取目标账号自身（源 uid 也从该档位的登录态读）。
     let variant = account::variant_of(&target);
-    let source_uid = session::current_user_uid(variant);
-    // 能力不满足时返回明确错误而不是空对象。
-    let copied = match session::copy_sessions_for_switch(&target, &session_ids) {
+    // 与桌面端同形：直接返回 core 的复制报告（copied / alreadyLinked / errors / needsRecovery）。
+    let mut report = match session::copy_sessions_for_switch(&target, &session_ids) {
         Ok(report) => report,
         Err(error) => {
             return json_err(error, StatusCode::BAD_REQUEST);
         }
     };
-    json_ok(json!({
-        "sourceUid": source_uid,
-        "targetUid": target.get("uid"),
-        "copied": copied,
-        "variant": variant.as_str(),
-    }))
+    report["variant"] = json!(variant.as_str());
+    json_ok(report)
+}
+
+/// POST /api/session-links/preview —— 预览当前账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `session_links_preview` 同形：直接返回 core 的只读预览（`supported` /
+/// `storeStatus` / `groups`），每组的 `defaultChecked` 与 `availableModes` 是前端的
+/// 勾选权限来源。`variant` 缺省取目标账号自身档位。
+async fn api_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let Some(target) = account::find_account(&target_account_id) else {
+        return json_err("目标账号不存在".to_string(), StatusCode::BAD_REQUEST);
+    };
+    let variant = match body.get("variant").and_then(Value::as_str) {
+        Some(raw) => WbVariant::parse(Some(raw)),
+        None => account::variant_of(&target),
+    };
+    match session::session_links_preview(variant, &target) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -902,5 +937,36 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/// GET /api/notifications —— 最近的应用内提示（新的在前，最多 100 条）。
+async fn api_notifications() -> Response {
+    match notifications::list() {
+        Ok(items) => json_ok(json!({ "items": items })),
+        Err(error) => json_err(error, StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+/// POST /api/notifications/record —— 记录一条提示（前端 toast 同步写一份）。
+async fn api_record_notification(Json(body): Json<Value>) -> Response {
+    let level = body.get("level").and_then(|v| v.as_str()).unwrap_or("info");
+    let title = body.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let description = body.get("description").and_then(|v| v.as_str());
+    match notifications::record(level, title, description) {
+        Ok(()) => json_ok(json!({ "recorded": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/notifications/clear —— 清空通知存档。
+async fn api_clear_notifications() -> Response {
+    match notifications::clear() {
+        Ok(()) => json_ok(json!({ "cleared": true })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }

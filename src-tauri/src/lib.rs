@@ -195,6 +195,7 @@ pub fn run() {
             commands::switch_account,
             commands::list_sessions,
             commands::copy_sessions,
+            commands::session_links_preview,
             commands::open_permission_settings,
             commands::check_auth_permission,
             commands::reveal_app_in_finder,
@@ -228,6 +229,9 @@ pub fn run() {
             commands::relaunch_app,
             commands::get_launch_at_login_enabled,
             commands::set_launch_at_login_enabled,
+            commands::record_notification,
+            commands::list_notifications,
+            commands::clear_notifications,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

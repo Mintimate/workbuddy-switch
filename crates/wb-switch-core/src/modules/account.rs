@@ -52,6 +52,16 @@ pub fn load_accounts() -> Vec<Value> {
     load_accounts_from_path(&accounts_file())
 }
 
+/// 指定工具存储根下的账号库路径（会话操作等注入路径的场景用）。
+pub fn accounts_file_in(store_root: &Path) -> std::path::PathBuf {
+    store_root.join("accounts.json")
+}
+
+/// 读取指定账号库文件；文件缺失或损坏返回空列表。
+pub fn load_accounts_at(path: &Path) -> Vec<Value> {
+    load_accounts_from_path(path)
+}
+
 /// 写回账号库（原子写），保持原 JSON 数组结构。
 pub fn save_accounts(accounts: &[Value]) -> std::io::Result<()> {
     save_accounts_to_path(&accounts_file(), accounts)

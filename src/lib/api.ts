@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountMeta,
   AccountRecord,
+  AppNotification,
   AppStatus,
   AutoRotateConfig,
   CodeBuddyCliInstallResult,
@@ -15,7 +16,6 @@ import type {
   CreditExpiry,
   CreditStatistics,
   TokenStatistics,
-  CopyResult,
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
@@ -27,6 +27,9 @@ import type {
   RotateLog,
   RotateStatus,
   Session,
+  SessionCopyReport,
+  SessionLinksPreview,
+  SessionSyncSelection,
   SwitchResult,
   TravelConfig,
   TravelStatus,
@@ -102,6 +105,7 @@ const ROUTES: Record<string, Route> = {
   switch_account: { method: "POST", path: "/api/switch" },
   list_sessions: { method: "GET", path: "/api/sessions" },
   copy_sessions: { method: "POST", path: "/api/sessions/copy" },
+  session_links_preview: { method: "POST", path: "/api/session-links/preview" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -117,6 +121,9 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  list_notifications: { method: "GET", path: "/api/notifications" },
+  record_notification: { method: "POST", path: "/api/notifications/record" },
+  clear_notifications: { method: "POST", path: "/api/notifications/clear" },
   get_travel_status: { method: "GET", path: "/api/travel/status" },
   get_auto_travel_config: { method: "GET", path: "/api/travel/config" },
   save_auto_travel_config: { method: "POST", path: "/api/travel/config" },
@@ -326,6 +333,7 @@ export function switchAccount(args: {
   restart?: boolean;
   shareSessions?: boolean;
   copySessionIds?: string[];
+  syncSelections?: SessionSyncSelection[];
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
 }
@@ -343,11 +351,27 @@ export function listSessions(variant?: WbVariant): Promise<{
   return call("list_sessions", variantArgs(variant));
 }
 
+/** 把勾选会话复制到指定账号；返回 core 同形的复制报告（copied / alreadyLinked / errors）。 */
 export function copySessions(
   targetAccountId: string,
   sessionIds: string[],
-): Promise<{ sourceUid: string; targetUid: string; copied: CopyResult[] }> {
+): Promise<SessionCopyReport & { variant?: WbVariant }> {
   return call("copy_sessions", { targetAccountId, sessionIds });
+}
+
+/**
+ * 预览「当前账号 → 目标账号」可同步的关联会话（只读）。
+ *
+ * 默认勾选与可选模式都来自后端：前端只按 `defaultChecked` / `availableModes` 渲染，
+ * 不自行扩大权限。`variant` 缺省由后端取目标账号自身档位。
+ */
+export function sessionLinksPreview(
+  targetAccountId: string,
+  variant?: WbVariant,
+): Promise<SessionLinksPreview> {
+  const args: Record<string, unknown> = { targetAccountId };
+  if (variant === "ai") args.variant = variant;
+  return call("session_links_preview", args);
 }
 
 /** 打开系统设置授权面板（桌面端专用；webui 模式由服务进程权限决定，无操作）。 */
@@ -622,4 +646,30 @@ export function asError(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
   return JSON.stringify(e ?? "未知错误");
+}
+
+// ---------------------------------------------------------------------------
+// 通知存档（toast 事后可查）
+// ---------------------------------------------------------------------------
+
+/** 记录一条应用内提示（由 `lib/notify.ts` 统一调用；失败不影响提示本身）。 */
+export function recordNotification(
+  level: AppNotification["level"],
+  title: string,
+  description?: string,
+): Promise<{ recorded: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ recorded: false });
+  return call("record_notification", { level, title, description });
+}
+
+/** 读取最近的通知（新的在前，最多 100 条）。 */
+export function listNotifications(): Promise<{ items: AppNotification[] }> {
+  if (demoModeEnabled) return Promise.resolve({ items: [] });
+  return call("list_notifications");
+}
+
+/** 清空通知存档。 */
+export function clearNotifications(): Promise<{ cleared: boolean }> {
+  if (demoModeEnabled) return Promise.resolve({ cleared: false });
+  return call("clear_notifications");
 }

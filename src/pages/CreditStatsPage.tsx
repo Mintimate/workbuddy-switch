@@ -780,7 +780,7 @@ function AccountTable({
                     <td className="max-w-[240px] px-4 py-3 sm:px-5">
                       <button
                         type="button"
-                        className="min-w-0 max-w-full text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+                        className="min-w-0 max-w-full cursor-pointer text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
                         onClick={() => onSelect(account.accountId)}
                       >
                         <span className="flex min-w-0 items-center gap-2">
@@ -975,7 +975,7 @@ function ModelBreakdown({
                   <button
                     key={option.key}
                     type="button"
-                    className={`rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                    className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
                       range === option.key
                         ? "bg-background font-medium text-foreground shadow-sm"
                         : "text-muted-foreground hover:text-foreground"
@@ -1345,11 +1345,8 @@ function UnselectedRecentEvents({ events }: { events: CreditStatsEvent[] }) {
 let cachedStatistics: CreditStatistics | null = null;
 let statisticsInflight: Promise<CreditStatistics> | null = null;
 
-/** 进入统计页时距上次刷新超过此时长（ms）则自动触发一次刷新统计 */
+/** 进入统计页时距上次采集超过此时长（ms）则自动重新采集一次 */
 const STATISTICS_AUTO_REFRESH_MS = 30 * 60 * 1000;
-
-/** 最近一次「刷新统计」完成的时刻（会话级，0 = 从未刷新过） */
-let lastStatisticsRefreshAt = 0;
 
 function rememberStatistics(next: CreditStatistics): CreditStatistics {
   cachedStatistics = next;
@@ -1401,7 +1398,6 @@ export default function CreditStatsPage() {
           await refreshCredits(ids);
         }
         setStats(await loadCachedStatistics(refresh));
-        if (refresh) lastStatisticsRefreshAt = Date.now();
       } catch (cause) {
         setError(api.asError(cause));
       } finally {
@@ -1412,12 +1408,17 @@ export default function CreditStatsPage() {
   );
 
   useEffect(() => {
-    // 已有会话缓存且距上次刷新超过 30 分钟时，进入页面自动刷新一次统计
-    const autoRefresh =
-      !api.isDemoMode() &&
-      cachedStatistics !== null &&
-      Date.now() - lastStatisticsRefreshAt >= STATISTICS_AUTO_REFRESH_MS;
-    void load(autoRefresh);
+    void (async () => {
+      // 先渲染本地缓存（后端只读磁盘，不用等网络）
+      await load(false);
+      if (api.isDemoMode()) return;
+      // 过期只看后端记录的采集时刻：会话内变量每次启动都归零，判断不出
+      // 「缓存其实是几小时前采的」，所以刚打开应用时不会自动刷新。
+      const collectedAt = cachedStatistics?.officialUsage?.collectedAt ?? 0;
+      if (collectedAt > 0 && Date.now() - collectedAt < STATISTICS_AUTO_REFRESH_MS) return;
+      if (useAccountsStore.getState().accounts.length === 0) return;
+      await load(true);
+    })();
   }, [load]);
 
   const variantByAccountId = useMemo(() => {
