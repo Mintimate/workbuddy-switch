@@ -133,10 +133,10 @@ fn line_digest_of(line: &str) -> String {
 pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedContent, String> {
     let own_session_id = own_session_id.trim();
     if own_session_id.is_empty() {
-        return Err("缺少会话 id，无法归一化正文".to_string());
+        return Err("缺少会话 id，无法读取内容".to_string());
     }
     if text.trim().is_empty() {
-        return Err("正文为空".to_string());
+        return Err("内容为空".to_string());
     }
 
     let mut lines: Vec<&str> = text.split('\n').collect();
@@ -149,10 +149,10 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
     for (index, raw) in lines.iter().enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if line.trim().is_empty() {
-            return Err(format!("第 {} 行为空，正文可能被截断", index + 1));
+            return Err(format!("第 {} 行为空，内容可能不完整", index + 1));
         }
         serde_json::from_str::<serde_json::Value>(line)
-            .map_err(|_| format!("第 {} 行不是合法 JSON，正文可能被截断", index + 1))?;
+            .map_err(|_| format!("第 {} 行的格式无法识别，内容可能不完整", index + 1))?;
         line_digests.push(line_digest_of(
             &line.replace(own_session_id, SESSION_ID_MARKER),
         ));
@@ -170,12 +170,12 @@ pub fn read_content_snapshot(path: &Path, own_session_id: &str) -> ContentState 
     let before = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == ErrorKind::NotFound => return ContentState::Missing,
-        Err(error) => return ContentState::Unavailable(format!("正文无法读取：{error}")),
+        Err(error) => return ContentState::Unavailable(format!("内容无法读取：{error}")),
     };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return ContentState::Missing,
-        Err(error) => return ContentState::Unavailable(format!("正文读取失败：{error}")),
+        Err(error) => return ContentState::Unavailable(format!("内容读取失败：{error}")),
     };
     let after = std::fs::metadata(path);
     let changed = match after {
@@ -183,11 +183,11 @@ pub fn read_content_snapshot(path: &Path, own_session_id: &str) -> ContentState 
         Err(_) => true,
     };
     if changed {
-        return ContentState::Unavailable("正文在读取期间发生变化，未确认完整".to_string());
+        return ContentState::Unavailable("内容在读取过程中发生变化，无法确认完整".to_string());
     }
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
-        Err(_) => return ContentState::Unavailable("正文不是合法 UTF-8".to_string()),
+        Err(_) => return ContentState::Unavailable("内容格式异常，无法读取".to_string()),
     };
     let full_digest = full_digest_of(text.as_bytes());
     match normalize_jsonl(&text, own_session_id) {
@@ -347,9 +347,9 @@ impl BaselineState {
     pub fn unusable_reason(&self) -> Option<String> {
         match self {
             BaselineState::Ready(_) => None,
-            BaselineState::Missing => Some("该成员对没有可验证的共同基线，不提供同步".to_string()),
+            BaselineState::Missing => Some("找不到双方上次一致的内容，暂时无法同步".to_string()),
             BaselineState::Unverifiable(reason) => {
-                Some(format!("共同基线不可验证（{reason}），不提供同步"))
+                Some(format!("上次一致的内容不可用（{reason}），暂时无法同步"))
             }
         }
     }
@@ -512,13 +512,13 @@ pub fn decide_sync(
 ) -> SyncDecision {
     let (source, target) = match (source, target) {
         (ContentState::Ready(source), ContentState::Ready(target)) => (source, target),
-        (ContentState::Missing, _) => return SyncDecision::unknown("来源正文不存在，内容不可验证"),
+        (ContentState::Missing, _) => return SyncDecision::unknown("当前账号的内容不存在，无法确认"),
         (ContentState::Unavailable(reason), _) => {
-            return SyncDecision::unknown(format!("来源正文无法验证：{reason}"))
+            return SyncDecision::unknown(format!("当前账号的内容无法确认：{reason}"))
         }
-        (_, ContentState::Missing) => return SyncDecision::unknown("目标正文不存在，内容不可验证"),
+        (_, ContentState::Missing) => return SyncDecision::unknown("目标账号的内容不存在，无法确认"),
         (_, ContentState::Unavailable(reason)) => {
-            return SyncDecision::unknown(format!("目标正文无法验证：{reason}"))
+            return SyncDecision::unknown(format!("目标账号的内容无法确认：{reason}"))
         }
     };
     let counts = multiset_counts(
@@ -531,7 +531,7 @@ pub fn decide_sync(
             SyncVerdict::Identical,
             counts,
             format!(
-                "双方记录数一致（{} 条），无需写入",
+                "两边的内容一致（各 {} 条），不需要同步",
                 source.normalized.record_count
             ),
         );
@@ -540,7 +540,7 @@ pub fn decide_sync(
         return SyncDecision::unknown(
             baseline
                 .unusable_reason()
-                .unwrap_or_else(|| "缺少可验证的共同基线".to_string()),
+                .unwrap_or_else(|| "找不到上次同步的记录，无法确认两边内容".to_string()),
         );
     };
     if target.normalized.line_digests == record.line_digests
@@ -550,21 +550,21 @@ pub fn decide_sync(
         return SyncDecision::decide(
             SyncVerdict::FastForward,
             counts,
-            format!("目标未偏离共同基线，来源新增 {added} 条记录，可快进"),
+            format!("目标账号没有改动，当前账号新增 {added} 条，可以直接同步"),
         );
     }
     if source.normalized.line_digests == record.line_digests {
         return SyncDecision::decide(
             SyncVerdict::Ahead,
             counts,
-            format!("仅目标有变化（目标独有 {} 条记录），本次不同步", counts.1),
+            format!("只有目标账号新增 {} 条，这次不会同步过去", counts.1),
         );
     }
     SyncDecision::decide(
         SyncVerdict::Diverge,
         counts,
         format!(
-            "双方都有变化或来源已重写（目标独有 {} 条记录）；覆盖会替换目标全文",
+            "两边都有改动（目标账号独有的 {} 条会被替换）；覆盖会替换目标账号的完整内容",
             counts.1
         ),
     )
@@ -827,11 +827,11 @@ fn acquire_link_store_lock(paths: &SessionPaths) -> Result<FileLock, String> {
             Ok(lock) => return Ok(lock),
             Err(LockError::Busy) => std::thread::sleep(STORE_LOCK_RETRY_INTERVAL),
             Err(LockError::Unavailable(reason)) => {
-                return Err(format!("关联存储锁不可用：{reason}"));
+                return Err(format!("同步记录暂时不可用：{reason}"));
             }
         }
     }
-    Err("关联存储正被其它写入占用，请稍后重试".to_string())
+    Err("同步记录正被其它操作占用，请稍后重试".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -889,28 +889,28 @@ pub fn load_store(paths: &SessionPaths) -> StoreState {
         Err(error) if error.kind() == ErrorKind::NotFound => {
             if has_unfinished_traces(paths) {
                 return StoreState::Unavailable(
-                    "关联存储主文件缺失但存在未完成的痕迹（操作记录或基线），已保留现场"
+                    "同步记录主文件缺失但存在未完成的痕迹（操作记录或上次同步的文件），已保留现场"
                         .to_string(),
                 );
             }
             return StoreState::Missing;
         }
-        Err(error) => return StoreState::Unavailable(format!("关联存储不可读：{error}")),
+        Err(error) => return StoreState::Unavailable(format!("同步记录无法读取：{error}")),
     };
     let store = match serde_json::from_str::<LinkStore>(&text) {
         Ok(store) => store,
         Err(_) => {
-            return StoreState::Unavailable("关联存储内容损坏，已保留原文件".to_string());
+            return StoreState::Unavailable("同步记录已损坏，原文件已保留".to_string());
         }
     };
     if store.version != LINK_STORE_VERSION {
         return StoreState::Unavailable(format!(
-            "关联存储版本 {} 不受支持（当前支持 {}），已保留原文件",
+            "同步记录版本 {} 不受支持（当前支持 {}），原文件已保留",
             store.version, LINK_STORE_VERSION
         ));
     }
     if let Err(reason) = validate_store(&store) {
-        return StoreState::Unavailable(format!("关联存储不满足不变量：{reason}"));
+        return StoreState::Unavailable(format!("同步记录内容不一致：{reason}"));
     }
     StoreState::Ready(store)
 }
@@ -925,13 +925,13 @@ pub fn validate_store(store: &LinkStore) -> Result<(), String> {
     let mut identities = std::collections::HashSet::new();
     for group in &store.groups {
         if !group_ids.insert(group.id.as_str()) {
-            return Err(format!("组 id 重复：{}", group.id));
+            return Err(format!("组记录重复：{}", group.id));
         }
         let mut member_ids = std::collections::HashSet::new();
         let mut active_by_uid = std::collections::HashSet::new();
         for member in &group.members {
             if !member_ids.insert(member.member_id.as_str()) {
-                return Err(format!("成员 id 重复：{}", member.member_id));
+                return Err(format!("成员记录重复：{}", member.member_id));
             }
             let identity = (
                 group.variant.as_str(),
@@ -939,20 +939,20 @@ pub fn validate_store(store: &LinkStore) -> Result<(), String> {
                 member.session_id.as_str(),
             );
             if !identities.insert(identity) {
-                return Err(format!("会话 {} 同时属于多个关联组", member.session_id));
+                return Err(format!("会话 {} 同时属于多个同步组", member.session_id));
             }
             if member.state == MemberState::Active && !active_by_uid.insert(member.uid.as_str()) {
-                return Err(format!("账号 {} 在组内出现多个 active 成员", member.uid));
+                return Err(format!("账号 {} 在同一组内出现多条有效成员记录", member.uid));
             }
         }
         let mut pairs = std::collections::HashSet::new();
         for pair in &group.pair_bases {
             if !pairs.insert(pair_key(&pair.member_ids[0], &pair.member_ids[1])) {
-                return Err(format!("成员对重复存储基线：{}", pair.baseline_ref));
+                return Err(format!("同一对成员重复保存了同步记录：{}", pair.baseline_ref));
             }
             for member_id in pair.member_ids.iter() {
                 if !member_ids.contains(member_id.as_str()) {
-                    return Err(format!("基线引用了组内不存在的成员：{member_id}"));
+                    return Err(format!("同步记录引用了不存在的成员：{member_id}"));
                 }
             }
         }
@@ -987,7 +987,7 @@ pub fn with_link_store_write<T>(
         StoreState::Unavailable(reason) => return Err(reason),
     };
     let outcome = mutate(&mut store)?;
-    validate_store(&store).map_err(|reason| format!("拒绝写入不一致的关联存储：{reason}"))?;
+    validate_store(&store).map_err(|reason| format!("拒绝保存不一致的同步记录：{reason}"))?;
     store.version = LINK_STORE_VERSION;
     store.revision = store.revision.saturating_add(1);
     let content = serde_json::to_string_pretty(&store).map_err(|error| error.to_string())?;
@@ -997,9 +997,9 @@ pub fn with_link_store_write<T>(
     // 共享关联表属于业务完成门禁：走会话专用持久化写（design §4）。
     session_backup::durable_write_str(&paths.session_links_file(), &content).map_err(|error| {
         if !existed {
-            format!("关联存储首次写入失败：{error}")
+            format!("同步记录首次保存失败：{error}")
         } else {
-            format!("关联存储写入失败：{error}")
+            format!("同步记录保存失败：{error}")
         }
     })?;
     Ok(outcome)
@@ -1129,7 +1129,7 @@ pub fn save_baseline(
         line_digests: normalized.line_digests.clone(),
     };
     if !record.is_self_consistent() {
-        return Err("基线内容不自洽，拒绝写入".to_string());
+        return Err("上次同步的记录内容不一致，无法保存".to_string());
     }
     std::fs::create_dir_all(paths.baselines_dir()).map_err(|error| error.to_string())?;
     let content = serde_json::to_string_pretty(&record).map_err(|error| error.to_string())?;
@@ -1183,13 +1183,13 @@ pub fn load_pair_baseline(
     };
     if pair.normalization_version != NORMALIZATION_VERSION {
         return BaselineState::Unverifiable(format!(
-            "归一化版本 {} 不受支持（当前 {}）",
+            "记录格式版本 {} 不受支持（当前 {}）",
             pair.normalization_version, NORMALIZATION_VERSION
         ));
     }
     match load_baseline(paths, &pair.baseline_ref) {
         Some(record) => BaselineState::Ready(record),
-        None => BaselineState::Unverifiable("基线文件缺失或内容不自洽".to_string()),
+        None => BaselineState::Unverifiable("上次同步的记录缺失或已损坏".to_string()),
     }
 }
 
@@ -1375,37 +1375,33 @@ pub fn prune_preview_tokens(paths: &SessionPaths, keep: usize) -> usize {
 pub fn verify_preview(preview: &PreviewToken, live: &PreviewBinding) -> Vec<String> {
     let mut stale: Vec<String> = Vec::new();
     if preview.version != PREVIEW_TOKEN_VERSION {
-        stale.push("预览凭据版本不受支持".to_string());
+        stale.push("检查结果已过期，请重新检查".to_string());
     }
     let expected = &preview.binding;
     if expected.variant != live.variant {
-        stale.push("档位已变化".to_string());
+        stale.push("当前应用已变化".to_string());
     }
     if expected.group_id != live.group_id {
-        stale.push("关联组已变化".to_string());
+        stale.push("会话的关联关系已变化".to_string());
     }
     if expected.group_fingerprint != live.group_fingerprint {
-        stale.push("关联组或配对基线已变化".to_string());
+        stale.push("会话的关联关系或同步记录已变化".to_string());
     }
     if expected.source != live.source {
-        stale.push("来源正文或成员已变化".to_string());
+        stale.push("当前账号的内容已变化".to_string());
     }
     if expected.target != live.target {
-        stale.push("目标正文或成员已变化".to_string());
+        stale.push("目标账号的内容已变化".to_string());
     }
     if expected.baseline_ref != live.baseline_ref {
-        stale.push("配对基线已变化".to_string());
+        stale.push("上次同步的记录已变化".to_string());
     } else if expected.baseline_total_digest != live.baseline_total_digest
         || expected.baseline_record_count != live.baseline_record_count
     {
-        stale.push("配对基线内容已变化".to_string());
+        stale.push("上次同步的内容已变化".to_string());
     }
     if expected.verdict != live.verdict {
-        stale.push(format!(
-            "判定结果已变化（{} → {}）",
-            expected.verdict.as_str(),
-            live.verdict.as_str()
-        ));
+        stale.push("检查结果已变化，请重新检查".to_string());
     }
     stale
 }
@@ -2361,7 +2357,7 @@ mod tests {
             assert_eq!(decision.verdict, SyncVerdict::Identical);
             assert!(!decision.default_checked);
             assert!(decision.verdict.available_modes().is_empty());
-            assert!(decision.reason.contains("记录"), "{}", decision.reason);
+            assert!(decision.reason.contains("不需要同步"), "{}", decision.reason);
         }
     }
 
@@ -2385,7 +2381,7 @@ mod tests {
             vec![SyncMode::FastForward]
         );
         assert!(
-            decision.reason.contains("新增 3 条记录"),
+            decision.reason.contains("新增 3 条"),
             "{}",
             decision.reason
         );
@@ -2410,7 +2406,7 @@ mod tests {
             "ahead 不可勾选"
         );
         assert!(
-            decision.reason.contains("仅目标有变化"),
+            decision.reason.contains("只有目标账号新增"),
             "{}",
             decision.reason
         );
@@ -2437,7 +2433,7 @@ mod tests {
         );
         assert!(!decision.verdict.allows(SyncMode::FastForward));
         assert!(
-            decision.reason.contains("替换目标全文"),
+            decision.reason.contains("替换目标账号的完整内容"),
             "{}",
             decision.reason
         );
@@ -2492,7 +2488,7 @@ mod tests {
             ("缺少基线引用", BaselineState::Missing),
             (
                 "基线不可验证",
-                BaselineState::Unverifiable("基线文件缺失或内容不自洽".to_string()),
+                BaselineState::Unverifiable("上次同步的记录缺失或已损坏".to_string()),
             ),
         ] {
             let decision = decide_sync(&content_from(&source), &content_from(&base), &baseline);
@@ -2512,7 +2508,7 @@ mod tests {
         assert!(BaselineState::Missing
             .unusable_reason()
             .unwrap()
-            .contains("没有可验证的共同基线"));
+            .contains("找不到双方上次一致的内容"));
 
         // 正文不可验证：缺失/截断/非法一律不得默认快进。
         let ready = BaselineState::Ready(baseline_from(&base));
@@ -2520,13 +2516,13 @@ mod tests {
             ("来源缺失", ContentState::Missing, content_from(&base)),
             (
                 "来源不可验证",
-                ContentState::Unavailable("第 3 行不是合法 JSON".to_string()),
+                ContentState::Unavailable("第 3 行的格式无法识别".to_string()),
                 content_from(&base),
             ),
             (
                 "目标不可验证",
                 content_from(&source),
-                ContentState::Unavailable("正文读取失败".to_string()),
+                ContentState::Unavailable("内容读取失败".to_string()),
             ),
         ] {
             let decision = decide_sync(&source, &target, &ready);
@@ -2598,7 +2594,7 @@ mod tests {
         }
     }
 
-    /// 文案统一称「记录数」，不得把 JSONL 行数叫「消息数」。
+    /// 文案用「条」，不得把 JSONL 行数叫「消息数」。
     #[test]
     fn verdict_reasons_use_record_wording() {
         let base = records(5, 0);
@@ -2621,12 +2617,12 @@ mod tests {
         for decision in &decisions {
             assert!(
                 !decision.reason.contains("消息"),
-                "不得把记录数叫消息数：{}",
+                "不得把条数叫消息数：{}",
                 decision.reason
             );
         }
         for decision in &decisions[..4] {
-            assert!(decision.reason.contains("记录"), "{}", decision.reason);
+            assert!(decision.reason.contains("条"), "{}", decision.reason);
         }
     }
 
@@ -2790,28 +2786,28 @@ mod tests {
 
         let cases: [(&str, PreviewBinding); 7] = [
             (
-                "档位",
+                "当前应用",
                 PreviewBinding {
                     variant: WbVariant::Ai,
                     ..binding.clone()
                 },
             ),
             (
-                "关联组",
+                "关联关系",
                 PreviewBinding {
                     group_id: "g-2".to_string(),
                     ..binding.clone()
                 },
             ),
             (
-                "关联组或配对基线",
+                "关联关系或同步记录",
                 PreviewBinding {
                     group_fingerprint: "changed".to_string(),
                     ..binding.clone()
                 },
             ),
             (
-                "来源正文",
+                "当前账号",
                 PreviewBinding {
                     source: PreviewMemberBinding {
                         raw_digest: "changed".to_string(),
@@ -2821,7 +2817,7 @@ mod tests {
                 },
             ),
             (
-                "目标正文",
+                "目标账号",
                 PreviewBinding {
                     target: PreviewMemberBinding {
                         session_id: "sess-b2".to_string(),
@@ -2831,14 +2827,14 @@ mod tests {
                 },
             ),
             (
-                "配对基线",
+                "上次同步的记录",
                 PreviewBinding {
                     baseline_ref: Some("base-other".to_string()),
                     ..binding.clone()
                 },
             ),
             (
-                "判定结果",
+                "检查结果",
                 PreviewBinding {
                     verdict: SyncVerdict::Diverge,
                     ..binding.clone()
@@ -2861,7 +2857,7 @@ mod tests {
         };
         let stale = verify_preview(&token, &drifted);
         assert!(
-            stale.iter().any(|reason| reason.contains("基线")),
+            stale.iter().any(|reason| reason.contains("上次同步的内容")),
             "{stale:?}"
         );
 
@@ -2906,7 +2902,7 @@ mod tests {
         );
         match load_pair_baseline(&paths, &group, "m-uid-a-sess-1", "m-uid-b-sess-b") {
             BaselineState::Unverifiable(reason) => {
-                assert!(reason.contains("归一化版本"), "{reason}")
+                assert!(reason.contains("记录格式版本"), "{reason}")
             }
             other => panic!("期望 Unverifiable，实际 {other:?}"),
         }

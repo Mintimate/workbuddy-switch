@@ -4268,7 +4268,7 @@ mod tests {
         assert_eq!(failed["copied"].as_array().unwrap().len(), 0);
         let error = failed["errors"][0]["error"].as_str().unwrap();
         assert!(
-            error.contains("写入失败") || error.contains("关联存储"),
+            error.contains("写入失败") || error.contains("同步记录"),
             "{error}"
         );
         assert_eq!(failed["needsRecovery"], true);
@@ -4324,7 +4324,7 @@ mod tests {
         assert_eq!(report["copied"].as_array().unwrap().len(), 0);
         let error = report["errors"][0]["error"].as_str().unwrap();
         assert!(
-            error.contains("关联存储") && error.contains("已阻止复制"),
+            error.contains("同步记录") && error.contains("已阻止复制"),
             "{error}"
         );
         assert_eq!(env.rows_for("uid-b").len(), 0);
@@ -4624,7 +4624,7 @@ mod tests {
         assert_eq!(report.needs_recovery.len(), 1);
         assert!(!report.needs_recovery[0].retryable);
         assert!(
-            report.needs_recovery[0].reason.contains("关联"),
+            report.needs_recovery[0].reason.contains("同步记录"),
             "{}",
             report.needs_recovery[0].reason
         );
@@ -5007,7 +5007,7 @@ mod tests {
         assert_eq!(group["target"]["sessionId"], target_id);
         assert_eq!(group["target"]["state"], "active");
         assert!(group["previewToken"].as_str().is_some());
-        assert!(group["reason"].as_str().unwrap().contains("记录"));
+        assert!(group["reason"].as_str().unwrap().contains("可以直接同步"));
         // 预览是只读的：目标正文与关联版本都不变。
         assert_eq!(
             std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
@@ -5035,7 +5035,7 @@ mod tests {
         assert_eq!(group["extraB"], 5);
         assert_eq!(group["availableModes"], json!([]));
         assert!(group.get("previewToken").is_none(), "不可勾选的组不发凭据");
-        assert!(group["reason"].as_str().unwrap().contains("仅目标有变化"));
+        assert!(group["reason"].as_str().unwrap().contains("只有目标账号新增"));
 
         // 预览不写目标：正文与关联版本都不变。
         assert_eq!(
@@ -5109,7 +5109,7 @@ mod tests {
         let skipped = &report["skipped"][0];
         assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE);
         assert!(
-            skipped["message"].as_str().unwrap().contains("来源正文"),
+            skipped["message"].as_str().unwrap().contains("当前账号的内容已变化"),
             "{skipped}"
         );
         assert_eq!(
@@ -5132,7 +5132,7 @@ mod tests {
             let skipped = &report["skipped"][0];
             assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
             assert!(
-                skipped["message"].as_str().unwrap().contains("目标正文"),
+                skipped["message"].as_str().unwrap().contains("目标账号的内容已变化"),
                 "{skipped}"
             );
         }
@@ -5204,7 +5204,7 @@ mod tests {
             skipped["message"]
                 .as_str()
                 .unwrap()
-                .contains("关联组或配对基线已变化"),
+                .contains("会话的关联关系或同步记录已变化"),
             "{skipped}"
         );
 
@@ -5239,7 +5239,7 @@ mod tests {
             skipped["message"]
                 .as_str()
                 .unwrap()
-                .contains("配对基线内容已变化"),
+                .contains("上次同步的内容已变化"),
             "{skipped}"
         );
     }
@@ -5507,7 +5507,7 @@ mod tests {
             report["errors"][0]["error"]
                 .as_str()
                 .unwrap()
-                .contains("关联存储"),
+                .contains("同步记录"),
             "{report}"
         );
         assert_eq!(report["needsRecovery"], true, "关系表损坏必须要求恢复");
@@ -6295,7 +6295,7 @@ mod tests {
         assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
         assert_eq!(report["needsRecovery"], true);
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("关联存储"), "{error}");
+        assert!(error.contains("同步记录"), "{error}");
 
         // 正文与数据库都已写入，但组表未提交 → 阶段停在 DbWritten。
         assert_eq!(
