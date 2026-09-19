@@ -1051,7 +1051,7 @@ fn finish_copy_from_body(
             return Err("数据库中找不到源会话记录，未复制".to_string())
         }
         DbCopyOutcome::NoSessionsTable => {
-            return Err("会话数据缺少 数据表，未复制".to_string())
+            return Err("会话数据缺少数据表，未复制".to_string())
         }
         DbCopyOutcome::NoDb => return Err("会话数据不存在，未复制".to_string()),
     }
@@ -1249,7 +1249,7 @@ fn committed_links_present(paths: &SessionPaths, operation: &Operation) -> Resul
             )
             .is_some();
             if !has_source || !has_target {
-                return Err("目标账号的会话缺失，已停止恢复".to_string());
+                return Err("对应的会话缺失，已停止恢复".to_string());
             }
             Ok(())
         }
@@ -1535,7 +1535,7 @@ fn preview_group_item(
             "common": 0,
             "defaultChecked": false,
             "availableModes": [],
-            "reason": "目标账号的会话已失效或已被替换，需手动处理",
+            "reason": "对应的会话已失效或已被替换，需手动处理",
             // 记录数契约与其它不可验证路径一致：source/target 为 0、baseline 为 null
             // （前端的 `recordCount` 类型按此声明，不能发 null）。
             "recordCount": {"source": 0, "target": 0, "baseline": null},
@@ -1558,7 +1558,7 @@ fn preview_group_item(
         session_link::decide_sync(&source_content, &target_content, &baseline)
     } else {
         // 会话行缺失/归属异常：成员实际已失效，与内容不可验证同等对待。
-        SyncDecision::unknown("会话记录缺失或归属异常，目标账号的会话已失效")
+        SyncDecision::unknown("会话记录缺失或归属异常，对应的会话已失效")
     };
     let reason = decision.reason.clone();
     let modes: Vec<&str> = decision
@@ -1700,7 +1700,7 @@ fn plan_sync_selection(
         session_link::active_member_for(group, source_uid),
         session_link::active_member_for(group, target_uid),
     ) else {
-        return skip("目标账号的会话已失效，检查结果已失效".to_string());
+        return skip("对应的会话已失效，检查结果已失效".to_string());
     };
     // 会话行缺失/归属异常：成员实际已失效（与预览的判定口径一致），提前拦下不写。
     if !member_row_owned_by(paths, source_member) || !member_row_owned_by(paths, target_member) {
@@ -2111,7 +2111,7 @@ fn verify_db_snapshot(path: &Path) -> Result<(), String> {
         return Err(format!("备份数据库完整性校验未通过：{check}"));
     }
     if !table_exists(&conn, "sessions") {
-        return Err("备份数据库缺少 数据表，未按备份成功处理".to_string());
+        return Err("备份数据库缺少数据表，未按备份成功处理".to_string());
     }
     Ok(())
 }
@@ -2129,7 +2129,7 @@ fn read_session_row(conn: &Connection, cid: &str) -> Result<Option<SyncBackupRow
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("会话表结构读取失败：{error}"))?;
     if columns.is_empty() {
-        return Err("会话数据缺少 数据表，无法读取目标会话记录".to_string());
+        return Err("会话数据缺少数据表，无法读取目标会话记录".to_string());
     }
     let sql = if columns.iter().any(|column| column == "custom_title") {
         "SELECT id, user_id, title, custom_title, updated_at, deleted_at \
@@ -2190,7 +2190,7 @@ fn verify_sync_backup(dir: &Path, manifest: &SyncBackupManifest) -> Result<(), S
     let conn =
         open_db(&snapshot, true).ok_or_else(|| "数据库快照无法打开，已停止恢复".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return Err("数据库快照缺少 数据表，已停止恢复".to_string());
+        return Err("数据库快照缺少数据表，已停止恢复".to_string());
     }
     Ok(())
 }
@@ -2420,7 +2420,7 @@ fn update_target_session_row(
     let mut conn = open_db(&paths.workbuddy_db(), false)
         .ok_or_else(|| "会话数据无法打开，未同步".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return Err("会话数据缺少 数据表，未同步".to_string());
+        return Err("会话数据缺少数据表，未同步".to_string());
     }
     // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
     session_backup::ensure_full_synchronous(&conn)?;
@@ -2484,7 +2484,7 @@ fn commit_sync_baseline(
             .iter()
             .any(|member| member.member_id == source_member_id)
         {
-            return Err("来源成员已不存在，未提交同步结果".to_string());
+            return Err("当前账号的会话已不存在，未提交同步结果".to_string());
         }
         {
             let Some(target) = group
@@ -2492,7 +2492,7 @@ fn commit_sync_baseline(
                 .iter_mut()
                 .find(|member| member.member_id == target_member_id)
             else {
-                return Err("目标成员已不存在，未提交同步结果".to_string());
+                return Err("目标账号的会话已不存在，未提交同步结果".to_string());
             };
             target.last_synced_at = Some(manifest.last_synced_at);
         }
@@ -5076,7 +5076,7 @@ mod tests {
         assert_eq!(group["availableModes"], json!([]));
         assert!(group.get("previewToken").is_none(), "不可执行的组不发凭据");
         assert!(
-            group["reason"].as_str().unwrap().contains("目标账号的会话已失效"),
+            group["reason"].as_str().unwrap().contains("对应的会话已失效"),
             "{preview}"
         );
         // 契约：不可验证时 source/target 为 0、baseline 为 null（前端类型据此声明）。
