@@ -780,7 +780,7 @@ function AccountTable({
                     <td className="max-w-[240px] px-4 py-3 sm:px-5">
                       <button
                         type="button"
-                        className="min-w-0 max-w-full text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
+                        className="min-w-0 max-w-full cursor-pointer text-left outline-none focus-visible:rounded-md focus-visible:ring-2 focus-visible:ring-ring"
                         onClick={() => onSelect(account.accountId)}
                       >
                         <span className="flex min-w-0 items-center gap-2">
@@ -975,7 +975,7 @@ function ModelBreakdown({
                   <button
                     key={option.key}
                     type="button"
-                    className={`rounded-md px-2.5 py-1.5 text-xs transition-colors ${
+                    className={`cursor-pointer rounded-md px-2.5 py-1.5 text-xs transition-colors ${
                       range === option.key
                         ? "bg-background font-medium text-foreground shadow-sm"
                         : "text-muted-foreground hover:text-foreground"
