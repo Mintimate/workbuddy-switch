@@ -375,7 +375,7 @@ mod tests {
             temporary_files: Vec::new(),
             needs_recovery: vec![RecoveryIssue {
                 operation_id: "op-1".to_string(),
-                reason: "目标正文与操作记录不一致，已停止恢复".to_string(),
+                reason: "目标内容与操作记录不一致，已停止恢复".to_string(),
                 retryable,
             }],
         }
@@ -445,7 +445,7 @@ mod tests {
         // 本次复制/同步新产生一条未完成操作。
         save_operation(
             &paths,
-            &operation("op-new", OpPhase::DbWritten, Some("目标会话行更新失败"), 2),
+            &operation("op-new", OpPhase::DbWritten, Some("目标会话记录更新失败"), 2),
         )
         .unwrap();
         let created = newly_unfinished_writes(
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].operation_id, "op-new");
         let detail = unfinished_writes_detail(&created);
-        assert!(detail.contains("目标会话行更新失败"), "{detail}");
+        assert!(detail.contains("目标会话记录更新失败"), "{detail}");
 
         // 已完成的写入不算未完成；没有失败原因时退化为操作 id。
         save_operation(&paths, &operation("op-done", OpPhase::Completed, None, 3)).unwrap();

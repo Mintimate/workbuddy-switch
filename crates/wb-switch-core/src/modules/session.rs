@@ -173,7 +173,7 @@ pub const SESSION_COPY_UNSUPPORTED: &str = "该档位暂不支持会话复制";
 
 /// WorkBuddy 正在运行时的统一错误文案：会话写入必须在 App 停止写入之后。
 pub const SESSION_COPY_APP_RUNNING: &str =
-    "WorkBuddy 正在运行，已阻止直接写入会话数据；请先退出 WorkBuddy 后重试";
+    "WorkBuddy 正在运行，已阻止修改会话数据；请先退出 WorkBuddy 后重试";
 
 /// 操作日志无法解析时的原因前缀（恢复与复制共用，避免漏报后写出第二个副本）。
 const UNPARSEABLE_OPERATION_REASON: &str = "操作记录无法解析";
@@ -349,7 +349,7 @@ fn find_project_jsonl(paths: &SessionPaths, cid: &str) -> Option<PathBuf> {
 fn backup_workbuddy_db(paths: &SessionPaths, backup_root: &Path) -> Result<PathBuf, String> {
     let db = paths.workbuddy_db();
     if !db.is_file() {
-        return Err("会话数据库不存在，未复制".to_string());
+        return Err("会话数据不存在，未复制".to_string());
     }
     std::fs::create_dir_all(backup_root).map_err(|error| format!("备份目录创建失败：{error}"))?;
     for suffix in ["", "-wal", "-shm"] {
@@ -407,7 +407,7 @@ fn insert_session_copy(
         return Ok(DbCopyOutcome::NoDb);
     }
     let Some(conn) = open_db(&db_path, false) else {
-        return Err("会话数据库无法打开".to_string());
+        return Err("会话数据无法打开".to_string());
     };
     if !table_exists(&conn, "sessions") {
         return Ok(DbCopyOutcome::NoSessionsTable);
@@ -457,7 +457,7 @@ fn insert_session_copy(
     let sql = format!("INSERT INTO sessions ({colnames}) VALUES ({placeholders})");
     let params: Vec<&rusqlite::types::Value> = vals.iter().collect();
     conn.execute(&sql, rusqlite::params_from_iter(params))
-        .map_err(|e| format!("会话行写入失败：{e}"))?;
+        .map_err(|e| format!("会话记录保存失败：{e}"))?;
     Ok(DbCopyOutcome::Inserted)
 }
 
@@ -466,9 +466,9 @@ fn verify_session_row(paths: &SessionPaths, new_cid: &str, target_uid: &str) -> 
     match session_row_owner(paths, new_cid) {
         Some(owner) if owner == target_uid => Ok(()),
         Some(owner) => Err(format!(
-            "会话行归属校验失败：期望 {target_uid}，实际 {owner}"
+            "会话记录归属校验失败：期望 {target_uid}，实际 {owner}"
         )),
-        None => Err("会话行写入后不可见，未报告成功".to_string()),
+        None => Err("会话记录保存后不可见，未按成功处理".to_string()),
     }
 }
 
@@ -795,21 +795,21 @@ fn write_copy_body(
 ) -> Result<PathBuf, String> {
     let dest = source_path.with_file_name(format!("{new_cid}.jsonl"));
     if dest.exists() {
-        return Err("目标正文已存在同名文件，已停止复制".to_string());
+        return Err("目标内容已存在同名文件，已停止复制".to_string());
     }
     let text = snapshot.text.replace(cid, new_cid);
     // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
     session_backup::durable_write_str(&dest, &text)
-        .map_err(|error| format!("副本正文写入失败：{error}"))?;
+        .map_err(|error| format!("复制后的内容保存失败：{error}"))?;
     match session_link::read_content_snapshot(&dest, new_cid) {
         ContentState::Ready(read_back)
             if read_back.normalized.total_digest == snapshot.normalized.total_digest =>
         {
             Ok(dest)
         }
-        ContentState::Ready(_) => Err("副本正文写后校验不一致，未报告成功".to_string()),
-        ContentState::Missing => Err("副本正文写入后不存在，未报告成功".to_string()),
-        ContentState::Unavailable(reason) => Err(format!("副本正文写后无法验证：{reason}")),
+        ContentState::Ready(_) => Err("复制后的内容保存后校验不一致，未按成功处理".to_string()),
+        ContentState::Missing => Err("复制后的内容保存后不存在，未按成功处理".to_string()),
+        ContentState::Unavailable(reason) => Err(format!("复制后的内容保存后无法确认：{reason}")),
     }
 }
 
@@ -840,7 +840,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         context.target_uid,
     ) {
         return Err(format!(
-            "上一次复制尚未完成（操作 {}）：{}，本次未新建副本",
+            "上一次复制尚未完成（操作 {}）：{}，这次不会重复创建",
             operation.operation_id,
             operation
                 .last_error
@@ -850,13 +850,13 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     }
 
     let Some(source_path) = find_project_jsonl(paths, cid) else {
-        return Err("会话正文不存在，未复制".to_string());
+        return Err("会话内容不存在，未复制".to_string());
     };
     let snapshot = match session_link::read_content_snapshot(&source_path, cid) {
         ContentState::Ready(snapshot) => snapshot,
-        ContentState::Missing => return Err("会话正文不存在，未复制".to_string()),
+        ContentState::Missing => return Err("会话内容不存在，未复制".to_string()),
         ContentState::Unavailable(reason) => {
-            return Err(format!("会话正文无法验证（{reason}），未复制"));
+            return Err(format!("会话内容无法验证（{reason}），未复制"));
         }
     };
     let source_owner = session_row_owner(paths, cid);
@@ -1051,9 +1051,9 @@ fn finish_copy_from_body(
             return Err("数据库中找不到源会话记录，未复制".to_string())
         }
         DbCopyOutcome::NoSessionsTable => {
-            return Err("会话数据库缺少 sessions 表，未复制".to_string())
+            return Err("会话数据缺少 数据表，未复制".to_string())
         }
-        DbCopyOutcome::NoDb => return Err("会话数据库不存在，未复制".to_string()),
+        DbCopyOutcome::NoDb => return Err("会话数据不存在，未复制".to_string()),
     }
     verify_session_row(paths, &operation.target.session_id, &operation.target.uid)?;
     advance_operation(paths, operation, OpPhase::DbWritten)?;
@@ -1234,7 +1234,7 @@ fn committed_links_present(paths: &SessionPaths, operation: &Operation) -> Resul
                 .iter()
                 .find(|group| group.id == operation.group_id)
             else {
-                return Err("关联组缺失，已停止恢复".to_string());
+                return Err("同步关系缺失，已停止恢复".to_string());
             };
             let has_source = session_link::find_member(
                 group,
@@ -1249,11 +1249,11 @@ fn committed_links_present(paths: &SessionPaths, operation: &Operation) -> Resul
             )
             .is_some();
             if !has_source || !has_target {
-                return Err("关联成员缺失，已停止恢复".to_string());
+                return Err("目标账号的会话缺失，已停止恢复".to_string());
             }
             Ok(())
         }
-        StoreState::Missing => Err("关联存储主文件缺失，已停止恢复".to_string()),
+        StoreState::Missing => Err("同步记录主文件缺失，已停止恢复".to_string()),
         StoreState::Unavailable(reason) => Err(reason),
     }
 }
@@ -1535,7 +1535,7 @@ fn preview_group_item(
             "common": 0,
             "defaultChecked": false,
             "availableModes": [],
-            "reason": "关联成员已失效或已被替换，需手动处理",
+            "reason": "目标账号的会话已失效或已被替换，需手动处理",
             // 记录数契约与其它不可验证路径一致：source/target 为 0、baseline 为 null
             // （前端的 `recordCount` 类型按此声明，不能发 null）。
             "recordCount": {"source": 0, "target": 0, "baseline": null},
@@ -1558,7 +1558,7 @@ fn preview_group_item(
         session_link::decide_sync(&source_content, &target_content, &baseline)
     } else {
         // 会话行缺失/归属异常：成员实际已失效，与内容不可验证同等对待。
-        SyncDecision::unknown("会话行缺失或归属异常，关联成员已失效")
+        SyncDecision::unknown("会话记录缺失或归属异常，目标账号的会话已失效")
     };
     let reason = decision.reason.clone();
     let modes: Vec<&str> = decision
@@ -1604,7 +1604,7 @@ fn preview_group_item(
                 // 绑定存不下来就不能让用户勾选：不给出可执行动作，并说明原因。
                 item["availableModes"] = json!([]);
                 item["defaultChecked"] = json!(false);
-                item["reason"] = json!(format!("{reason}（预览凭据无法保存：{error}）"));
+                item["reason"] = json!(format!("{reason}（检查结果无法保存：{error}）"));
             }
         }
     }
@@ -1668,13 +1668,13 @@ fn plan_sync_selection(
     // 凭据必须是我们服务端保存过的：伪造的 id 读不到，直接拒绝。
     let Some(token) = session_link::load_preview_token(paths, &selection.preview_token) else {
         return SyncItemOutcome::Rejected {
-            message: "预览凭据不存在或已失效，请重新预览后再操作".to_string(),
+            message: "检查结果不存在或已失效，请重新检查后再操作".to_string(),
         };
     };
     let binding = &token.binding;
     if binding.variant != variant || binding.group_id != selection.group_id {
         return SyncItemOutcome::Rejected {
-            message: "预览凭据与所选关联组不匹配，已拒绝".to_string(),
+            message: "检查结果与所选同步关系不匹配，已拒绝".to_string(),
         };
     }
     let skip = |message: String| SyncItemOutcome::Skipped {
@@ -1684,27 +1684,27 @@ fn plan_sync_selection(
     };
     // 来源身份取登录态、目标身份取入参：与预览不一致说明账号已经变了。
     if binding.source.uid != source_uid || binding.target.uid != target_uid {
-        return skip("账号已变化，预览已失效".to_string());
+        return skip("账号已变化，检查结果已失效".to_string());
     }
     let Some(store) = store else {
-        return skip("关联存储不存在或不可用，预览已失效".to_string());
+        return skip("同步记录不存在或不可用，检查结果已失效".to_string());
     };
     let Some(group) = store
         .groups
         .iter()
         .find(|group| group.id == selection.group_id && group.variant == variant)
     else {
-        return skip("关联组已不存在，预览已失效".to_string());
+        return skip("同步关系已不存在，检查结果已失效".to_string());
     };
     let (Some(source_member), Some(target_member)) = (
         session_link::active_member_for(group, source_uid),
         session_link::active_member_for(group, target_uid),
     ) else {
-        return skip("关联成员已失效，预览已失效".to_string());
+        return skip("目标账号的会话已失效，检查结果已失效".to_string());
     };
     // 会话行缺失/归属异常：成员实际已失效（与预览的判定口径一致），提前拦下不写。
     if !member_row_owned_by(paths, source_member) || !member_row_owned_by(paths, target_member) {
-        return skip("会话行缺失或归属异常，预览已失效".to_string());
+        return skip("会话记录缺失或归属异常，检查结果已失效".to_string());
     }
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
     let source_content = member_content_state(paths, &source_member.session_id);
@@ -1727,7 +1727,7 @@ fn plan_sync_selection(
     );
     let mismatches = session_link::verify_preview(&token, &live);
     if !mismatches.is_empty() {
-        return skip(format!("预览已失效：{}", mismatches.join("；")));
+        return skip(format!("检查结果已失效：{}", mismatches.join("；")));
     }
     // 判定已按当前内容重算：mode 必须仍然成立，unknown 不得被覆盖绕过。
     if !decision.verdict.allows(selection.mode) {
@@ -1743,7 +1743,7 @@ fn plan_sync_selection(
     let (ContentState::Ready(source_snapshot), ContentState::Ready(target_snapshot)) =
         (&source_content, &target_content)
     else {
-        return skip("双方正文不可验证，预览已失效".to_string());
+        return skip("双方内容不可验证，检查结果已失效".to_string());
     };
     // 目标正文 = 来源正文，只把本副本 sessionId 换成目标 sessionId（保留目标 SID）。
     let incoming_text = source_snapshot
@@ -1753,7 +1753,7 @@ fn plan_sync_selection(
         Ok(normalized) => normalized,
         Err(reason) => {
             return SyncItemOutcome::Rejected {
-                message: format!("目标正文无法按来源内容生成（{reason}），已拒绝"),
+                message: format!("目标内容无法按来源内容生成（{reason}），已拒绝"),
             }
         }
     };
@@ -2049,16 +2049,16 @@ fn backup_file_with_digest(
 ) -> Result<(), String> {
     let bytes = std::fs::read(source).map_err(|error| format!("备份读取失败：{error}"))?;
     if full_digest_of(&bytes) != expected_raw_digest {
-        return Err("备份内容与读取时不一致（正文在读取后被改动），已停止写入".to_string());
+        return Err("备份内容与读取时不一致（内容在读取后被改动），已停止保存".to_string());
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|error| format!("备份目录创建失败：{error}"))?;
     }
     session_backup::durable_write(dest, &bytes)
-        .map_err(|error| format!("备份写入失败：{error}"))?;
+        .map_err(|error| format!("备份保存失败：{error}"))?;
     let read_back = std::fs::read(dest).map_err(|error| format!("备份回读失败：{error}"))?;
     if full_digest_of(&read_back) != expected_raw_digest {
-        return Err("备份写后核验不一致，未报告备份成功".to_string());
+        return Err("备份保存后核验不一致，未按备份成功处理".to_string());
     }
     Ok(())
 }
@@ -2069,14 +2069,14 @@ fn backup_file_with_digest(
 /// 数据库文件（同时自动带上未 checkpoint 的 WAL 内容），并做写后核验。
 fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
     if !source.is_file() {
-        return Err("会话数据库不存在，无法备份".to_string());
+        return Err("会话数据不存在，无法备份".to_string());
     }
     if dest.exists() {
         return Err("备份数据库已存在同名文件，未覆盖".to_string());
     }
     // 源连接用读写打开：WAL 库在缺 -shm 时无法只读打开，而备份是写入门禁，
     // 不能因此失败。App 已关闭且持有档位锁，读写打开不会改动会话内容。
-    let src = open_db(source, false).ok_or_else(|| "会话数据库无法打开，未同步".to_string())?;
+    let src = open_db(source, false).ok_or_else(|| "会话数据无法打开，未同步".to_string())?;
     {
         let mut dst =
             Connection::open(dest).map_err(|error| format!("备份数据库创建失败：{error}"))?;
@@ -2103,7 +2103,7 @@ fn snapshot_workbuddy_db(source: &Path, dest: &Path) -> Result<(), String> {
 /// 快照核验：可回读、完整性检查通过、会话表存在。
 fn verify_db_snapshot(path: &Path) -> Result<(), String> {
     let conn =
-        open_db(path, true).ok_or_else(|| "备份数据库无法回读，未报告备份成功".to_string())?;
+        open_db(path, true).ok_or_else(|| "备份数据库无法回读，未按备份成功处理".to_string())?;
     let check: String = conn
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
         .map_err(|error| format!("备份数据库完整性校验失败：{error}"))?;
@@ -2111,7 +2111,7 @@ fn verify_db_snapshot(path: &Path) -> Result<(), String> {
         return Err(format!("备份数据库完整性校验未通过：{check}"));
     }
     if !table_exists(&conn, "sessions") {
-        return Err("备份数据库缺少 sessions 表，未报告备份成功".to_string());
+        return Err("备份数据库缺少 数据表，未按备份成功处理".to_string());
     }
     Ok(())
 }
@@ -2129,7 +2129,7 @@ fn read_session_row(conn: &Connection, cid: &str) -> Result<Option<SyncBackupRow
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("会话表结构读取失败：{error}"))?;
     if columns.is_empty() {
-        return Err("会话数据库缺少 sessions 表，无法读取目标会话行".to_string());
+        return Err("会话数据缺少 数据表，无法读取目标会话记录".to_string());
     }
     let sql = if columns.iter().any(|column| column == "custom_title") {
         "SELECT id, user_id, title, custom_title, updated_at, deleted_at \
@@ -2148,13 +2148,13 @@ fn read_session_row(conn: &Connection, cid: &str) -> Result<Option<SyncBackupRow
         })
     })
     .optional()
-    .map_err(|error| format!("目标会话行读取失败：{error}"))
+    .map_err(|error| format!("目标会话记录读取失败：{error}"))
 }
 
 /// 会话行的覆盖前快照；只有成功查询且没有命中时才返回 None。
 fn session_row_snapshot(paths: &SessionPaths, cid: &str) -> Result<Option<SyncBackupRow>, String> {
     let conn = open_db(&paths.workbuddy_db(), true)
-        .ok_or_else(|| "会话数据库无法打开，无法读取目标会话行".to_string())?;
+        .ok_or_else(|| "会话数据无法打开，无法读取目标会话记录".to_string())?;
     read_session_row(&conn, cid)
 }
 
@@ -2168,7 +2168,7 @@ fn load_sync_manifest(dir: &Path) -> Option<SyncBackupManifest> {
 /// 备份完整性核验：覆盖前正文与待写入正文都能按清单摘要读回，数据库快照可回读。
 fn verify_sync_backup(dir: &Path, manifest: &SyncBackupManifest) -> Result<(), String> {
     let Some(target_body_file) = manifest.target.body_file.as_deref() else {
-        return Err("备份清单缺少目标正文备份位置".to_string());
+        return Err("备份清单缺少目标内容备份位置".to_string());
     };
     for (relative, digest) in [
         (target_body_file, manifest.target.body_raw_digest.as_str()),
@@ -2190,7 +2190,7 @@ fn verify_sync_backup(dir: &Path, manifest: &SyncBackupManifest) -> Result<(), S
     let conn =
         open_db(&snapshot, true).ok_or_else(|| "数据库快照无法打开，已停止恢复".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return Err("数据库快照缺少 sessions 表，已停止恢复".to_string());
+        return Err("数据库快照缺少 数据表，已停止恢复".to_string());
     }
     Ok(())
 }
@@ -2208,7 +2208,7 @@ fn validated_target_body_path(
         .file_name()
         .is_some_and(|name| name.to_string_lossy() == expected_name);
     if !path.starts_with(paths.projects_dir()) || !name_matches {
-        return Err("备份清单记录的目标正文路径不合法，已停止写入".to_string());
+        return Err("备份清单记录的目标内容路径不合法，已停止保存".to_string());
     }
     Ok(path)
 }
@@ -2246,14 +2246,14 @@ fn create_sync_backup(
     let incoming_rel = format!("bodies/incoming-{}.jsonl", plan.target_member.session_id);
     let incoming_raw = plan.incoming_text.as_bytes();
     std::fs::write(dir.join(&incoming_rel), incoming_raw)
-        .map_err(|error| format!("待写入正文备份失败：{error}"))?;
+        .map_err(|error| format!("待保存内容备份失败：{error}"))?;
     let incoming_raw_digest = full_digest_of(incoming_raw);
     if full_digest_of(
         &std::fs::read(dir.join(&incoming_rel))
-            .map_err(|error| format!("待写入正文回读失败：{error}"))?,
+            .map_err(|error| format!("待保存内容回读失败：{error}"))?,
     ) != incoming_raw_digest
     {
-        return Err("待写入正文备份写后核验不一致，未报告备份成功".to_string());
+        return Err("待保存内容备份保存后核验不一致，未按备份成功处理".to_string());
     }
     // 3) 数据库一致性快照。
     let db_rel = "workbuddy.db".to_string();
@@ -2302,13 +2302,13 @@ fn create_sync_backup(
         old_baseline_ref: plan.old_baseline_ref.clone(),
         last_synced_at,
         restore_steps: vec![
-            "目标正文：从 bodies/ 下 original-*.jsonl 写回目标路径（先校验当前正文是否为本次写入的内容）"
+            "目标内容：从 bodies/ 下 original-*.jsonl 写回目标路径（先校验当前内容是否为本次保存的内容）"
                 .to_string(),
-            "目标会话行：把 sessions.updated_at 还原为清单 db.targetRow.updatedAt（先校验归属与当前值）"
+            "目标会话记录：把 sessions.updated_at 还原为清单 db.targetRow.updatedAt（先校验归属与当前值）"
                 .to_string(),
-            "数据库：workbuddy.db 为本次写入前的一致性快照，可用 SQLite 打开核对；不要整库覆盖当前库"
+            "数据库：workbuddy.db 为本次保存前的一致性快照，可用 SQLite 打开核对；不要整库覆盖当前库"
                 .to_string(),
-            "配对基线：把 manifest.newBaselineRef 对应的成员对基线还原为 oldBaselineRef（若未改动则无需处理）"
+            "同步记录：把 manifest.newBaselineRef 对应的成员间同步记录还原为 oldBaselineRef（若未改动则无需处理）"
                 .to_string(),
         ],
     };
@@ -2316,10 +2316,10 @@ fn create_sync_backup(
     let content = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
     let manifest_file = sync_manifest_file(&dir);
     session_backup::durable_write_str(&manifest_file, &content)
-        .map_err(|error| format!("同步备份清单写入失败：{error}"))?;
+        .map_err(|error| format!("同步备份清单保存失败：{error}"))?;
     match load_sync_manifest(&dir) {
         Some(read_back) if read_back == manifest => {}
-        _ => return Err("同步备份清单写后核验不一致，未报告备份成功".to_string()),
+        _ => return Err("同步备份清单保存后核验不一致，未按备份成功处理".to_string()),
     }
     verify_sync_backup(&dir, &manifest)?;
     Ok(SyncBackup {
@@ -2355,12 +2355,12 @@ fn classify_sync_body(
             SyncBodyState::PreSync
         }
         ContentState::Ready(_) => SyncBodyState::Unknown(
-            "目标正文与本次写入及覆盖前版本都不一致（可能被其它程序改动），已停止写入，不覆盖未知内容"
+            "目标内容与本次保存及覆盖前版本都不一致（可能被其它程序改动），已停止保存，不覆盖未知内容"
                 .to_string(),
         ),
         ContentState::Missing => SyncBodyState::Gone,
         ContentState::Unavailable(reason) => SyncBodyState::Unknown(format!(
-            "目标正文无法验证（{reason}），已停止写入"
+            "目标内容无法验证（{reason}），已停止保存"
         )),
     }
 }
@@ -2374,14 +2374,14 @@ fn write_sync_body(
 ) -> Result<NormalizedContent, String> {
     // 正文属于业务完成门禁：会话专用持久化写（sync_all + 父目录持久化）。
     session_backup::durable_write_str(target_body_path, text)
-        .map_err(|error| format!("同步正文写入失败：{error}"))?;
+        .map_err(|error| format!("同步内容保存失败：{error}"))?;
     match session_link::read_content_snapshot(target_body_path, target_session_id) {
         ContentState::Ready(read_back) if read_back.normalized.total_digest == expected_digest => {
             Ok(read_back.normalized)
         }
-        ContentState::Ready(_) => Err("同步正文写后校验不一致，未报告成功".to_string()),
-        ContentState::Missing => Err("同步正文写入后不存在，未报告成功".to_string()),
-        ContentState::Unavailable(reason) => Err(format!("同步正文写后无法验证：{reason}")),
+        ContentState::Ready(_) => Err("同步内容保存后校验不一致，未按成功处理".to_string()),
+        ContentState::Missing => Err("同步内容保存后不存在，未按成功处理".to_string()),
+        ContentState::Unavailable(reason) => Err(format!("同步内容保存后无法确认：{reason}")),
     }
 }
 
@@ -2394,12 +2394,12 @@ fn apply_sync_body(
 ) -> Result<NormalizedContent, String> {
     let target_body_path = validated_target_body_path(paths, manifest)?;
     let bytes = std::fs::read(backup_dir.join(&manifest.incoming.body_file))
-        .map_err(|error| format!("待写入正文备份读取失败：{error}"))?;
+        .map_err(|error| format!("待保存内容备份读取失败：{error}"))?;
     if full_digest_of(&bytes) != manifest.incoming.body_raw_digest {
-        return Err("待写入正文备份与清单不一致，已停止写入".to_string());
+        return Err("待保存内容备份与清单不一致，已停止保存".to_string());
     }
     let text =
-        String::from_utf8(bytes).map_err(|_| "待写入正文不是合法 UTF-8，未写入".to_string())?;
+        String::from_utf8(bytes).map_err(|_| "待保存内容不是合法 UTF-8，未保存".to_string())?;
     write_sync_body(
         &target_body_path,
         &manifest.target.session_id,
@@ -2418,45 +2418,45 @@ fn update_target_session_row(
     before: Option<&SyncBackupRow>,
 ) -> Result<(), String> {
     let mut conn = open_db(&paths.workbuddy_db(), false)
-        .ok_or_else(|| "会话数据库无法打开，未同步".to_string())?;
+        .ok_or_else(|| "会话数据无法打开，未同步".to_string())?;
     if !table_exists(&conn, "sessions") {
-        return Err("会话数据库缺少 sessions 表，未同步".to_string());
+        return Err("会话数据缺少 数据表，未同步".to_string());
     }
     // 写事务的提交必须可靠持久：在本次实际写连接上确认 synchronous ≥ FULL。
     session_backup::ensure_full_synchronous(&conn)?;
     let tx = conn
         .transaction()
-        .map_err(|error| format!("会话数据库事务开启失败：{error}"))?;
+        .map_err(|error| format!("会话数据事务开启失败：{error}"))?;
     let affected = tx
         .execute(
             "UPDATE sessions SET updated_at = ?1 \
              WHERE id = ?2 AND user_id = ?3 AND deleted_at IS NULL",
             rusqlite::params![new_updated_at, target.session_id, target.uid],
         )
-        .map_err(|error| format!("目标会话行更新失败：{error}"))?;
+        .map_err(|error| format!("目标会话记录更新失败：{error}"))?;
     if affected != 1 {
         return Err(
-            "目标会话行归属校验失败：会话不存在、不属于目标账号或已被删除，未报告成功".to_string(),
+            "目标会话记录归属校验失败：会话不存在、不属于目标账号或已被删除，未按成功处理".to_string(),
         );
     }
     match (read_session_row(&tx, &target.session_id)?, before) {
-        (None, _) => return Err("目标会话行写入后不可见，未报告成功".to_string()),
+        (None, _) => return Err("目标会话记录保存后不可见，未按成功处理".to_string()),
         (Some(after), Some(before)) => {
             if after.session_id != before.session_id
                 || after.user_id != before.user_id
                 || after.title != before.title
                 || after.custom_title != before.custom_title
             {
-                return Err("目标会话行的归属或标题在写入期间发生变化，已回滚本次更新".to_string());
+                return Err("目标会话记录的归属或标题在保存期间发生变化，已回滚本次更新".to_string());
             }
             if after.updated_at != Some(new_updated_at) {
-                return Err("目标会话行更新时间未按本次写入生效，未报告成功".to_string());
+                return Err("目标会话记录更新时间未按本次保存生效，未按成功处理".to_string());
             }
         }
         (Some(_), None) => {}
     }
     tx.commit()
-        .map_err(|error| format!("会话数据库提交失败：{error}"))?;
+        .map_err(|error| format!("会话数据提交失败：{error}"))?;
     Ok(())
 }
 
@@ -2477,7 +2477,7 @@ fn commit_sync_baseline(
             .iter_mut()
             .find(|group| group.id == manifest.group_id && group.variant == variant)
         else {
-            return Err("关联组已不存在，未提交同步结果".to_string());
+            return Err("同步关系已不存在，未提交同步结果".to_string());
         };
         if !group
             .members
@@ -2520,24 +2520,24 @@ fn verify_sync_baseline_committed(
                 .iter()
                 .find(|group| group.id == manifest.group_id)
             else {
-                return Err("关联组缺失，已停止恢复".to_string());
+                return Err("同步关系缺失，已停止恢复".to_string());
             };
             let Some(pair) = session_link::find_pair_base(
                 group,
                 &manifest.source.member_id,
                 &manifest.target.member_id,
             ) else {
-                return Err("配对基线缺失，已停止恢复".to_string());
+                return Err("同步记录缺失，已停止恢复".to_string());
             };
             if pair.baseline_ref != manifest.new_baseline_ref {
-                return Err("配对基线与本次写入不一致，已停止恢复".to_string());
+                return Err("同步记录与本次保存不一致，已停止恢复".to_string());
             }
             if session_link::load_baseline(paths, &manifest.new_baseline_ref).is_none() {
-                return Err("基线文件缺失或内容不自洽，已停止恢复".to_string());
+                return Err("同步记录缺失或内容不一致，已停止恢复".to_string());
             }
             Ok(())
         }
-        StoreState::Missing => Err("关联存储主文件缺失，已停止恢复".to_string()),
+        StoreState::Missing => Err("同步记录主文件缺失，已停止恢复".to_string()),
         StoreState::Unavailable(reason) => Err(reason),
     }
 }
@@ -2549,18 +2549,18 @@ fn restore_sync_backup_body(
     manifest: &SyncBackupManifest,
 ) -> Result<(), String> {
     let Some(relative) = manifest.target.body_file.as_deref() else {
-        return Err("备份清单缺少目标正文备份位置".to_string());
+        return Err("备份清单缺少目标内容备份位置".to_string());
     };
     let bytes =
-        std::fs::read(dir.join(relative)).map_err(|error| format!("备份正文读取失败：{error}"))?;
+        std::fs::read(dir.join(relative)).map_err(|error| format!("备份内容读取失败：{error}"))?;
     if full_digest_of(&bytes) != manifest.target.body_raw_digest {
-        return Err("备份正文摘要不一致，已停止回滚".to_string());
+        return Err("备份内容摘要不一致，已停止回滚".to_string());
     }
     let text =
-        String::from_utf8(bytes).map_err(|_| "备份正文不是合法 UTF-8，未回滚".to_string())?;
+        String::from_utf8(bytes).map_err(|_| "备份内容不是合法 UTF-8，未回滚".to_string())?;
     let target_body_path = validated_target_body_path(paths, manifest)?;
     session_backup::durable_write_str(&target_body_path, &text)
-        .map_err(|error| format!("目标正文回滚失败：{error}"))
+        .map_err(|error| format!("目标内容回滚失败：{error}"))
 }
 
 /// 阶段化写入：正文 → 数据库 → 组表 → completed；每步先落阶段再推进，可恢复。
@@ -2589,11 +2589,11 @@ fn run_sync_phases(
                     content.normalized
                 }
                 ContentState::Ready(_) => {
-                    return Err("目标正文与本次写入不一致，已停止恢复".to_string())
+                    return Err("目标内容与本次保存不一致，已停止恢复".to_string())
                 }
-                ContentState::Missing => return Err("目标正文丢失，已停止恢复".to_string()),
+                ContentState::Missing => return Err("目标内容丢失，已停止恢复".to_string()),
                 ContentState::Unavailable(reason) => {
-                    return Err(format!("目标正文无法验证（{reason}），已停止恢复"))
+                    return Err(format!("目标内容无法验证（{reason}），已停止恢复"))
                 }
             }
         }
@@ -2647,7 +2647,7 @@ fn execute_sync_item(
             && operation.target.session_id == plan.target_member.session_id
     }) {
         return Err(format!(
-            "上一次会话写入尚未完成（操作 {}）：{}，本次未写入",
+            "上一次会话保存尚未完成（操作 {}）：{}，本次未保存",
             operation.operation_id,
             operation
                 .last_error
@@ -2656,7 +2656,7 @@ fn execute_sync_item(
         ));
     }
     let target_body_path = find_project_jsonl(paths, &plan.target_member.session_id)
-        .ok_or_else(|| "目标正文不存在，未同步".to_string())?;
+        .ok_or_else(|| "目标内容不存在，未同步".to_string())?;
     let new_updated_at = now_ms();
     let last_synced_at = now_ms();
     let new_baseline_ref = uuid::Uuid::new_v4().to_string();
@@ -2791,7 +2791,7 @@ pub fn recover_pending_session_operations_at(
         report.needs_recovery.push(RecoveryIssue {
             operation_id: "operation-scan".to_string(),
             reason: format!(
-                "{UNPARSEABLE_OPERATION_REASON}（操作日志目录不可读或枚举失败），已停止恢复以免产生重复副本"
+                "{UNPARSEABLE_OPERATION_REASON}（操作记录无法读取），已停止恢复以免产生重复复制"
             ),
             retryable: false,
         });
@@ -2800,7 +2800,7 @@ pub fn recover_pending_session_operations_at(
         report.needs_recovery.push(RecoveryIssue {
             operation_id: problem.clone(),
             reason: format!(
-                "{UNPARSEABLE_OPERATION_REASON}（{problem}），已停止恢复以免产生重复副本"
+                "{UNPARSEABLE_OPERATION_REASON}（{problem}），已停止恢复以免产生重复复制"
             ),
             retryable: false,
         });
@@ -2870,16 +2870,16 @@ fn check_target_body(paths: &SessionPaths, operation: &Operation) -> BodyCheck {
                 BodyCheck::Verified(content.normalized)
             } else {
                 BodyCheck::NeedsRecovery(
-                    "目标正文与操作记录不一致（可能被其它程序改动），已停止恢复".to_string(),
+                    "目标内容与操作记录不一致（可能被其它程序改动），已停止恢复".to_string(),
                 )
             }
         }
         Some(ContentState::Unavailable(reason)) => {
-            BodyCheck::NeedsRecovery(format!("目标正文不可验证（{reason}），已停止恢复"))
+            BodyCheck::NeedsRecovery(format!("目标内容不可验证（{reason}），已停止恢复"))
         }
         Some(ContentState::Missing) | None => {
             if operation.phase >= OpPhase::BodyWritten {
-                BodyCheck::NeedsRecovery("目标正文丢失，已停止恢复".to_string())
+                BodyCheck::NeedsRecovery("目标内容丢失，已停止恢复".to_string())
             } else {
                 BodyCheck::Absent
             }
@@ -2955,7 +2955,7 @@ fn recover_sync_operation(
         // 后续无关修改（用户/官方 App 追加过内容）或内容不可验证：停止恢复，不覆盖。
         SyncBodyState::Unknown(reason) => return needs(reason.clone(), false),
         SyncBodyState::Gone if operation.phase >= OpPhase::BodyWritten => {
-            return needs("目标正文丢失，已停止恢复".to_string(), false);
+            return needs("目标内容丢失，已停止恢复".to_string(), false);
         }
         _ => {}
     }
@@ -2976,7 +2976,7 @@ fn recover_sync_operation(
         if matches!(body, SyncBodyState::Ours) {
             if let Err(error) = restore_sync_backup_body(paths, &backup_dir, &manifest) {
                 return needs(
-                    format!("目标会话行已不存在且正文回滚失败（{error}），请手动处理"),
+                    format!("目标会话记录已不存在且内容回滚失败（{error}），请手动处理"),
                     false,
                 );
             }
@@ -2984,16 +2984,16 @@ fn recover_sync_operation(
         abandon_operation_with(
             paths,
             &mut operation,
-            "目标会话行已不存在（或已删除），本次同步已从备份回滚，未写入会话内容",
+            "目标会话记录已不存在（或已删除），本次同步已从备份回滚，未保存会话内容",
         );
         return RecoverOutcome::Abandoned(operation_id);
     }
     let Some(row) = row else {
         // row_absent 已经把 None 分支处理掉，这里只是形式上的兜底。
-        return needs("目标会话行无法读取，已停止恢复".to_string(), false);
+        return needs("目标会话记录无法读取，已停止恢复".to_string(), false);
     };
     if row.user_id != operation.target.uid {
-        return needs("目标会话行归属异常，已停止恢复".to_string(), false);
+        return needs("目标会话记录归属异常，已停止恢复".to_string(), false);
     }
     let before = manifest
         .db
@@ -3005,7 +3005,7 @@ fn recover_sync_operation(
     if !applied && !untouched && before.is_some() {
         // 既不是本次写入的值、也不是覆盖前的值：被其它程序改动过，不覆盖。
         return needs(
-            "目标会话行的更新时间与本次写入及覆盖前值都不一致（可能被其它程序改动），已停止恢复"
+            "目标会话记录的更新时间与本次保存及覆盖前值都不一致（可能被其它程序改动），已停止恢复"
                 .to_string(),
             false,
         );
@@ -3079,11 +3079,11 @@ fn recover_copy_operation(
     match session_row_owner(paths, &operation.target.session_id) {
         Some(owner) if owner == operation.target.uid => {}
         Some(_) => {
-            return needs("目标会话行归属异常，已停止恢复".to_string(), false);
+            return needs("目标会话记录归属异常，已停止恢复".to_string(), false);
         }
         None => {
             if operation.phase >= OpPhase::DbWritten {
-                return needs("目标会话行丢失，已停止恢复".to_string(), false);
+                return needs("目标会话记录丢失，已停止恢复".to_string(), false);
             }
             match insert_session_copy(
                 paths,
@@ -3094,7 +3094,7 @@ fn recover_copy_operation(
             ) {
                 Ok(DbCopyOutcome::Inserted) => {}
                 Ok(outcome) => {
-                    let error = format!("会话行写入失败（{outcome:?}），保留操作待重试");
+                    let error = format!("会话记录保存失败（{outcome:?}），保留操作待重试");
                     fail_operation(paths, &mut operation, &error);
                     return needs(error, false);
                 }
@@ -3170,7 +3170,7 @@ fn abandon_operation(paths: &SessionPaths, operation: &mut Operation) {
     abandon_operation_with(
         paths,
         operation,
-        "源会话已不可用，且未写入任何副本，已放弃该操作",
+        "源会话已不可用，且没有复制出任何会话，已放弃该操作",
     );
 }
 
@@ -3313,7 +3313,7 @@ mod tests {
         fn store(&self) -> LinkStore {
             match session_link::load_store(&self.paths) {
                 StoreState::Ready(store) => store,
-                other => panic!("关联存储应为 Ready，实际 {other:?}"),
+                other => panic!("同步记录应为 Ready，实际 {other:?}"),
             }
         }
 
@@ -3718,7 +3718,7 @@ mod tests {
         assert!(session_backup::scan_lifecycle(&env.paths)
             .records
             .is_empty());
-        assert_eq!(env.body_files().len(), 4, "两条来源正文与两个副本正文都在");
+        assert_eq!(env.body_files().len(), 4, "两条来源内容与两个复制后的内容都在");
     }
 
     /// 归属不可验证（临时目录路径被替换为符号链接）：业务成功保持不变、材料保留并上报，
@@ -3802,7 +3802,7 @@ mod tests {
         assert_eq!(
             env.store().revision,
             revision_before_retry,
-            "幂等复用不写关联存储"
+            "幂等复用不写同步记录"
         );
         assert_eq!(env.store().groups[0].members.len(), 2);
     }
@@ -3930,7 +3930,7 @@ mod tests {
         assert_eq!(
             env.body_files().len(),
             2,
-            "旧副本正文已删，只剩源与新建副本"
+            "旧复制后的内容已删，只剩源与新建副本"
         );
 
         let group = &env.store().groups[0];
@@ -4125,7 +4125,7 @@ mod tests {
         assert_eq!(mixed["alreadyLinked"][0]["id"], "sess-1");
         assert_eq!(mixed["errors"].as_array().unwrap().len(), 1);
         assert_eq!(mixed["errors"][0]["id"], "sess-2");
-        assert_eq!(mixed["errors"][0]["error"], "会话正文不存在，未复制");
+        assert_eq!(mixed["errors"][0]["error"], "会话内容不存在，未复制");
         // 复用/失败都不算未完成写入。
         assert!(mixed.get("needsRecovery").is_none());
     }
@@ -4141,8 +4141,8 @@ mod tests {
 
         let report = copy(&env, "uid-b", &["sess-1"]);
         assert_eq!(report["copied"].as_array().unwrap().len(), 0);
-        assert_eq!(report["errors"][0]["error"], "会话正文不存在，未复制");
-        assert_eq!(env.rows_for("uid-b").len(), 0, "不得写出半成品会话行");
+        assert_eq!(report["errors"][0]["error"], "会话内容不存在，未复制");
+        assert_eq!(env.rows_for("uid-b").len(), 0, "不得写出半成品会话记录");
         assert_eq!(env.body_files().len(), 0);
     }
 
@@ -4154,7 +4154,7 @@ mod tests {
         let report = copy(&env, "uid-b", &["sess-1"]);
         assert_eq!(report["copied"].as_array().unwrap().len(), 0);
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("会话正文无法验证"), "{error}");
+        assert!(error.contains("会话内容无法验证"), "{error}");
         assert_eq!(env.rows_for("uid-b").len(), 0);
     }
 
@@ -4169,7 +4169,7 @@ mod tests {
             report["errors"][0]["error"],
             "数据库中找不到源会话记录，未复制"
         );
-        assert_eq!(env.body_files().len(), 1, "不得写出无数据库行的正文");
+        assert_eq!(env.body_files().len(), 1, "不得写出无数据库行的内容");
     }
 
     #[test]
@@ -4202,7 +4202,7 @@ mod tests {
         assert_eq!(
             env.body_files().len(),
             2,
-            "正文与数据库行已写入，未报告成功"
+            "内容与数据库行已写入，未按成功处理"
         );
 
         let pending = session_link::pending_operations(&env.paths(), WbVariant::Cn);
@@ -4268,7 +4268,7 @@ mod tests {
         assert_eq!(failed["copied"].as_array().unwrap().len(), 0);
         let error = failed["errors"][0]["error"].as_str().unwrap();
         assert!(
-            error.contains("写入失败") || error.contains("同步记录"),
+            error.contains("保存失败") || error.contains("同步记录"),
             "{error}"
         );
         assert_eq!(failed["needsRecovery"], true);
@@ -4309,7 +4309,7 @@ mod tests {
         }
         assert_eq!(report["copied"].as_array().unwrap().len(), 0);
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("副本正文写入失败"), "{error}");
+        assert!(error.contains("复制后的内容保存失败"), "{error}");
         assert_eq!(env.rows_for("uid-b").len(), 0);
         assert_eq!(env.body_files().len(), 1);
     }
@@ -4435,11 +4435,11 @@ mod tests {
             lock_held_on_recheck.get(),
             "复查必须发生在已经拿到档位锁之后、任何写入之前"
         );
-        assert_eq!(env.body_files().len(), 1, "不得写入副本正文");
+        assert_eq!(env.body_files().len(), 1, "不得写入复制后的内容");
         assert_eq!(env.rows_for("uid-b").len(), 0, "不得写入数据库行");
         assert!(
             !env.paths.session_links_file().exists(),
-            "不得初始化关联存储"
+            "不得初始化同步记录"
         );
         assert!(session_link::pending_operations(&env.paths(), WbVariant::Cn).is_empty());
 
@@ -4517,7 +4517,7 @@ mod tests {
         let issue = &report.needs_recovery[0];
         assert!(!issue.retryable);
         assert!(
-            issue.reason.contains("目标正文与操作记录不一致"),
+            issue.reason.contains("目标内容与操作记录不一致"),
             "{}",
             issue.reason
         );
@@ -4588,7 +4588,7 @@ mod tests {
         assert!(report.is_clean(), "{:?}", report.needs_recovery);
 
         let after = env.store();
-        assert_eq!(after.revision, revision_before, "恢复不得重写关联存储");
+        assert_eq!(after.revision, revision_before, "恢复不得重写同步记录");
         assert_eq!(after.groups[0].pair_bases.len(), pair_bases_before.len());
         assert_eq!(
             after.groups[0].pair_bases[0].baseline_ref, pair_bases_before[0].baseline_ref,
@@ -4674,7 +4674,7 @@ mod tests {
             "{}",
             report.needs_recovery[0].reason
         );
-        assert_eq!(env.store().revision, revision_before, "不得重写关联存储");
+        assert_eq!(env.store().revision, revision_before, "不得重写同步记录");
         assert_eq!(env.mapping_rows(), 0, "不得悄悄补登记映射");
         assert_eq!(
             session_link::pending_operations(&paths, WbVariant::Cn).len(),
@@ -4876,7 +4876,7 @@ mod tests {
         let env = ready_env("backup-fail");
         std::fs::remove_file(env.paths.workbuddy_db()).unwrap();
         let err = backup_workbuddy_db(&env.paths(), &env.paths.backup_root()).unwrap_err();
-        assert!(err.contains("会话数据库不存在"), "{err}");
+        assert!(err.contains("会话数据不存在"), "{err}");
 
         // 正常备份返回主库路径且大小一致。
         env.create_db();
@@ -5076,7 +5076,7 @@ mod tests {
         assert_eq!(group["availableModes"], json!([]));
         assert!(group.get("previewToken").is_none(), "不可执行的组不发凭据");
         assert!(
-            group["reason"].as_str().unwrap().contains("关联成员已失效"),
+            group["reason"].as_str().unwrap().contains("目标账号的会话已失效"),
             "{preview}"
         );
         // 契约：不可验证时 source/target 为 0、baseline 为 null（前端类型据此声明）。
@@ -5267,7 +5267,7 @@ mod tests {
                 errors[0]["error"]
                     .as_str()
                     .unwrap()
-                    .contains("预览凭据不存在"),
+                    .contains("检查结果不存在"),
                 "{report}"
             );
         }
@@ -5450,12 +5450,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(env.body_path(&c_id)).unwrap(),
             c_body_before,
-            "C 的正文不得被同步改写"
+            "C 的内容不得被同步改写"
         );
         assert_ne!(
             std::fs::read_to_string(env.body_path(&b_id)).unwrap(),
             b_body_before,
-            "B 的正文应被同步替换"
+            "B 的内容应被同步替换"
         );
         let group = env
             .store()
@@ -5699,7 +5699,7 @@ mod tests {
     }
 
     fn session_row(env: &Env, cid: &str) -> RowView {
-        try_session_row(env, cid).expect("会话行必须存在")
+        try_session_row(env, cid).expect("会话记录必须存在")
     }
 
     /// 改标题与自定义标题（模拟用户在目标账号改名；标题不是内容身份，不使预览失效）。
@@ -5717,7 +5717,7 @@ mod tests {
             .groups
             .into_iter()
             .find(|group| group.id == group_id)
-            .expect("关联组必须存在")
+            .expect("同步关系必须存在")
     }
 
     fn pair_ref_of(group: &LinkGroup, left_uid: &str, right_uid: &str) -> String {
@@ -5854,7 +5854,7 @@ mod tests {
 
         // 组表：A/B 基线推进到本次写入内容，目标成员 lastSyncedAt 更新。
         let incoming_normalized =
-            session_link::normalize_jsonl(&expected, &target_id).expect("正文可归一化");
+            session_link::normalize_jsonl(&expected, &target_id).expect("内容可归一化");
         let group = group_snapshot(&env, &group_id);
         let pair_ref_after = pair_ref_of(&group, "uid-a", "uid-b");
         assert_ne!(pair_ref_after, pair_ref_before);
@@ -6139,7 +6139,7 @@ mod tests {
         }
         assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("同步正文写入失败"), "{error}");
+        assert!(error.contains("同步内容保存失败"), "{error}");
         assert_eq!(report["needsRecovery"], true);
 
         // 正文与数据库都没变；备份已生成并留下未完成操作（阶段停在 Prepared）。
@@ -6197,7 +6197,7 @@ mod tests {
         );
         assert!(report["synced"].as_array().unwrap().is_empty(), "{report}");
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("目标会话行更新失败"), "{error}");
+        assert!(error.contains("目标会话记录更新失败"), "{error}");
         assert_eq!(report["needsRecovery"], true);
 
         // 正文已写入，但数据库未更新：绝不报成功；组表也未提交。
@@ -6467,7 +6467,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
             written,
-            "归属异常时不得继续改写正文"
+            "归属异常时不得继续改写内容"
         );
         assert_eq!(
             session_link::pending_operations(&env.paths, WbVariant::Cn).len(),
@@ -6700,7 +6700,7 @@ mod tests {
         assert_eq!(report["needsRecovery"], true, "{report}");
         assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
         let error = report["errors"][0]["error"].as_str().unwrap();
-        assert!(error.contains("上一次会话写入尚未完成"), "{error}");
+        assert!(error.contains("上一次会话保存尚未完成"), "{error}");
         assert_eq!(body_bytes(&env, &target_id), target_before);
         assert_eq!(env.body_files().len(), 2);
         assert_eq!(
