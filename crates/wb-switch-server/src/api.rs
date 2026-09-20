@@ -290,18 +290,27 @@ async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
     // 默认不重启：VS Code 运行中不得写入，切换仅在编辑器完全退出后可用。
     let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(false);
     // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/* 命名风格一致）。
-    let copy_items: Vec<vscode_session::CopyItem> = body
+    // 任一条目非法即整包拒绝（与 Tauri 侧 `Option<Vec<CopyItem>>` 的 serde 整包报错同形），
+    // 避免「部分成功 + 静默丢弃」让用户误以为全部复制成功。
+    let copy_items: Vec<vscode_session::CopyItem> = match body
         .get("copySessions")
         .and_then(|v| v.as_array())
         .map(|array| {
             array
                 .iter()
-                .filter_map(|item| {
-                    serde_json::from_value::<vscode_session::CopyItem>(item.clone()).ok()
-                })
-                .collect()
+                .map(|item| serde_json::from_value::<vscode_session::CopyItem>(item.clone()))
+                .collect::<Result<Vec<_>, _>>()
         })
-        .unwrap_or_default();
+        .transpose()
+    {
+        Ok(items) => items.unwrap_or_default(),
+        Err(error) => {
+            return json_err(
+                format!("copySessions 条目非法：{error}"),
+                StatusCode::BAD_REQUEST,
+            )
+        }
+    };
 
     let result = if copy_items.is_empty() {
         vscode_ext::switch_account(account_id, restart)
