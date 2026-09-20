@@ -125,25 +125,26 @@ export function CodeBuddyCnIdeMark({ size = 32, className }: MarkProps) {
 }
 
 /**
- * VS Code 内 CodeBuddy 扩展标记：**VS Code 品牌蓝底 + 白色官方字形**，
- * 与 VS Code 自己的图标同构（蓝底圆角方块 + 白色字形），一眼能认出是「VS Code 目标」。
+ * VS Code 内 CodeBuddy 扩展标记：**黑白自适应底块 + 扩展官方字形**。
  *
  * - 字形取自扩展自带的 `resources/copilot.svg`（24×24 六边形 + S 形镂空，`fill-rule: evenodd`）；
- * - viewBox 裁到字形包围盒（去掉原图四周约 8% 空白），字形取底块 70% 居中 → 与相邻
- *   满幅 app 图标（WorkBuddy / CodeBuddy IDE）视觉等大；
- * - 蓝底 + 白字形在浅色与深色主题下都成立，故不做主题翻转。
+ * - viewBox 裁到字形包围盒 `2.1 0.63 19.8 22.74`（去掉原图四周约 8% 空白），字形取底块
+ *   80% 居中：字形实占约 70%×80%，与相邻满幅 app 图标（WorkBuddy / CodeBuddy IDE）
+ *   视觉等大且更压得住；
+ * - 底块 `bg-foreground` + 字形 `text-background`：浅色=黑底白字形、深色=白底黑字形，
+ *   黑白中性并随主题切换。
  */
 export function VscodeExtMark({ size = 32, className }: MarkProps) {
   return (
     <span
       aria-hidden
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-[#007acc] text-white",
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-foreground text-background",
         className,
       )}
       style={{ width: size, height: size }}
     >
-      <svg viewBox="2.1 0.63 19.8 22.74" fill="none" className="size-[70%]">
+      <svg viewBox="2.1 0.63 19.8 22.74" fill="none" className="size-[80%]">
         <path
           fillRule="evenodd"
           clipRule="evenodd"
