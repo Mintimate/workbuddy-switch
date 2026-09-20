@@ -81,19 +81,21 @@ pub fn account_display_name(acc: &Value) -> String {
 }
 
 /// 账号的展示元数据（不泄露 token）。对照 server.py `account_meta`。
+/// 展示字段一律走 `display_value`：WorkBuddy 5.6 起 nickname/phoneNumber 可能是
+/// 加密信封对象，裸透传会导致前端 React error #31（白屏）。
 pub fn account_meta(acc: &Value) -> Value {
     json!({
-        "id": acc.get("id"),
-        "uid": acc.get("uid"),
-        "email": acc.get("email"),
-        "nickname": acc.get("nickname"),
-        "enterpriseName": acc.get("enterpriseName"),
-        "expiresAt": acc.get("expiresAt"),
-        "refreshExpiresAt": acc.get("refreshExpiresAt"),
-        "refreshedAt": acc.get("refreshedAt"),
-        "createdAt": acc.get("createdAt"),
+        "id": display_value(acc, "id"),
+        "uid": display_value(acc, "uid"),
+        "email": display_value(acc, "email"),
+        "nickname": display_value(acc, "nickname"),
+        "enterpriseName": display_value(acc, "enterpriseName"),
+        "expiresAt": display_value(acc, "expiresAt"),
+        "refreshExpiresAt": display_value(acc, "refreshExpiresAt"),
+        "refreshedAt": display_value(acc, "refreshedAt"),
+        "createdAt": display_value(acc, "createdAt"),
         "needsRelogin": acc.get("needs_relogin").and_then(|v| v.as_bool()) == Some(true),
-        "needsReloginReason": acc.get("needs_relogin_reason"),
+        "needsReloginReason": display_value(acc, "needs_relogin_reason"),
         // 档位随元数据下发，供宿主按档位过滤列表（缺省国内版，历史数据零迁移）。
         "variant": variant_of(acc).as_str(),
     })
@@ -105,6 +107,28 @@ pub fn get_str(v: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// 展示型字段安全读取：标量原样返回；对象/数组（如 WorkBuddy 5.6 引入的
+/// `{$wbEncrypted, envelope}` 加密信封）折叠为 Null，避免对象漏进前端
+/// 被当作 React 子节点渲染导致整树卸载（白屏）。
+pub fn display_value(acc: &Value, key: &str) -> Value {
+    match acc.get(key) {
+        Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null)) => {
+            v.clone()
+        }
+        _ => Value::Null,
+    }
+}
+
+/// 字段值读取：接受明文字符串或 WorkBuddy 5.6 加密信封对象，其他类型返回 None。
+/// 信封在本机同一 keyblob 下可由 WorkBuddy 自行解密，导入与切换写回时需原样保留。
+pub fn secret_value(v: &Value, key: &str) -> Option<Value> {
+    match v.get(key) {
+        Some(s @ Value::String(_)) => Some(s.clone()),
+        Some(o @ Value::Object(map)) if map.contains_key("$wbEncrypted") => Some(o.clone()),
+        _ => None,
+    }
 }
 
 /// 账号档位：显式 `variant` 字段优先，缺失时按 `domain` 后缀兜底，缺省国内版。
