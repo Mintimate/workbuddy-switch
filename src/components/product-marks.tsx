@@ -125,20 +125,20 @@ export function CodeBuddyCnIdeMark({ size = 32, className }: MarkProps) {
 }
 
 /**
- * VS Code 内 CodeBuddy 扩展标记：扩展自带的官方字形
- * （`resources/copilot.svg`，24×24 六边形 + S 形镂空，`fill-rule: evenodd`）。
+ * VS Code 内 CodeBuddy 扩展标记：**VS Code 品牌蓝底 + 白色官方字形**，
+ * 与 VS Code 自己的图标同构（蓝底圆角方块 + 白色字形），一眼能认出是「VS Code 目标」。
  *
- * - viewBox 裁到字形自身包围盒（去掉原图四周约 8% 空白），字形占满底块 → 与相邻
- *   产品图标（WorkBuddy / CodeBuddy IDE 的满幅 app 图标）视觉大小一致；
- * - 底色 `bg-foreground` + 字形 `text-background`：浅色下黑底白字、深色下白底黑字，
- *   黑白中性且随主题切换，与彩色 app 图标、深色 CLI 图标并列都不突兀。
+ * - 字形取自扩展自带的 `resources/copilot.svg`（24×24 六边形 + S 形镂空，`fill-rule: evenodd`）；
+ * - viewBox 裁到字形包围盒（去掉原图四周约 8% 空白），字形取底块 70% 居中 → 与相邻
+ *   满幅 app 图标（WorkBuddy / CodeBuddy IDE）视觉等大；
+ * - 蓝底 + 白字形在浅色与深色主题下都成立，故不做主题翻转。
  */
 export function VscodeExtMark({ size = 32, className }: MarkProps) {
   return (
     <span
       aria-hidden
       className={cn(
-        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-foreground text-background",
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-[#007acc] text-white",
         className,
       )}
       style={{ width: size, height: size }}
