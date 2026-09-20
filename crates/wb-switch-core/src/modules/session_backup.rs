@@ -9,7 +9,9 @@
 //! - 清理失败不回滚业务、不报告操作失败，保留可重试依据，下次维护入口补清理。
 
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
@@ -123,6 +125,26 @@ pub fn sync_dir(_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 持久化单个文件的已写内容。
+///
+/// Unix 上只读句柄即可 `fsync`；Windows 的 `FlushFileBuffers` 要求句柄具备写权限，
+/// 而 `File::open` 只申请 `GENERIC_READ`，对只读句柄 `sync_all` 必定返回
+/// `ERROR_ACCESS_DENIED(5)`。备份目录里的文件都是本进程刚写出的副本，故用可写句柄打开。
+#[cfg(unix)]
+pub fn sync_file(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// [`sync_file`] 的 Windows 实现：句柄必须可写（见上方说明）。
+#[cfg(not(unix))]
+pub fn sync_file(path: &Path) -> std::io::Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
+}
+
 /// 目标文件所在目录的持久化（不存在时视为无需处理）。
 fn sync_parent_of(path: &Path) -> std::io::Result<()> {
     match path.parent() {
@@ -172,7 +194,7 @@ pub fn sync_tree(dir: &Path) -> std::io::Result<()> {
         if meta.is_dir() {
             sync_tree(&path)?;
         } else {
-            File::open(&path)?.sync_all()?;
+            sync_file(&path)?;
         }
     }
     sync_dir(dir)
@@ -955,6 +977,27 @@ mod tests {
         );
     }
 
+    /// 回归（issue #76）：备份目录里有真实文件时，「转 protected」必须成功。
+    ///
+    /// Windows 的 `FlushFileBuffers` 要求句柄具备写权限，而 `File::open` 只申请
+    /// `GENERIC_READ`：只读句柄上 `sync_all` 必定返回 `ERROR_ACCESS_DENIED(5)`，导致
+    /// Windows 上复制会话 100% 报「备份目录持久化失败：拒绝访问。(os error 5)」。
+    /// 目录为空时不会触发（空目录不进入文件分支），所以必须显式写入真实文件。
+    #[test]
+    fn sync_tree_flushes_files_before_protected() {
+        let dir = TempDir::new("flush");
+        let paths = dir.paths();
+        let mut record = begin_operation(&paths, WbVariant::Cn, "copy", None, None).unwrap();
+        let target = transaction_dir(&paths, WbVariant::Cn, &record.operation_id).unwrap();
+        std::fs::write(target.join("workbuddy.db"), b"snapshot").unwrap();
+        std::fs::create_dir_all(target.join("nested")).unwrap();
+        std::fs::write(target.join("nested").join("workbuddy.db-wal"), b"wal").unwrap();
+
+        sync_tree(&target).expect("备份目录必须能持久化其中的文件");
+        mark_protected(&paths, &mut record).expect("备份目录持久化必须成功");
+        assert_eq!(record.state, BackupState::Protected);
+    }
+
     #[test]
     fn protected_with_completed_log_is_swept_but_unfinished_is_not() {
         let dir = TempDir::new("sweep");
@@ -1023,6 +1066,7 @@ mod tests {
             .is_dir());
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_transaction_dir_is_preserved() {
         let dir = TempDir::new("symlink");
