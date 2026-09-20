@@ -5470,6 +5470,7 @@ dependencies = [
  "tokio",
  "uuid",
  "wb-switch-core",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
