@@ -11,7 +11,7 @@
 //! - **消费方式**：记 offset + 到 1 MB 轮转（`rename` 后再读旧 inode 的增量），不裁剪写入方
 //!   正在追加的文件；轮转失败不动文件，宁可继续增长也不丢事件。
 //! - **CLI 归因**：key 是**进程级快照**（切换只对新进程生效）。本轮起「活进程 key ==
-//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/model-rate-limits.md`）：
+//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/rate-limit-ledger.md`）：
 //!   手动切换先关进程再写 `state.json`，自动轮换只在没有存活会话时才切。因此归因只需
 //!   「读当前账号 + 一个陈旧守卫」：取「该会话进程的启动时刻」（`sessions/<pid>.json` 的
 //!   `startedAt`，兜底 transcript 首行），`startedAt ≥ state.json mtime` → 当前账号；
@@ -48,10 +48,6 @@ const COMPACT_AFTER_BYTES: u64 = 1024 * 1024;
 
 /// watcher 轮询间隔：一次 `stat`，hook 事件要求秒级可见（AC1）。
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-/// `transcript_model` 时间截断的容差：hook 写入时刻略晚于事件当轮最后的 transcript 行，
-/// 给少量余量防写入顺序边界；切模型后的人工操作（看到 429 → 切模型 → 发送）远超该值。
-const STALE_PAYLOAD_TOLERANCE_MS: i64 = 2_000;
 
 /// 模型字段的未知哨兵值（与 IDE 解析同一套）：不得作为模型名展示。
 const MODEL_SENTINELS: [&str; 3] = ["auto", "undefined", "null"];
@@ -112,6 +108,9 @@ fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// hook payload 里本模块用到的字段（其余字段与版本差异一律忽略）。
+///
+/// 历史事件行可能带已废弃的 `_hookTs`（旧脚本写入的时刻锚）：它不在结构里，
+/// `serde` 默认忽略未知字段，因此这些行照常消费。
 #[derive(Deserialize)]
 struct HookPayload {
     #[serde(default)]
@@ -122,15 +121,6 @@ struct HookPayload {
     model: Option<String>,
     #[serde(default)]
     last_assistant_message: Option<String>,
-    /// hook 脚本写入事件行的时刻（毫秒，见 `rate_limit_hook::script_body`）。
-    ///
-    /// 事件可能被延迟消费（App 重启 / watcher 未跑），消费时 transcript 往往已包含
-    /// 429 之后的新轮次；没有写入时刻就无法把「切模型后的模型行」排除在归因之外
-    /// （2026-09-19 实证：429 在 15:46 被 deepseek 请求触发，16:07 才消费，此时主人
-    /// 已切 glm 继续同一会话 ⇒ transcript 最后一条模型行是 glm ⇒ 假 chip）。
-    /// 旧版脚本没有该字段（None）；0 是脚本的无效回退值，同样视为 None。
-    #[serde(default, rename = "_hookTs")]
-    hook_ts: Option<i64>,
 }
 
 /// 事件的客户端来源（由 `transcript_path` 前缀判定）。
@@ -148,8 +138,6 @@ struct QuotaEvent {
     session_id: Option<String>,
     model: Option<String>,
     reset_at: i64,
-    /// 事件行写入时刻（毫秒）；旧版脚本 / 无效值 → None。
-    hook_ts: Option<i64>,
 }
 
 /// 一行 payload → 限额事件；非限额行、解析失败、缺恢复时刻统一返回 None（静默忽略）。
@@ -165,6 +153,9 @@ fn parse_quota_line(line: &str) -> Option<QuotaEvent> {
     }
     // 取不到官方恢复时刻就不是可入账的限额事件（不猜时间）。
     let reset_at = limits::parse_reset_at(message)?;
+    // 模型直接采用**本次 payload** 的字段：它是 429 当轮客户端侧选定的模型，
+    // 与失败请求同轮（不读 transcript 全文猜模型 —— 延迟消费时那段文本已经属于
+    // 之后的轮次，会给出别的模型，2026-09-19 实证假 chip）。
     let model = payload
         .model
         .filter(|model| !MODEL_SENTINELS.contains(&model.as_str()))
@@ -174,8 +165,6 @@ fn parse_quota_line(line: &str) -> Option<QuotaEvent> {
         session_id: payload.session_id,
         model,
         reset_at,
-        // 0 是 hook 脚本取不到毫秒时的回退值，与缺失等价。
-        hook_ts: payload.hook_ts.filter(|ts| *ts > 0),
     })
 }
 
@@ -442,59 +431,6 @@ fn complete_lines(bytes: &[u8]) -> (Vec<String>, u64) {
     (lines, consumed)
 }
 
-/// transcript 里 429 事件当轮的 `providerData.model`（实际服务模型）。
-///
-/// hook payload 的 `model` 是**会话 UI 选定模型**，与真正被限的服务模型可能不同
-/// （2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f，台账出现双 chip）。
-/// 与日志通路「触发前同会话最近一次实际请求模型」同一语义：流式读 transcript，
-/// 取最后一条带 `providerData.model` 的行；文件不可读 / 无模型行 → None（回落 payload）。
-///
-/// ⚠️ 事件可能被延迟消费（App 重启 / watcher 未跑，2026-09-19 实测延迟 21 分钟），
-/// 届时 transcript 已包含 429 之后的新轮次 —— 主人切模型继续会话后，「最后一条模型行」
-/// 就是切过去的模型，不再是被限模型。因此有 `hook_ts`（事件写入时刻）时做时间截断：
-/// 只采信 `timestamp ≤ hook_ts + 容差` 的模型行，晚于事件的行与无法判时的行一律不采信
-/// （宁可回落 payload.model —— 429 当轮 UI 模型与被限模型同轮，是安全兜底）。
-/// 无 `hook_ts`（旧版脚本）保持旧行为：取最后一条，风险与历史一致。
-fn transcript_model(transcript_path: &str, hook_ts: Option<i64>) -> Option<String> {
-    let cutoff = hook_ts.map(|ts| ts + STALE_PAYLOAD_TOLERANCE_MS);
-    let file = std::fs::File::open(transcript_path).ok()?;
-    let mut last = None;
-    for line in std::io::BufRead::lines(std::io::BufReader::new(file)) {
-        let Ok(line) = line else { continue };
-        // 子串预筛：transcript 可达数十 MB，避免逐行做完整 JSON 解析。
-        if !line.contains("\"providerData\"") || !line.contains("\"model\"") {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        let Some(model) = value
-            .get("providerData")
-            .and_then(|provider| provider.get("model"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        else {
-            continue;
-        };
-        if let Some(cutoff) = cutoff {
-            match timestamp_ms(&value) {
-                Some(ts) if ts <= cutoff => {}
-                // 晚于事件（429 之后的新轮次）或无法判时的行都不可信。
-                _ => continue,
-            }
-        }
-        last = Some(model.to_string());
-    }
-    last
-}
-
-/// transcript 行的时间戳（毫秒）：数值优先，其次数字字符串。
-fn timestamp_ms(value: &Value) -> Option<i64> {
-    let ts = value.get("timestamp")?;
-    ts.as_i64().or_else(|| ts.as_str().and_then(|s| s.parse().ok()))
-}
-
 /// 把一批行入账到状态；返回是否新增了条目。
 fn ingest_lines(ctx: &IngestContext, state: &mut State, lines: &[String], now: i64) -> bool {
     let mut added = false;
@@ -508,14 +444,11 @@ fn ingest_lines(ctx: &IngestContext, state: &mut State, lines: &[String], now: i
         let Some(account_id) = attribute(&event, source, ctx, now) else {
             continue;
         };
-        // 模型归因：transcript 的实际服务模型优先（时间截断到事件当轮），payload 的
-        // UI 选定模型只做兜底。
-        let model = transcript_model(&event.transcript_path, event.hook_ts).or(event.model.clone());
         merge_entry(
             &mut state.events,
             StoredEntry {
                 account_id,
-                model,
+                model: event.model.clone(),
                 reset_at: event.reset_at,
                 first_seen_at: now,
                 hit_count: 1,
@@ -708,8 +641,15 @@ mod tests {
         .to_string()
     }
 
-    /// 带 `_hookTs`（hook 脚本写入时刻）的限额 payload（新版脚本形态）。
-    fn stop_payload_at(session: &str, model: &str, transcript: &Path, hook_ts: i64) -> String {
+    /// 带废弃字段 `_hookTs` 的限额 payload（旧脚本写入的历史事件行形态）。
+    ///
+    /// 该字段已从消费端移除，但事件文件是 append-only 的：历史行必须照常消费。
+    fn legacy_stop_payload_with_hook_ts(
+        session: &str,
+        model: &str,
+        transcript: &Path,
+        hook_ts: i64,
+    ) -> String {
         json!({
             "session_id": session,
             "transcript_path": transcript.to_string_lossy(),
@@ -854,7 +794,6 @@ mod tests {
             session_id: Some(session.to_string()),
             model: Some("deepseek-v4.1-flash".to_string()),
             reset_at: 1_789_670_683_000,
-            hook_ts: None,
         }
     }
 
@@ -957,7 +896,7 @@ mod tests {
     }
 
     /// 事件文件首行带 UTF-8 BOM（Windows PowerShell 5.1 `Add-Content -Encoding UTF8`
-    /// 建文件时的实测行为）不得吞掉第一个限额事件。
+    /// 建文件时的实测行为）不得吞掉第一个限额事件，也不得打乱按**字节**推进的消费偏移。
     #[test]
     fn utf8_bom_on_the_first_line_does_not_kill_the_first_event() {
         let fixture = Fixture::new();
@@ -969,160 +908,100 @@ mod tests {
         fixture.write_session_registry(4242, session, 500);
         std::fs::write(
             fixture.events(),
-            format!("\u{feff}{}\n", stop_payload(session, "hy3", &fixture.cli_transcript(session))),
+            format!(
+                "\u{feff}{}\n",
+                stop_payload(session, "hy3", &fixture.cli_transcript(session))
+            ),
         )
         .expect("带 BOM 的事件文件");
 
         let mut state = State::default();
         assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
         assert_eq!(state.events.len(), 1, "BOM 前缀不得让首行解析失败");
-    }
-
-    /// 模型归因：transcript 的实际服务模型（`providerData.model`）优先于 payload 的
-    /// UI 选定模型（2026-09-18 实证：UI 选 glm-5.3-flash，实际被限 hy4-preview-f）。
-    #[test]
-    fn transcript_serving_model_wins_over_the_payload_ui_model() {
-        let fixture = Fixture::new();
-        let lookup = absent_lookup;
-        let ctx = fixture.context(vec![cli_account()], &lookup);
-        fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
-        let session = "s-model";
-        let transcript = fixture.cli_transcript(session);
-        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
-        std::fs::write(
-            &transcript,
-            format!(
-                "{}\n{}\n{}\n",
-                json!({ "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] }),
-                json!({ "type": "reasoning", "providerData": { "model": "glm-5.3-flash", "reasoning": "x" } }),
-                // 最后一条实际服务模型是 hy4-preview-f（中途换过模型也要取最新的）。
-                json!({ "type": "function_call", "providerData": { "model": "hy4-preview-f" } })
-            ),
-        )
-        .expect("写 transcript");
-        fixture.write_session_registry(4242, session, 500);
-        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "glm-5.3-flash", &transcript)))
-            .expect("事件文件");
-
-        let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
-        assert_eq!(state.events.len(), 1);
+        // 偏移以字节计（BOM 也算在内）：文件被消费完，下一轮不会重复入账。
         assert_eq!(
-            state.events[0].model.as_deref(),
-            Some("hy4-preview-f"),
-            "必须取 transcript 的实际服务模型，不是 payload 的 UI 模型"
+            state.offset,
+            std::fs::metadata(fixture.events()).expect("事件文件").len()
+        );
+        assert_eq!(
+            consume_with(&ctx, &mut state, 1_001),
+            None,
+            "无新字节不重复消费"
         );
     }
 
-    /// transcript 不可读 / 无模型行 → 回落 payload 的模型，不入成「未知」。
+    /// 事件模型来自**当次 payload**：切到 B 后的首个请求被限（429 轮次没有响应行），
+    /// 延迟消费期间会话又切到 C —— 事件必须仍记为 B。
+    ///
+    /// 回归 2026-09-20 审查反例：曾按 transcript 全文重判模型，会取到上一轮的 A
+    /// （时间上界只截到「最新一条模型行」），把 payload 里正确的 B 覆盖掉。
     #[test]
-    fn payload_model_is_the_fallback_when_transcript_has_no_model_rows() {
+    fn event_model_comes_from_the_current_payload_not_the_transcript() {
         let fixture = Fixture::new();
         let lookup = absent_lookup;
         let ctx = fixture.context(vec![cli_account()], &lookup);
         fixture.write_cli_state("acc-cli");
         set_state_mtime(&fixture, 1);
-        let session = "s-fallback";
-        // transcript 存在但没有 providerData.model 行。
-        let transcript = fixture.cli_transcript(session);
-        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
-        std::fs::write(&transcript, json!({ "type": "message", "role": "user" }).to_string())
-            .expect("写 transcript");
-        fixture.write_session_registry(4242, session, 500);
-        std::fs::write(fixture.events(), format!("{}\n", stop_payload(session, "hy3", &transcript))).expect("事件文件");
-
-        let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
-        assert_eq!(state.events.len(), 1);
-        assert_eq!(state.events[0].model.as_deref(), Some("hy3"));
-    }
-
-    /// 2026-09-19 glm 假 chip 实证回归：事件被延迟消费（429 在 15:46、消费在 16:07），
-    /// 期间主人切模型继续同一会话 ⇒ transcript 已有「事件之后」的模型行。带 `_hookTs`
-    /// 的事件必须按写入时刻截断，归因到事件当轮的模型（切之前的），不是切之后的。
-    #[test]
-    fn stale_transcript_rows_after_the_hook_timestamp_are_ignored() {
-        let fixture = Fixture::new();
-        let lookup = absent_lookup;
-        let ctx = fixture.context(vec![cli_account()], &lookup);
-        fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
-        let session = "s-stale";
-        let transcript = fixture.cli_transcript(session);
-        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
-        let hook_ts = 1_000_000_i64;
-        std::fs::write(
-            &transcript,
-            format!(
-                "{}\n{}\n{}\n",
-                // 事件当轮：实际服务模型 deepseek（429 请求本身无响应行，最后一条是它）。
-                json!({ "type": "reasoning", "timestamp": hook_ts - 1_000, "providerData": { "model": "deepseek-v4.1-flash" } }),
-                // 事件之后主人切 glm 继续会话（延迟消费时已在文件里）。
-                json!({ "type": "message", "timestamp": hook_ts + 60_000, "providerData": { "model": "glm-5.3-flash" } }),
-                // 事件之后无时间戳的行同样不可信。
-                json!({ "type": "function_call", "providerData": { "model": "kimi-k3-1" } })
-            ),
-        )
-        .expect("写 transcript");
-        fixture.write_session_registry(4242, session, 500);
-        std::fs::write(
-            fixture.events(),
-            format!(
-                "{}\n",
-                stop_payload_at(session, "deepseek-v4.1-flash", &transcript, hook_ts)
-            ),
-        )
-        .expect("事件文件");
-
-        let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, hook_ts + 120_000), Some(true));
-        assert_eq!(state.events.len(), 1);
-        assert_eq!(
-            state.events[0].model.as_deref(),
-            Some("deepseek-v4.1-flash"),
-            "事件之后的新轮次模型行必须被时间截断排除"
-        );
-    }
-
-    /// 同一场景但 `_hookTs` 为 0（脚本取不到毫秒的回退值）：视为无时间锚，保持旧行为。
-    #[test]
-    fn zero_hook_timestamp_falls_back_to_the_last_model_row() {
-        let fixture = Fixture::new();
-        let lookup = absent_lookup;
-        let ctx = fixture.context(vec![cli_account()], &lookup);
-        fixture.write_cli_state("acc-cli");
-        set_state_mtime(&fixture, 1);
-        let session = "s-zero-ts";
+        let session = "s-switched";
         let transcript = fixture.cli_transcript(session);
         std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
         std::fs::write(
             &transcript,
             format!(
                 "{}\n{}\n",
-                json!({ "type": "reasoning", "providerData": { "model": "deepseek-v4.1-flash" } }),
-                json!({ "type": "message", "providerData": { "model": "glm-5.3-flash" } })
+                // 上一轮用 A 成功（事件之前的最后一个 assistant 轮次）。
+                json!({ "type": "message", "timestamp": 900_000, "providerData": { "model": "model-a" } }),
+                // 事件之后主人切到 C 继续会话（延迟消费时已在文件里）。
+                json!({ "type": "message", "timestamp": 1_060_000, "providerData": { "model": "model-c" } })
             ),
         )
         .expect("写 transcript");
         fixture.write_session_registry(4242, session, 500);
         std::fs::write(
             fixture.events(),
+            format!("{}\n", stop_payload(session, "model-b", &transcript)),
+        )
+        .expect("事件文件");
+
+        let mut state = State::default();
+        // 事件写入在 1 000 000，消费推迟到 1 200 000（transcript 已含切到 C 的新轮次）。
+        assert_eq!(consume_with(&ctx, &mut state, 1_200_000), Some(true));
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].model.as_deref(),
+            Some("model-b"),
+            "模型必须取当次 payload，不得被 transcript 里的其它轮次覆盖"
+        );
+    }
+
+    /// 旧脚本写入的事件行带已废弃字段 `_hookTs`：仍须照常消费（事件文件是 append-only 的）。
+    #[test]
+    fn legacy_events_with_the_retired_hook_ts_field_are_still_consumed() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-legacy";
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(
+            fixture.events(),
             format!(
                 "{}\n",
-                stop_payload_at(session, "glm-5.3-flash", &transcript, 0)
+                legacy_stop_payload_with_hook_ts(
+                    session,
+                    "hy3",
+                    &fixture.cli_transcript(session),
+                    1_000_000
+                )
             ),
         )
         .expect("事件文件");
 
         let mut state = State::default();
-        assert_eq!(consume_with(&ctx, &mut state, 2_000), Some(true));
-        assert_eq!(state.events.len(), 1);
-        assert_eq!(
-            state.events[0].model.as_deref(),
-            Some("glm-5.3-flash"),
-            "无有效时间锚时保持旧行为：取最后一条模型行"
-        );
+        assert_eq!(consume_with(&ctx, &mut state, 1_200_000), Some(true));
+        assert_eq!(state.events.len(), 1, "未知字段不得让整行解析失败");
+        assert_eq!(state.events[0].model.as_deref(), Some("hy3"));
     }
 
     #[test]

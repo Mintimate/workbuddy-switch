@@ -507,8 +507,8 @@ pub fn get_rate_limit_config() -> Value {
 
 /// POST /api/rate-limits/config —— 保存限额监听开关。
 ///
-/// 走 `limits::save_rate_limit_config`：`scanIdeLogs` 变化时同步清扫描缓存（只清缓存，
-/// 不强制全量），否则关掉 IDE 扫描后下一次还会按旧缓存把两个 IDE 扫一遍。
+/// 走 `limits::save_rate_limit_config`：`scanIdeLogs` 变化时作废扫描缓存（下一次按当前
+/// 来源范围重算），否则关掉 IDE 扫描后下一次还会按旧缓存把两个 IDE 扫一遍。
 #[tauri::command]
 pub fn save_rate_limit_config(config: Value) -> Result<Value, String> {
     limits::save_rate_limit_config(&config).map_err(|e| e.to_string())?;

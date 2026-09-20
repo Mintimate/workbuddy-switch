@@ -691,7 +691,7 @@ async fn api_rate_limit_config() -> Response {
 
 /// POST /api/rate-limits/config —— 保存限额监听配置。
 ///
-/// 与桌面端同语义：`scanIdeLogs` 变化时清扫描缓存（只清缓存、不强制全量）。
+/// 与桌面端同语义：`scanIdeLogs` 变化时作废扫描缓存，下一次按当前来源范围重算。
 async fn api_save_rate_limit_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
     match limits::save_rate_limit_config(submitted) {
