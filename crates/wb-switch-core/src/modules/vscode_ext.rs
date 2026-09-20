@@ -131,8 +131,9 @@ fn account_entry_key(entry: &Value) -> Option<&str> {
 
 /// 构造写入 VS Code 扩展 secret 的会话 JSON（merge 策略）。
 ///
-/// 先以既有明文为底（保留 `accounts[]` 等扩展私有字段），仅覆盖账号身份相关的
-/// 顶层键；读不到既有 secret（未登录）时退化为新建完整载荷（`accounts` 单元素）。
+/// 先以既有明文为底（保留 `accounts[]` / `auth` 等扩展私有字段），仅覆盖账号身份相关的
+/// 顶层键与 `auth` 内的凭据键；读不到既有 secret（未登录）时退化为新建完整载荷
+/// （`accounts` 单元素）。
 pub fn build_ext_session_json(acc: &Value, existing: Option<&str>) -> String {
     let uid = get_str(acc, "uid").unwrap_or_default();
     let domain = get_str(acc, "domain").unwrap_or_default();
@@ -140,6 +141,7 @@ pub fn build_ext_session_json(acc: &Value, existing: Option<&str>) -> String {
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64()).unwrap_or(0);
+    let refresh_expires_at = acc.get("refreshExpiresAt").and_then(|v| v.as_i64());
 
     let mut root: serde_json::Map<String, Value> = existing
         .and_then(|s| serde_json::from_str::<Value>(s).ok())
@@ -151,17 +153,35 @@ pub fn build_ext_session_json(acc: &Value, existing: Option<&str>) -> String {
     if let Some(map) = account_obj.as_object_mut() {
         map.insert("lastLogin".to_string(), json!(true));
     }
-    let auth = json!({
-        "accessToken": access_token,
-        "refreshToken": refresh_token,
-        "tokenType": token_type,
-        "domain": domain,
-        "expiresAt": expires_at,
-        "expiresIn": expires_at,
-        "refreshExpiresIn": 0,
-        "refreshExpiresAt": 0,
-        "lastRefreshTime": now_ms(),
-    });
+
+    // auth 同样走 merge：以既有 auth 为底，只覆盖身份/凭据键，扩展私有键
+    //（`scope` / `sessionState` / `notBeforePolicy` 等）原样保留。
+    let mut auth: serde_json::Map<String, Value> = root
+        .get("auth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    auth.insert("accessToken".to_string(), json!(access_token));
+    auth.insert("refreshToken".to_string(), json!(refresh_token));
+    auth.insert("tokenType".to_string(), json!(token_type));
+    auth.insert("domain".to_string(), json!(domain));
+    auth.insert("expiresAt".to_string(), json!(expires_at));
+    // 注：`expiresIn` / `refreshExpiresIn` 刻意沿用写绝对时间的既有写法，与线上已验证的
+    // CN IDE 实现（`codebuddy_cn_ide::build_session_json`）保持一致，不在本次修正。
+    auth.insert("expiresIn".to_string(), json!(expires_at));
+    auth.insert("refreshExpiresIn".to_string(), json!(0));
+    match refresh_expires_at {
+        // 账号库优先
+        Some(value) => {
+            auth.insert("refreshExpiresAt".to_string(), json!(value));
+        }
+        // 账号库没有：保留既有值；连既有值也没有时维持旧的 0（不让键凭空消失）。
+        None if !auth.contains_key("refreshExpiresAt") => {
+            auth.insert("refreshExpiresAt".to_string(), json!(0));
+        }
+        None => {}
+    }
+    auth.insert("lastRefreshTime".to_string(), json!(now_ms()));
 
     root.insert("id".to_string(), json!(PAYLOAD_ID));
     root.insert("token".to_string(), json!(access_token));
@@ -171,7 +191,7 @@ pub fn build_ext_session_json(acc: &Value, existing: Option<&str>) -> String {
     root.insert("accessToken".to_string(), json!(format!("{uid}+{access_token}")));
     root.insert("converted".to_string(), json!(true));
     root.insert("account".to_string(), account_obj.clone());
-    root.insert("auth".to_string(), auth);
+    root.insert("auth".to_string(), Value::Object(auth));
 
     // accounts[] upsert：保留其他账号条目、数组顺序稳定，并把当前账号标记为 lastLogin。
     // 命中（按 uid，缺失回退 id）原地替换，未命中追加；数组不存在或非数组则新建单元素数组。
@@ -562,8 +582,9 @@ mod tests {
             "refresh_token": "rt-new",
             "domain": "www.codebuddy.cn",
             "expiresAt": 42_i64,
+            "refreshExpiresAt": 1_700_000_000_000_i64,
         });
-        let existing = r#"{"accounts":[{"uid":"old","lastLogin":true}],"id":"Tencent-Cloud.coding-copilot","craftSettings":{"x":1},"converted":true}"#;
+        let existing = r#"{"accounts":[{"uid":"old","lastLogin":true}],"id":"Tencent-Cloud.coding-copilot","craftSettings":{"x":1},"converted":true,"auth":{"accessToken":"tok-old","scope":"all","sessionState":"logged_in","notBeforePolicy":0,"refreshExpiresAt":111,"expiresIn":5184000}}"#;
         let s = build_ext_session_json(&acc, Some(existing));
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["accessToken"], "u-99+tok-new");
@@ -578,6 +599,53 @@ mod tests {
         assert_eq!(v["accounts"].as_array().map(|a| a.len()), Some(2));
         // 扩展私有字段保留，不被覆盖
         assert_eq!(v["craftSettings"]["x"], 1);
+        // auth 的扩展私有键原样保留（F4）
+        assert_eq!(v["auth"]["scope"], "all");
+        assert_eq!(v["auth"]["sessionState"], "logged_in");
+        assert_eq!(v["auth"]["notBeforePolicy"], 0);
+        // auth 的身份/凭据键被覆盖
+        assert_eq!(v["auth"]["accessToken"], "tok-new");
+        assert_eq!(v["auth"]["refreshToken"], "rt-new");
+        assert_eq!(v["auth"]["tokenType"], "Bearer");
+        assert_eq!(v["auth"]["domain"], "www.codebuddy.cn");
+        assert_eq!(v["auth"]["expiresAt"], 42);
+        // refreshExpiresAt 取账号库的值（不再写 0）
+        assert_eq!(v["auth"]["refreshExpiresAt"], 1_700_000_000_000_i64);
+        // expiresIn 刻意沿用「写绝对时间」的既有写法（与 CN IDE 已验证实现一致）
+        assert_eq!(v["auth"]["expiresIn"], 42);
+        assert_eq!(v["auth"]["refreshExpiresIn"], 0);
+    }
+
+    /// F4：账号库没有 `refreshExpiresAt` 时保留既有 auth 里的值（而非写 0）。
+    #[test]
+    fn ext_session_json_keeps_existing_auth_refresh_expires_at_without_account_value() {
+        let acc = json!({
+            "uid": "u-7",
+            "nickname": "无 refreshExpiresAt",
+            "access_token": "tok-7",
+            "domain": "www.codebuddy.cn",
+            "expiresAt": 7_i64,
+        });
+        let existing = r#"{"auth":{"refreshExpiresAt":777,"scope":"all"}}"#;
+        let s = build_ext_session_json(&acc, Some(existing));
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["auth"]["refreshExpiresAt"], 777);
+        assert_eq!(v["auth"]["scope"], "all");
+        assert_eq!(v["auth"]["accessToken"], "tok-7");
+    }
+
+    /// F4：既无账号库值也无既有 auth（未登录）时维持旧载荷形状（键在、值为 0）。
+    #[test]
+    fn ext_session_json_without_existing_auth_keeps_zero_refresh_expires_at() {
+        let acc = json!({
+            "uid": "u-8",
+            "access_token": "tok-8",
+            "domain": "www.codebuddy.cn",
+            "expiresAt": 8_i64,
+        });
+        let s = build_ext_session_json(&acc, None);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["auth"]["refreshExpiresAt"], 0);
     }
 
     #[test]

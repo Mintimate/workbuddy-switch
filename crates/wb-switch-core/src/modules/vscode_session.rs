@@ -218,12 +218,18 @@ fn remove_dir_all_if_exists(path: &Path) {
 
 /// 列出某账号可复制的会话（按工作区 hash 分桶）。
 ///
-/// 返回 `{ sourceUid, sessions:[{id, workspaceHash, title, updatedAt, type, hasHistory}], skipped }`。
-/// `skipped` 为无法解析（损坏）的工作区索引数量。
+/// 返回 `{ sourceUid, sessions:[{id, workspaceHash, title, updatedAt, type, hasHistory}], skipped, dataRoot }`。
+/// `skipped` 为无法解析（损坏）的工作区索引数量；`dataRoot` 为解析到的扩展数据根目录
+/// （找不到时为 `null`，调用方据此区分「未找到数据目录」与「该账号无会话」）。
 pub fn list_vscode_sessions(uid: &str) -> Value {
     match ext_data_root() {
         Some(root) => list_sessions_in(&root, uid),
-        None => json!({ "sourceUid": uid, "sessions": [], "skipped": 0 }),
+        None => json!({
+            "sourceUid": uid,
+            "sessions": [],
+            "skipped": 0,
+            "dataRoot": Value::Null,
+        }),
     }
 }
 
@@ -231,9 +237,15 @@ pub fn list_vscode_sessions(uid: &str) -> Value {
 pub fn list_sessions_in(root: &Path, uid: &str) -> Value {
     let mut sessions: Vec<Value> = Vec::new();
     let mut skipped = 0usize;
+    let data_root = root.to_string_lossy().to_string();
 
     if !is_safe_uid(uid) {
-        return json!({ "sourceUid": uid, "sessions": sessions, "skipped": skipped });
+        return json!({
+            "sourceUid": uid,
+            "sessions": sessions,
+            "skipped": skipped,
+            "dataRoot": data_root,
+        });
     }
 
     let history = history_root(root, uid);
@@ -298,7 +310,12 @@ pub fn list_sessions_in(root: &Path, uid: &str) -> Value {
         right_at.cmp(&left_at)
     });
 
-    json!({ "sourceUid": uid, "sessions": sessions, "skipped": skipped })
+    json!({
+        "sourceUid": uid,
+        "sessions": sessions,
+        "skipped": skipped,
+        "dataRoot": data_root,
+    })
 }
 
 /// 会话是否含正文（`index.json` 有 messages，或磁盘 `messages/` 下有文件）。
@@ -590,7 +607,9 @@ impl RemapPlan {
         let mut request_ids: BTreeMap<String, String> = BTreeMap::new();
         let mut used: BTreeSet<String> = BTreeSet::new();
 
-        // 消息 id：来自索引 messages[] 与磁盘 messages/*.json 文件名。
+        // 消息 id：来自索引 messages[]（索引是权威引用，取值按契约即 hex，不做过滤）
+        // 与磁盘 messages/*.json 文件名（只认 32 位小写 hex：目录里的其它 json 如
+        // 调试文件既非消息 id，也不该被改名，原样复制）。
         if let Some(messages) = source_index.get("messages").and_then(Value::as_array) {
             for message in messages {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
@@ -602,7 +621,9 @@ impl RemapPlan {
             for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if let Some(stem) = name.strip_suffix(".json") {
-                    insert_new_id(&mut message_ids, &mut used, stem);
+                    if is_hex32(stem) {
+                        insert_new_id(&mut message_ids, &mut used, stem);
+                    }
                 }
             }
         }
@@ -685,7 +706,7 @@ fn copy_one_conversation(
     let entry = conversation_entry(source_entry.as_ref(), &new_conversation_id);
 
     let before = state.current.clone();
-    merge_workspace_index(&mut state.current, entry);
+    merge_workspace_index(&mut state.current, entry, &new_conversation_id);
     if let Err(error) = state.persist() {
         // 回退本条对索引的改动（保留同工作区其它已成功条目的合并结果）。
         state.current = before;
@@ -730,6 +751,13 @@ fn write_conversation(
             }
             let name = entry.file_name().to_string_lossy().to_string();
             let stem = name.strip_suffix(".json").unwrap_or(&name).to_string();
+            // 只重写 32 位小写 hex 的消息文件；`messages/` 下的其它 json（调试文件、
+            // 扩展自己的锁文件等）一律按字节原样复制——既不改名也不改内容，避免
+            // `remap_message_file` 的重新序列化改变其格式。
+            if !is_hex32(&stem) {
+                std::fs::copy(&path, target_messages.join(&name))?;
+                continue;
+            }
             let new_name = match plan.message_ids.get(&stem) {
                 Some(new_id) => format!("{new_id}.json"),
                 None => name.clone(),
@@ -907,7 +935,7 @@ fn remap_value_recursive(value: &mut Value, plan: &RemapPlan) {
 }
 
 /// 把新会话条目并入工作区索引（保留 `current` 等字段不变，追加到 `conversations[]`）。
-fn merge_workspace_index(index: &mut Value, entry: Value) {
+fn merge_workspace_index(index: &mut Value, entry: Value, new_id: &str) {
     if !index.is_object() {
         *index = json!({});
     }
@@ -922,6 +950,26 @@ fn merge_workspace_index(index: &mut Value, entry: Value) {
     }
     if let Some(array) = conversations.as_array_mut() {
         array.push(entry);
+    }
+
+    // 保证 `current` 存在且指向索引内真实存在的会话：实测（macOS，扩展 4.12）缺 `current`
+    // 的工作区索引会被扩展判定为损坏——改名为 `index.json.corrupted.<ms>` 并重建，同时
+    // 多出一条垃圾空会话（见 acceptance.md §3 / F9）。目标原本的 `current` 仍有效则保留，
+    // 缺失或悬空时指向本次并入的会话。
+    let current_ok = match object.get("current").and_then(Value::as_str) {
+        Some(current) => object
+            .get("conversations")
+            .and_then(Value::as_array)
+            .map(|array| {
+                array
+                    .iter()
+                    .any(|item| item.get("id").and_then(Value::as_str) == Some(current))
+            })
+            .unwrap_or(false),
+        None => false,
+    };
+    if !current_ok {
+        object.insert("current".to_string(), json!(new_id));
     }
 }
 
@@ -1087,6 +1135,130 @@ mod tests {
         assert_eq!(session.get("title").and_then(Value::as_str), Some("测试会话"));
         assert_eq!(session.get("hasHistory").and_then(Value::as_bool), Some(true));
         assert!(session.get("updatedAt").and_then(Value::as_i64).unwrap() > 0);
+        // F3：响应带上解析到的数据根目录（找不到根时为 null，由 list_vscode_sessions 兜底）。
+        let expected_root = fixture.root.to_string_lossy().to_string();
+        assert_eq!(
+            result.get("dataRoot").and_then(Value::as_str),
+            Some(expected_root.as_str())
+        );
+    }
+
+    /// F5 回归：`messages/` 下的非 32-hex 文件名原样复制、原样命名、内文 id 不动；
+    /// 正常 hex 消息文件仍按映射表重命名并同步内文 id，且不产生多余 hex 文件。
+    /// F9 回归：目标工作区原本没有索引时，合并后必须写入 `current`。
+    ///
+    /// 实测（macOS，扩展 4.12）：缺 `current` 的工作区索引会被扩展判为损坏——改名为
+    /// `index.json.corrupted.<ms>` 并重建，同时多出一条垃圾空会话（见 acceptance.md §3）。
+    /// 目标原本 `current` 仍有效则保留的场景由
+    /// `copy_conversation_remaps_ids_and_merges_index` 覆盖。
+    #[test]
+    fn copy_into_empty_workspace_writes_current() {
+        let fixture = Fixture::new("empty-target-ws");
+        seed_source(&fixture);
+
+        let items = vec![CopyItem {
+            workspace_hash: WS.to_string(),
+            conversation_id: CONV_OLD.to_string(),
+        }];
+        let report = copy_sessions_in(&fixture.root, &fixture.backup, SRC_UID, DST_UID, &items)
+            .expect("copy ok");
+        let new_conv = report.get("copied").and_then(Value::as_array).unwrap()[0]
+            .get("newId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+
+        let dst_index = read_json(&fixture.dst_ws_dir().join("index.json")).unwrap();
+        assert_eq!(
+            dst_index.get("current").and_then(Value::as_str),
+            Some(new_conv.as_str()),
+            "空目标工作区合并后必须写入 current"
+        );
+        let bak = read_json(&fixture.dst_ws_dir().join(".index_bak.json")).unwrap();
+        assert_eq!(
+            bak.get("current").and_then(Value::as_str),
+            Some(new_conv.as_str())
+        );
+    }
+
+    #[test]
+    fn copy_keeps_non_hex_message_files_untouched() {
+        let fixture = Fixture::new("non-hex-files");
+        seed_source(&fixture);
+        seed_target_index(&fixture);
+        let src_conv_dir = fixture.src_ws_dir().join(CONV_OLD);
+        // 故意用「带缩进 + 含旧 requestId 引用」的 JSON：若实现对非 hex 文件做解析重写，
+        // 字节会变（缩进丢失、id 被替换），下面的字节级断言即会失败。
+        let notes = format!(
+            "{{\n  \"note\": \"调试笔记，不是消息\",\n  \"extra\": {{ \"requestId\": \"{REQ_1}\" }}\n}}\n"
+        );
+        let legacy = "{\n  \"kind\": \"legacy-index\"\n}\n".to_string();
+        write(&src_conv_dir.join("messages/notes.json"), &notes);
+        write(&src_conv_dir.join("messages/index.json"), &legacy);
+
+        let items = vec![CopyItem {
+            workspace_hash: WS.to_string(),
+            conversation_id: CONV_OLD.to_string(),
+        }];
+        let report = copy_sessions_in(&fixture.root, &fixture.backup, SRC_UID, DST_UID, &items)
+            .expect("copy ok");
+        assert_eq!(
+            report.get("copied").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        // 报告的消息数量仍等于索引内的消息数（非 hex 文件不计入）。
+        assert_eq!(
+            report.get("copied").and_then(Value::as_array).unwrap()[0]
+                .get("messages")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+
+        let new_conv = report.get("copied").and_then(Value::as_array).unwrap()[0]
+            .get("newId")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let target_messages = fixture.dst_ws_dir().join(&new_conv).join("messages");
+
+        // 非 hex 文件：原名存在、内容未改。
+        assert_eq!(
+            std::fs::read_to_string(target_messages.join("notes.json")).unwrap(),
+            notes
+        );
+        assert_eq!(
+            std::fs::read_to_string(target_messages.join("index.json")).unwrap(),
+            legacy
+        );
+
+        // 目录里恰好 4 个文件：2 个 hex 消息（重命名后）+ 2 个非 hex 原样文件，无多余 hex。
+        let names: BTreeSet<String> = std::fs::read_dir(&target_messages)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 4, "目标 messages 目录文件集不符：{names:?}");
+        assert!(names.contains("notes.json") && names.contains("index.json"));
+        for name in &names {
+            if name == "notes.json" || name == "index.json" {
+                continue;
+            }
+            let stem = name.strip_suffix(".json").expect("json 文件名");
+            assert!(is_hex32(stem), "消息文件未被重命名为 hex：{name}");
+            assert_ne!(stem, MSG_1);
+            assert_ne!(stem, MSG_2);
+            // 内文 id 与文件名同步。
+            let value: Value =
+                serde_json::from_str(&std::fs::read_to_string(target_messages.join(name)).unwrap())
+                    .unwrap();
+            assert_eq!(value.get("id").and_then(Value::as_str), Some(stem));
+        }
+
+        // 源目录不被改动（非 hex 文件仍在原位、原名）。
+        assert_eq!(
+            std::fs::read_to_string(src_conv_dir.join("messages/notes.json")).unwrap(),
+            notes
+        );
     }
 
     #[test]
