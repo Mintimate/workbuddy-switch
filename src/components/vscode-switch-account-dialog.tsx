@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -34,6 +35,8 @@ interface Props {
 export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeExtStatus, onDone }: Props) {
   const [sessions, setSessions] = useState<VscodeSession[]>([]);
   const [sourceUid, setSourceUid] = useState<string | null>(null);
+  /** 扩展数据根目录：`null` = 未找到（与「有目录但无会话」区分）；`undefined` = 后端未返回该字段。 */
+  const [dataRoot, setDataRoot] = useState<string | null | undefined>(undefined);
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [copyEnabled, setCopyEnabled] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -48,6 +51,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
     setCopyEnabled(false);
     setSelected(new Set());
     setCollapsed(new Set());
+    setDataRoot(undefined);
     setError("");
     setLoadingSessions(true);
     api
@@ -55,10 +59,12 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
       .then((res) => {
         setSessions(res.sessions);
         setSourceUid(res.sourceUid);
+        setDataRoot(res.dataRoot);
       })
       .catch(() => {
         setSessions([]);
         setSourceUid(null);
+        setDataRoot(undefined);
       })
       .finally(() => setLoadingSessions(false));
   }, [open, account]);
@@ -149,7 +155,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const copyCount = copyEnabled ? selected.size : 0;
   const hasCopyable = groups.length > 0;
   const running = vscodeExtStatus?.running === true;
-  const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, hasCopyable);
+  const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, dataRoot, hasCopyable);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -320,21 +326,24 @@ function selectionState(ids: string[], selected: Set<string>) {
   return { allOn: ids.length > 0 && count === ids.length, someOn: count > 0 && count < ids.length };
 }
 
-/** 统一空态文案：区分未装 VS Code / 未装扩展 / 未登录 / 无会话。 */
+/** 统一空态文案：区分未装 VS Code / 未装扩展 / 未找到数据目录 / 未登录 / 无会话。 */
 function emptyStateHint(
   status: VscodeExtStatus | null | undefined,
   loading: boolean,
   sourceUid: string | null,
+  dataRoot: string | null | undefined,
   hasCopyable: boolean,
 ): string {
   if (loading) return "正在加载会话…";
   if (status && !status.installed) return "未检测到 VS Code，请先安装并登录 CodeBuddy 扩展";
   if (status && !status.extensionInstalled) return "未安装 CodeBuddy 扩展，请先在 VS Code 中安装并登录";
+  if (dataRoot === null) return "未找到 CodeBuddy 扩展数据目录，请先打开 VS Code 并登录 CodeBuddy 扩展";
   if (!sourceUid) return "未检测到 VS Code 扩展当前登录账号，请先在 VS Code 中登录";
   if (!hasCopyable) return "当前账号暂无可复制的会话（无含正文的历史）";
   return "将当前账号勾选的会话以新 id 复制给目标账号（加法，不影响源账号）";
 }
 
+/** 组头三态复选框：全选 / 半选（点击即全选）/ 未选。 */
 function TreeCheckbox({
   allOn,
   someOn,
@@ -347,14 +356,9 @@ function TreeCheckbox({
   ariaLabel: string;
 }) {
   return (
-    <input
-      type="checkbox"
-      className="size-3.5 shrink-0 accent-primary"
-      checked={allOn}
-      ref={(el) => {
-        if (el) el.indeterminate = someOn;
-      }}
-      onChange={onChange}
+    <Checkbox
+      checked={allOn ? true : someOn ? "indeterminate" : false}
+      onCheckedChange={onChange}
       aria-label={ariaLabel}
     />
   );
@@ -371,11 +375,10 @@ function SessionRow({
 }) {
   return (
     <label className="flex cursor-pointer items-center gap-2.5 rounded-md py-1.5 pl-7 pr-2 hover:bg-accent/50">
-      <input
-        type="checkbox"
-        className="size-3.5 shrink-0 accent-primary"
+      <Checkbox
         checked={checked}
-        onChange={onToggle}
+        onCheckedChange={onToggle}
+        aria-label={`选择会话 ${session.title}`}
       />
       <span className="min-w-0 flex-1 truncate text-sm" title={session.title}>
         {session.title}

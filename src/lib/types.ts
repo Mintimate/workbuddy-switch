@@ -742,5 +742,10 @@ export interface VscodeSessionList {
   sessions: VscodeSession[];
   /** 无法解析（损坏）的工作区索引数量。 */
   skipped?: number;
+  /**
+   * 扩展数据根目录；`null` 表示未找到（与「有目录但没有会话」区分）。
+   * 可选：旧后端不返回该字段时为 `undefined`，前端按旧文案处理。
+   */
+  dataRoot?: string | null;
 }
 

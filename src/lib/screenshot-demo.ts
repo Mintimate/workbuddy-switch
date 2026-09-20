@@ -583,6 +583,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "list_vscode_sessions": return {
       sourceUid: demoAccounts[0].uid,
       skipped: 0,
+      dataRoot: "/demo/CodeBuddyExtension/Data",
       sessions: [
         { id: "7f3a91c0d4e5b6a7c8d9e0f1a2b3c4d5", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "完善账号卡片交互", updatedAt: Date.now() - 1000 * 60 * 12, type: "craft", hasHistory: true },
         { id: "9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e", workspaceHash: "3c1f8a92b4d5e60718f9a0b1c2d3e4f5", title: "修复切换后历史为空", updatedAt: Date.now() - 1000 * 60 * 60 * 3, type: "craft", hasHistory: true },
