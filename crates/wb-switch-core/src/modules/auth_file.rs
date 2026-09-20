@@ -243,7 +243,7 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
         .and_then(|a| a.get("accessToken"))
         .cloned()
         .unwrap_or(Value::Null);
-    let expect_token = acc.get("access_token").cloned().unwrap_or(Value::Null);
+    let expect_token = auth_obj.get("accessToken").cloned().unwrap_or(Value::Null);
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
@@ -414,6 +414,36 @@ mod tests {
         assert_eq!(account["nickname"], "同名用户");
         assert!(account["email"].is_null());
         assert_eq!(account["variant"], "cn");
+    }
+
+    /// 回归：`"accessToken": ""`（含纯空白）的登录态必须判为「没有 token」。
+    /// 修复前 `secret_value` 对空串返回 `Some("")`，`imported_account_from_root` 里
+    /// `access_token.is_none()` 的检查拦不住，导入会落库一条空凭据账号；
+    /// `/api/import-local` 也因此不再返回 400「未读取到本地 WorkBuddy 登录信息」。
+    #[test]
+    fn blank_access_token_is_not_imported() {
+        for blank in ["", "   ", "\t\n"] {
+            let imported = imported_account_from_root(
+                json!({
+                    "account": {"uid": "u-1", "nickname": "小明"},
+                    "auth": {"accessToken": blank, "refreshToken": "RT-1"}
+                }),
+                WbVariant::Cn,
+            );
+            assert!(imported.is_none(), "空 accessToken（{blank:?}）不得被导入");
+        }
+
+        // 加密信封不受影响：仍原样保留，切换写回依赖它。
+        let envelope = json!({"$wbEncrypted": 1, "envelope": "enc"});
+        let imported = imported_account_from_root(
+            json!({
+                "account": {"uid": "u-1"},
+                "auth": {"accessToken": envelope.clone()}
+            }),
+            WbVariant::Cn,
+        )
+        .expect("加密信封 accessToken 必须可导入");
+        assert_eq!(imported["access_token"], envelope);
     }
 
     #[test]

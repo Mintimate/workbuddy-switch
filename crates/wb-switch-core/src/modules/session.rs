@@ -7,7 +7,8 @@
 //! WorkBuddy 5.x 数据三件套（缺一不可）：
 //!   1) 正文：`~/.workbuddy/projects/{workspace}/{cid}.jsonl`（JSONL 含 sessionId 字段）
 //!   2) 元数据：`~/.workbuddy/workbuddy.db` sessions 表（id = conversation id = UUID）
-//!   3) 云端映射：`~/.workbuddy/edge-sync-mapping-v2.db` edge_sync_mapping
+//!   3) 云端映射：`~/.workbuddy/edge-sync-mapping-v{N}.db` edge_sync_mapping
+//!      （文件名版本号由客户端演进，按最大版本号动态发现）
 //!      （session_id=conversation_id，msg_channel=convmsg:{uid} 决定云端归属）
 //!
 //! 复制收口（design §4）：所有复制入口统一走 [`copy_sessions_for_switch`]，在同一把
@@ -138,22 +139,55 @@ pub fn workbuddy_db_path(variant: WbVariant) -> PathBuf {
     variant.data_root().join("workbuddy.db")
 }
 
-/// 云端映射库解析：国内版历史为 v2；WorkBuddy 5.6 起国内版也实测迁移到 v4
-/// （`edge_sync_mapping` 表结构与本模块写入语句兼容，2026-09 本机实测）。
-/// 解析顺序：v2 存在则沿用 v2（兼容老版本）；v2 缺失且 v4 存在则回落 v4；
-/// 两者皆无返回 v2 路径（保留既有「云端映射库不存在」错误文案）。国际版固定 v4。
-fn edge_sync_db_path(root: &std::path::Path, variant: WbVariant) -> std::path::PathBuf {
-    let v2 = root.join("edge-sync-mapping-v2.db");
-    let v4 = root.join("edge-sync-mapping-v4.db");
+/// 映射库文件名解析：`edge-sync-mapping.db` 记 0，`edge-sync-mapping-vN.db` 记 N
+/// （N 为整数）。其它名字（含 `-shm` / `-wal` 伴生文件，它们不以 `.db` 结尾）返回 None。
+fn edge_sync_db_version(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let middle = name
+        .strip_prefix("edge-sync-mapping")?
+        .strip_suffix(".db")?;
+    if middle.is_empty() {
+        return Some(0);
+    }
+    let digits = middle.strip_prefix("-v")?;
+    // `u64::parse` also accepts a leading `+`; WorkBuddy's filename contract is
+    // digits only, so reject non-canonical names instead of treating them as candidates.
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// 没有任何候选时返回的默认文件名（保留各档位既有的「云端映射库 xxx 不存在」文案）。
+fn edge_sync_db_default_name(variant: WbVariant) -> &'static str {
     match variant {
-        WbVariant::Ai => v4,
-        WbVariant::Cn => {
-            if v2.is_file() || !v4.is_file() {
-                v2
-            } else {
-                v4
-            }
-        }
+        WbVariant::Cn => "edge-sync-mapping-v2.db",
+        WbVariant::Ai => "edge-sync-mapping-v4.db",
+    }
+}
+
+/// 云端映射库解析：扫描数据根下所有 `edge-sync-mapping*.db`，返回版本号最大的一个。
+///
+/// 写死任何版本都会再次失效：WorkBuddy 客户端自行演进文件名，本机实测 v2（迁移残留）、
+/// v3、v4 并存，而 v3 从未出现在本工具任何代码历史里（2026-09 实测）。
+/// 判据不用 mtime——本工具自身写入会刷新 mtime，按它选会自我强化错误结果；
+/// 也不用行数——需逐个打开数据库，还要处理损坏与锁。两个档位走同一套发现逻辑。
+/// 目录不存在、读取失败或没有任何候选时回落到默认文件名，不得 panic。
+fn edge_sync_db_path(root: &Path, variant: WbVariant) -> PathBuf {
+    let best = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let version = edge_sync_db_version(&path)?;
+            path.is_file().then_some((version, path))
+        })
+        // 同版本号时按路径定序，保证结果与目录遍历顺序无关。
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_path().cmp(b.1.as_path())));
+    match best {
+        Some((_, path)) => path,
+        None => root.join(edge_sync_db_default_name(variant)),
     }
 }
 
@@ -3429,19 +3463,17 @@ mod tests {
             .workbuddy_db()
             .to_string_lossy()
             .ends_with(".workbuddy/workbuddy.db"));
-        // 映射库文件名交给解析器：真实数据根可能只有 v4（WorkBuddy 5.6 迁移），
-        // 这里只断言落在国内版数据根下的 edge-sync-mapping-*.db，具体回落规则
-        // 由 edge_sync_db_falls_back_to_v4_when_v2_missing 用临时目录覆盖。
+        // 映射库文件名交给解析器：真实数据根可能是任意版本（WorkBuddy 5.6 已迁移到
+        // v4 且 v2/v3 残留并存），这里只断言落在国内版数据根下的 edge-sync-mapping-*.db，
+        // 具体发现规则由 edge_sync_db_picks_largest_discovered_version 用临时目录覆盖。
         let cn_edge = cn.edge_sync_db(WbVariant::Cn);
         assert_eq!(cn_edge.parent(), Some(cn.data_root.as_path()));
-        assert!(cn_edge
-            .to_string_lossy()
-            .contains("edge-sync-mapping-"));
+        assert!(cn_edge.to_string_lossy().contains("edge-sync-mapping-"));
 
         let ai = SessionPaths::for_variant(WbVariant::Ai);
         assert_eq!(ai.workbuddy_db().parent(), Some(ai.data_root.as_path()));
         assert_ne!(cn.workbuddy_db(), ai.workbuddy_db());
-        // 国际版实测为 v4 库，不能套用国内版 v2 文件名。
+        // 国际版数据根与国内版不同构，默认文件名为 v4，且同样走动态发现。
         assert!(ai
             .edge_sync_db(WbVariant::Ai)
             .to_string_lossy()
@@ -3463,26 +3495,139 @@ mod tests {
             .ends_with("locks/session-links.lock"));
     }
 
-    #[test]
-    fn edge_sync_db_falls_back_to_v4_when_v2_missing() {
-        // 回归：WorkBuddy 5.6 国内版数据根只有 v4 映射库（v2 已迁移），国内档位
-        // 必须回落 v4，否则会话复制收尾恒失败、切号被永久暂停（2026-09 实测）。
-        let root = temp_root("edge_sync_fallback");
+    /// 在临时数据根里放好给定文件，返回国内版（或指定档位）解析出的映射库文件名。
+    fn edge_sync_pick(variant: WbVariant, files: &[&str]) -> String {
+        let root = temp_root("edge_sync_pick");
         std::fs::create_dir_all(&root).unwrap();
-
-        // 两者皆无：返回 v2 路径，保留既有错误文案。
-        let cn = SessionPaths { data_root: root.clone(), ..SessionPaths::for_variant(WbVariant::Cn) };
-        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v2.db"));
-
-        // 只有 v4：国内档位回落 v4。
-        std::fs::write(root.join("edge-sync-mapping-v4.db"), b"stub").unwrap();
-        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v4.db"));
-
-        // 两者都有：优先 v2（老版本兼容）。
-        std::fs::write(root.join("edge-sync-mapping-v2.db"), b"stub").unwrap();
-        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v2.db"));
-
+        for name in files {
+            std::fs::write(root.join(name), b"stub").unwrap();
+        }
+        let paths = SessionPaths {
+            data_root: root.clone(),
+            ..SessionPaths::for_variant(variant)
+        };
+        let picked = paths
+            .edge_sync_db(variant)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         std::fs::remove_dir_all(&root).unwrap();
+        picked
+    }
+
+    #[test]
+    fn edge_sync_db_picks_largest_discovered_version() {
+        // 回归：WorkBuddy 客户端自行演进映射库文件名（本机实测 v2 迁移残留、v3、v4
+        // 并存，v3 从未出现在本工具代码里）。路径必须动态发现最大版本号，写死任何
+        // 名字都会再次失效——写死 v2 会把登记写进迁移残留库，云端归属随之丢失。
+        // 六种组合：空 / 仅无后缀 / 仅 v2 / v2+v4 / v2+v3+v4 / 仅 v4。
+        let cn = WbVariant::Cn;
+        assert_eq!(edge_sync_pick(cn, &[]), "edge-sync-mapping-v2.db");
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping.db"]),
+            "edge-sync-mapping.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v0.db"]),
+            "edge-sync-mapping-v0.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v2.db"]),
+            "edge-sync-mapping-v2.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v2.db", "edge-sync-mapping-v4.db"]),
+            "edge-sync-mapping-v4.db"
+        );
+        assert_eq!(
+            edge_sync_pick(
+                cn,
+                &[
+                    "edge-sync-mapping-v2.db",
+                    "edge-sync-mapping-v3.db",
+                    "edge-sync-mapping-v4.db",
+                ]
+            ),
+            "edge-sync-mapping-v4.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v4.db"]),
+            "edge-sync-mapping-v4.db"
+        );
+
+        // 伴生文件（-shm / -wal）不是候选；更高版本出现时自动适配。
+        assert_eq!(
+            edge_sync_pick(
+                cn,
+                &[
+                    "edge-sync-mapping-v4.db",
+                    "edge-sync-mapping-v4.db-shm",
+                    "edge-sync-mapping-v4.db-wal",
+                ]
+            ),
+            "edge-sync-mapping-v4.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v4.db", "edge-sync-mapping-v5.db"]),
+            "edge-sync-mapping-v5.db"
+        );
+
+        // 版本号只接受十进制数字：前导零仍按数值比较；非数字、溢出、大小写差异和
+        // 额外前后缀都静默忽略，避免把相似但非 WorkBuddy 文件误当成映射库。
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v01.db"]),
+            "edge-sync-mapping-v01.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v01.db", "edge-sync-mapping-v1.db"]),
+            "edge-sync-mapping-v1.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v+9.db"]),
+            "edge-sync-mapping-v2.db"
+        );
+        assert_eq!(
+            edge_sync_pick(cn, &["edge-sync-mapping-v18446744073709551616.db"]),
+            "edge-sync-mapping-v2.db"
+        );
+        assert_eq!(
+            edge_sync_pick(
+                cn,
+                &[
+                    "edge-sync-mapping-vx.db",
+                    "Edge-sync-mapping-v9.db",
+                    "prefix-edge-sync-mapping-v9.db",
+                    "edge-sync-mapping-v9.db.bak",
+                    "edge-sync-mapping-v9-extra.db",
+                ]
+            ),
+            "edge-sync-mapping-v2.db"
+        );
+
+        // 国际版走同一套发现逻辑（不再写死 v4）。
+        assert_eq!(
+            edge_sync_pick(WbVariant::Ai, &[]),
+            "edge-sync-mapping-v4.db"
+        );
+        assert_eq!(
+            edge_sync_pick(
+                WbVariant::Ai,
+                &["edge-sync-mapping-v4.db", "edge-sync-mapping-v6.db"]
+            ),
+            "edge-sync-mapping-v6.db"
+        );
+
+        // 目录不存在：安全回落到默认文件名，不 panic（调用方据此报「云端映射库不存在」）。
+        let missing = temp_root("edge_sync_missing");
+        assert_eq!(
+            edge_sync_db_path(&missing, cn),
+            missing.join("edge-sync-mapping-v2.db")
+        );
+        assert_eq!(
+            edge_sync_db_path(&missing, WbVariant::Ai),
+            missing.join("edge-sync-mapping-v4.db")
+        );
     }
 
     fn temp_root(name: &str) -> PathBuf {

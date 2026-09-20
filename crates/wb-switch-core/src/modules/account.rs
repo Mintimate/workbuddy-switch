@@ -134,18 +134,18 @@ pub fn get_str(v: &Value, key: &str) -> Option<String> {
 /// 被当作 React 子节点渲染导致整树卸载（白屏）。
 pub fn display_value(acc: &Value, key: &str) -> Value {
     match acc.get(key) {
-        Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null)) => {
-            v.clone()
-        }
+        Some(v @ (Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null)) => v.clone(),
         _ => Value::Null,
     }
 }
 
 /// 字段值读取：接受明文字符串或 WorkBuddy 5.6 加密信封对象，其他类型返回 None。
 /// 信封在本机同一 keyblob 下可由 WorkBuddy 自行解密，导入与切换写回时需原样保留。
+/// 空白字符串按「没有值」处理（与 `get_str` 的空值语义一致）：否则 auth 文件里的
+/// `"accessToken": ""` 会被判为已有 token，导入一条空凭据账号。
 pub fn secret_value(v: &Value, key: &str) -> Option<Value> {
     match v.get(key) {
-        Some(s @ Value::String(_)) => Some(s.clone()),
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(Value::String(s.clone())),
         Some(o @ Value::Object(map)) if map.contains_key("$wbEncrypted") => Some(o.clone()),
         _ => None,
     }
