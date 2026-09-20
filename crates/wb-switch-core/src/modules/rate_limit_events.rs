@@ -11,7 +11,7 @@
 //! - **消费方式**：记 offset + 到 1 MB 轮转（`rename` 后再读旧 inode 的增量），不裁剪写入方
 //!   正在追加的文件；轮转失败不动文件，宁可继续增长也不丢事件。
 //! - **CLI 归因**：key 是**进程级快照**（切换只对新进程生效）。本轮起「活进程 key ==
-//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/model-rate-limits.md`）：
+//!   当前账号」是显式不变式（INV，见 `.trellis/spec/wb-switch-core/backend/rate-limit-ledger.md`）：
 //!   手动切换先关进程再写 `state.json`，自动轮换只在没有存活会话时才切。因此归因只需
 //!   「读当前账号 + 一个陈旧守卫」：取「该会话进程的启动时刻」（`sessions/<pid>.json` 的
 //!   `startedAt`，兜底 transcript 首行），`startedAt ≥ state.json mtime` → 当前账号；
@@ -108,6 +108,9 @@ fn save_state(path: &Path, state: &State) -> std::io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// hook payload 里本模块用到的字段（其余字段与版本差异一律忽略）。
+///
+/// 历史事件行可能带已废弃的 `_hookTs`（旧脚本写入的时刻锚）：它不在结构里，
+/// `serde` 默认忽略未知字段，因此这些行照常消费。
 #[derive(Deserialize)]
 struct HookPayload {
     #[serde(default)]
@@ -150,6 +153,9 @@ fn parse_quota_line(line: &str) -> Option<QuotaEvent> {
     }
     // 取不到官方恢复时刻就不是可入账的限额事件（不猜时间）。
     let reset_at = limits::parse_reset_at(message)?;
+    // 模型直接采用**本次 payload** 的字段：它是 429 当轮客户端侧选定的模型，
+    // 与失败请求同轮（不读 transcript 全文猜模型 —— 延迟消费时那段文本已经属于
+    // 之后的轮次，会给出别的模型，2026-09-19 实证假 chip）。
     let model = payload
         .model
         .filter(|model| !MODEL_SENTINELS.contains(&model.as_str()))
@@ -410,7 +416,13 @@ fn complete_lines(bytes: &[u8]) -> (Vec<String>, u64) {
         return (Vec::new(), 0);
     };
     let consumed = (last_newline + 1) as u64;
-    let text = String::from_utf8_lossy(&bytes[..last_newline]);
+    let mut text = String::from_utf8_lossy(&bytes[..last_newline]).into_owned();
+    // Windows PowerShell 5.1 的 `Add-Content -Encoding UTF8` **创建文件时**会写 BOM：
+    // 首行带 `\u{feff}` 前缀，serde_json 解析必失败 ⇒ hook 装好后的**第一个**限额事件
+    // 会被静默丢弃（2026-09-18 本机实证）。只在文本开头剥一次，开销可忽略。
+    if text.starts_with('\u{feff}') {
+        text.remove(0);
+    }
     let lines = text
         .lines()
         .map(|line| line.trim().to_string())
@@ -629,6 +641,26 @@ mod tests {
         .to_string()
     }
 
+    /// 带废弃字段 `_hookTs` 的限额 payload（旧脚本写入的历史事件行形态）。
+    ///
+    /// 该字段已从消费端移除，但事件文件是 append-only 的：历史行必须照常消费。
+    fn legacy_stop_payload_with_hook_ts(
+        session: &str,
+        model: &str,
+        transcript: &Path,
+        hook_ts: i64,
+    ) -> String {
+        json!({
+            "session_id": session,
+            "transcript_path": transcript.to_string_lossy(),
+            "hook_event_name": "Stop",
+            "model": model,
+            "_hookTs": hook_ts,
+            "last_assistant_message": "429 您的使用量已超出频率限制，将在 2026-09-17 17:59:27 UTC+8 重置，您也可以切换其他模型继续使用。",
+        })
+        .to_string()
+    }
+
     fn absent_lookup(_variant: WbVariant, _session: &str) -> Option<String> {
         None
     }
@@ -636,6 +668,14 @@ mod tests {
     /// 临时环境：所有路径都在 tempdir 下，绝不触碰真实用户配置。
     struct Fixture {
         root: PathBuf,
+    }
+
+    /// 测试结束自动清理 tempdir：不清理的话每轮 cargo test 留 20+ 个残留目录
+    /// （2026-09-18 实证 127 个，且目录名与事件文件形态酷似「沙箱写入」，误导过排查方向）。
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
     }
 
     impl Fixture {
@@ -853,6 +893,115 @@ mod tests {
         let (lines, consumed) = complete_lines(b"\n\n{\"a\":1}\n");
         assert_eq!(lines, vec!["{\"a\":1}"]);
         assert_eq!(consumed, 10);
+    }
+
+    /// 事件文件首行带 UTF-8 BOM（Windows PowerShell 5.1 `Add-Content -Encoding UTF8`
+    /// 建文件时的实测行为）不得吞掉第一个限额事件，也不得打乱按**字节**推进的消费偏移。
+    #[test]
+    fn utf8_bom_on_the_first_line_does_not_kill_the_first_event() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-bom";
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(
+            fixture.events(),
+            format!(
+                "\u{feff}{}\n",
+                stop_payload(session, "hy3", &fixture.cli_transcript(session))
+            ),
+        )
+        .expect("带 BOM 的事件文件");
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, 1_000), Some(true));
+        assert_eq!(state.events.len(), 1, "BOM 前缀不得让首行解析失败");
+        // 偏移以字节计（BOM 也算在内）：文件被消费完，下一轮不会重复入账。
+        assert_eq!(
+            state.offset,
+            std::fs::metadata(fixture.events()).expect("事件文件").len()
+        );
+        assert_eq!(
+            consume_with(&ctx, &mut state, 1_001),
+            None,
+            "无新字节不重复消费"
+        );
+    }
+
+    /// 事件模型来自**当次 payload**：切到 B 后的首个请求被限（429 轮次没有响应行），
+    /// 延迟消费期间会话又切到 C —— 事件必须仍记为 B。
+    ///
+    /// 回归 2026-09-20 审查反例：曾按 transcript 全文重判模型，会取到上一轮的 A
+    /// （时间上界只截到「最新一条模型行」），把 payload 里正确的 B 覆盖掉。
+    #[test]
+    fn event_model_comes_from_the_current_payload_not_the_transcript() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-switched";
+        let transcript = fixture.cli_transcript(session);
+        std::fs::create_dir_all(transcript.parent().expect("父目录")).expect("transcript 目录");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                // 上一轮用 A 成功（事件之前的最后一个 assistant 轮次）。
+                json!({ "type": "message", "timestamp": 900_000, "providerData": { "model": "model-a" } }),
+                // 事件之后主人切到 C 继续会话（延迟消费时已在文件里）。
+                json!({ "type": "message", "timestamp": 1_060_000, "providerData": { "model": "model-c" } })
+            ),
+        )
+        .expect("写 transcript");
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(
+            fixture.events(),
+            format!("{}\n", stop_payload(session, "model-b", &transcript)),
+        )
+        .expect("事件文件");
+
+        let mut state = State::default();
+        // 事件写入在 1 000 000，消费推迟到 1 200 000（transcript 已含切到 C 的新轮次）。
+        assert_eq!(consume_with(&ctx, &mut state, 1_200_000), Some(true));
+        assert_eq!(state.events.len(), 1);
+        assert_eq!(
+            state.events[0].model.as_deref(),
+            Some("model-b"),
+            "模型必须取当次 payload，不得被 transcript 里的其它轮次覆盖"
+        );
+    }
+
+    /// 旧脚本写入的事件行带已废弃字段 `_hookTs`：仍须照常消费（事件文件是 append-only 的）。
+    #[test]
+    fn legacy_events_with_the_retired_hook_ts_field_are_still_consumed() {
+        let fixture = Fixture::new();
+        let lookup = absent_lookup;
+        let ctx = fixture.context(vec![cli_account()], &lookup);
+        fixture.write_cli_state("acc-cli");
+        set_state_mtime(&fixture, 1);
+        let session = "s-legacy";
+        fixture.write_session_registry(4242, session, 500);
+        std::fs::write(
+            fixture.events(),
+            format!(
+                "{}\n",
+                legacy_stop_payload_with_hook_ts(
+                    session,
+                    "hy3",
+                    &fixture.cli_transcript(session),
+                    1_000_000
+                )
+            ),
+        )
+        .expect("事件文件");
+
+        let mut state = State::default();
+        assert_eq!(consume_with(&ctx, &mut state, 1_200_000), Some(true));
+        assert_eq!(state.events.len(), 1, "未知字段不得让整行解析失败");
+        assert_eq!(state.events[0].model.as_deref(), Some("hy3"));
     }
 
     #[test]
