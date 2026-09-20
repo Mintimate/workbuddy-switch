@@ -363,20 +363,25 @@ mod tests {
     #[test]
     fn auth_file_path_covers_three_platforms() {
         let home = Path::new("/home/tester");
+        // 比较 Path 而非 to_string_lossy：Windows 的 Path::join 产出 `\` 分隔符，
+        // 写死正斜杠的字符串断言会在 Windows 上失败——分隔符不是被测行为的一部分。
         let cn = WbVariant::Cn.auth_file_path_at(home, HostOs::Macos);
         assert_eq!(
-            cn.to_string_lossy(),
-            "/home/tester/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn,
+            home.join("Library/Application Support/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
         let cn_win = WbVariant::Cn.auth_file_path_at(home, HostOs::Windows);
         assert_eq!(
-            cn_win.to_string_lossy(),
-            "/home/tester/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn_win,
+            home.join("AppData/Local/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
         let cn_linux = WbVariant::Cn.auth_file_path_at(home, HostOs::Linux);
         assert_eq!(
-            cn_linux.to_string_lossy(),
-            "/home/tester/.local/share/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info"
+            cn_linux,
+            home.join(".local/share/CodeBuddyExtension/Data/Public/auth")
+                .join("workbuddy-desktop.info")
         );
 
         for os in [HostOs::Macos, HostOs::Windows, HostOs::Linux] {
@@ -461,14 +466,13 @@ mod tests {
             WbVariant::Ai.macos_bundle_id(),
             "com.workbuddy.workbuddy-ai"
         );
-        assert_eq!(
-            WbVariant::Cn.macos_default_app_path().to_string_lossy(),
-            "/Applications/WorkBuddy.app"
-        );
-        assert_eq!(
-            WbVariant::Ai.macos_default_app_path().to_string_lossy(),
-            "/Applications/WorkBuddy AI.app"
-        );
+        // 断言父目录与文件名，而不是整串字符串：Windows 上 join 产出 `\`。
+        let cn_app = WbVariant::Cn.macos_default_app_path();
+        assert_eq!(cn_app.parent(), Some(Path::new("/Applications")));
+        assert_eq!(cn_app.file_name().unwrap(), "WorkBuddy.app");
+        let ai_app = WbVariant::Ai.macos_default_app_path();
+        assert_eq!(ai_app.parent(), Some(Path::new("/Applications")));
+        assert_eq!(ai_app.file_name().unwrap(), "WorkBuddy AI.app");
     }
 
     #[test]
