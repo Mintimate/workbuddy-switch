@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tauri::menu::{CheckMenuItem, Menu, MenuBuilder, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, Runtime, WebviewWindowBuilder, Window, WindowEvent,
 };
@@ -37,16 +37,19 @@ pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         .icon_as_template(cfg!(target_os = "macos"))
         .tooltip(DEFAULT_TOOLTIP)
         .menu(&menu)
-        // 菜单仅在右键单击时弹出；左键单击唤起主界面（见 on_tray_icon_event）。
-        .show_menu_on_left_click(false)
+        // 左键弹菜单只保留在 macOS：菜单栏图标的惯例本就是左键展开菜单。
+        // Windows 的惯例相反——左键唤起主界面、右键出菜单，见 on_tray_icon_event。
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click {
-                button: tauri::tray::MouseButton::Left,
-                button_state: tauri::tray::MouseButtonState::Up,
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
                 ..
             } = event
             {
-                show_main_window(tray.app_handle());
+                if should_wake_main_window(button, button_state) {
+                    show_main_window(tray.app_handle());
+                }
             }
         })
         .on_menu_event(|app, event| match event.id().as_ref() {
@@ -148,6 +151,20 @@ pub fn on_run_event(event: RunEvent) {
 
 fn should_keep_tray_alive(code: Option<i32>) -> bool {
     code.is_none()
+}
+
+/// 托盘左键单击（抬起）是否应唤起主窗口。
+///
+/// - macOS：`show_menu_on_left_click` 保持 true，左键展开菜单；但 mouseUp 仍会派发
+///   `Click`，所以这里必须显式返回 false，否则左键会「既弹菜单又唤窗」。
+/// - Linux：Tauri 不派发 `TrayIconEvent`（仅 Windows / macOS 支持），该分支不会触发，
+///   托盘点击行为仍由 libappindicator 决定（左右键都会出菜单）。
+fn should_wake_main_window(button: MouseButton, button_state: MouseButtonState) -> bool {
+    !cfg!(target_os = "macos")
+        && matches!(
+            (button, button_state),
+            (MouseButton::Left, MouseButtonState::Up)
+        )
 }
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
@@ -518,8 +535,9 @@ fn tray_icon() -> tauri::image::Image<'static> {
 ///
 /// 为什么不能用模板素材：Windows 没有「模板图标」概念，`icon_as_template` 会被忽略，
 /// 单色（白）剪影在浅色任务栏上会显示为纯白方块（深色任务栏则几乎不可见）。
-/// 这里直接用 32×32 彩色素材（贴近 Windows 托盘实际尺寸，减少系统二次缩放导致的模糊）（由 `scripts/gen-tray-icon.py` 预解码入库为 raw RGBA，
-/// 避免为此启用 `image-png` feature 引入 PNG 解码依赖）。
+/// 这里直接用 32×32 彩色素材（贴近 Windows 托盘实际尺寸，减少系统二次缩放导致的模糊）；
+/// 素材由 `scripts/gen-tray-icon.py` 从 `public/icon-transparent.png` 预解码入库为
+/// raw RGBA，避免为此启用 `image-png` feature 引入 PNG 解码依赖。
 #[cfg(not(target_os = "macos"))]
 fn tray_icon() -> tauri::image::Image<'static> {
     const ICON: &[u8; 32 * 32 * 4] = include_bytes!(concat!(
@@ -566,8 +584,8 @@ fn format_checkin_tooltip(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_checkin_tooltip, is_silent_startup, tray_icon, should_activate_on_second_launch,
-        should_keep_tray_alive,
+        format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
+        should_keep_tray_alive, should_wake_main_window, tray_icon, MouseButton, MouseButtonState,
     };
     use serde_json::json;
 
@@ -589,11 +607,10 @@ mod tests {
             .any(|pixel| (1..=254).contains(&pixel[3])));
     }
 
-
     /// 非 macOS 平台：托盘图标必须是**彩色**的，避免再次退化成白块。
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn tray_icon_is_colored_and_opaque() {
+    fn tray_icon_is_colored_on_transparent_background() {
         let icon = tray_icon();
         assert_eq!((icon.width(), icon.height()), (32, 32));
         let px: Vec<&[u8]> = icon.rgba().chunks_exact(4).collect();
@@ -602,15 +619,39 @@ mod tests {
             px.iter().any(|p| p[3] == 0),
             "背景必须透明：满幅不透明方图会在深色任务栏上显示为白底方块"
         );
-        let colored = px
-            .iter()
-            .filter(|p| p[3] > 200)
-            .any(|p| (p[0] as i32 - p[1] as i32).abs() > 12
+        let colored = px.iter().filter(|p| p[3] > 200).any(|p| {
+            (p[0] as i32 - p[1] as i32).abs() > 12
                 || (p[1] as i32 - p[2] as i32).abs() > 12
-                || (p[0] as i32 - p[2] as i32).abs() > 12);
-        assert!(colored, "托盘图标必须是彩色的（Windows 不支持模板图标语义）");
+                || (p[0] as i32 - p[2] as i32).abs() > 12
+        });
+        assert!(
+            colored,
+            "托盘图标必须是彩色的（Windows 不支持模板图标语义）"
+        );
     }
 
+    /// 左键「抬起」才唤窗；右键、按下都不唤窗。
+    ///
+    /// macOS 例外：左键要留给菜单，唤窗判定必须为 false。
+    #[test]
+    fn tray_left_click_release_wakes_main_window_only_off_macos() {
+        assert_eq!(
+            should_wake_main_window(MouseButton::Left, MouseButtonState::Up),
+            !cfg!(target_os = "macos")
+        );
+        assert!(!should_wake_main_window(
+            MouseButton::Left,
+            MouseButtonState::Down
+        ));
+        assert!(!should_wake_main_window(
+            MouseButton::Right,
+            MouseButtonState::Up
+        ));
+        assert!(!should_wake_main_window(
+            MouseButton::Middle,
+            MouseButtonState::Up
+        ));
+    }
     #[test]
     fn silent_startup_matches_exact_hidden_arg() {
         assert!(is_silent_startup(["--hidden"]));
