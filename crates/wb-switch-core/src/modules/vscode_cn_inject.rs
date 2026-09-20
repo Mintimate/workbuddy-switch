@@ -1,12 +1,15 @@
-//! Electron/Chromium Safe Storage 注入（参数化：CodeBuddy CN IDE 与 VS Code 扩展共用）。
+//! Electron/Chromium Safe Storage 注入（参数化：CodeBuddy 桌面 IDE 与 VS Code 扩展共用）。
 //!
 //! 把账号会话 JSON 加密写入 `state.vscdb` 的 ItemTable，键形如
 //! `secret://{"extensionId":"<ext>","key":"<key>"}`。
 //!
 //! 各目标之间的差异点（数据目录 / secret key / macOS Keychain 服务名 /
 //! Linux `secret-tool` 应用名）全部收敛在 [`VscodeSafeStorageTarget`] 描述符，
-//! CodeBuddy CN IDE（`codebuddy_cn_ide`）与 VS Code CodeBuddy 扩展（`vscode_ext`）
-//! 复用同一套加解密与读写流程。
+//! CodeBuddy CN IDE（`codebuddy_cn_ide`）、CodeBuddy 国际版 IDE（`codebuddy_ide`）
+//! 与 VS Code CodeBuddy 扩展（`vscode_ext`）复用同一套加解密与读写流程。
+//!
+//! 桌面 IDE 的「国内 CN / 国际版」档位用 [`CodeBuddyIdeFlavor`] 表达，
+//! 并映射到对应的 [`VscodeSafeStorageTarget`] 常量描述符。
 //!
 //! 平台加密模型对齐 Chromium/Electron Safe Storage：
 //! - macOS: Keychain「<app> Safe Storage」→ PBKDF2-SHA1(1003) → AES-128-CBC `v10`
@@ -56,6 +59,8 @@ const SALT: &[u8] = b"saltysalt";
 pub const SECRET_EXTENSION_ID: &str = "tencent-cloud.coding-copilot";
 /// CodeBuddy CN IDE 的 secret key（secret key 中的 `key`）。
 pub const SECRET_KEY: &str = "planning-genie.new.accessTokencn";
+/// CodeBuddy 国际版 IDE 的 secret key（secret key 中的 `key`）。
+pub const INTL_SECRET_KEY: &str = "planning-genie.new.accessToken";
 
 /// 一个「基于 Electron/Chromium Safe Storage」的应用目标描述符。
 ///
@@ -86,6 +91,70 @@ pub const CODEBUDDY_CN_TARGET: VscodeSafeStorageTarget = VscodeSafeStorageTarget
     linux_secret_tool_app_names: &["CodeBuddy CN", "codebuddy cn", "codebuddy-cn", "codebuddycn"],
 };
 
+/// CodeBuddy 国际版 IDE（桌面客户端）目标描述符。
+pub const CODEBUDDY_INTL_TARGET: VscodeSafeStorageTarget = VscodeSafeStorageTarget {
+    data_dir_resolver: codebuddy_intl_data_dir,
+    display_name: "CodeBuddy",
+    secret_item_prefix_extension_id: SECRET_EXTENSION_ID,
+    secret_key: INTL_SECRET_KEY,
+    macos_keychain_service: "CodeBuddy Safe Storage",
+    linux_secret_tool_app_names: &["CodeBuddy", "codebuddy"],
+};
+
+/// CodeBuddy 桌面 IDE 档位：国内 CN 与国际版共用加密，密钥/目录不同。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeBuddyIdeFlavor {
+    Cn,
+    Intl,
+}
+
+impl CodeBuddyIdeFlavor {
+    pub fn product_label(self) -> &'static str {
+        match self {
+            Self::Cn => "CodeBuddy CN",
+            Self::Intl => "CodeBuddy",
+        }
+    }
+
+    pub fn data_dir_name(self) -> &'static str {
+        self.product_label()
+    }
+
+    pub fn secret_key(self) -> &'static str {
+        match self {
+            Self::Cn => SECRET_KEY,
+            Self::Intl => INTL_SECRET_KEY,
+        }
+    }
+
+    pub fn keychain_service(self) -> &'static str {
+        match self {
+            Self::Cn => "CodeBuddy CN Safe Storage",
+            Self::Intl => "CodeBuddy Safe Storage",
+        }
+    }
+
+    pub fn linux_secret_apps(self) -> &'static [&'static str] {
+        match self {
+            Self::Cn => &[
+                "CodeBuddy CN",
+                "codebuddy cn",
+                "codebuddy-cn",
+                "codebuddycn",
+            ],
+            Self::Intl => &["CodeBuddy", "codebuddy"],
+        }
+    }
+
+    /// 映射到对应的静态目标描述符。
+    pub fn target(self) -> &'static VscodeSafeStorageTarget {
+        match self {
+            Self::Cn => &CODEBUDDY_CN_TARGET,
+            Self::Intl => &CODEBUDDY_INTL_TARGET,
+        }
+    }
+}
+
 /// ItemTable 完整 key（默认目标 = CodeBuddy CN，保持既有行为）。
 pub fn secret_storage_item_key() -> String {
     secret_storage_item_key_for(&CODEBUDDY_CN_TARGET)
@@ -99,20 +168,35 @@ pub fn secret_storage_item_key_for(target: &VscodeSafeStorageTarget) -> String {
     )
 }
 
-/// CodeBuddy CN 数据目录（保持既有行为）。
-pub fn codebuddy_cn_data_dir() -> Option<PathBuf> {
+/// CodeBuddy 桌面 IDE 数据目录（按档位区分 CN / 国际版）。
+pub fn codebuddy_ide_data_dir(flavor: CodeBuddyIdeFlavor) -> Option<PathBuf> {
+    let name = flavor.data_dir_name();
     #[cfg(target_os = "macos")]
     {
-        Some(crate::modules::config::home_dir().join("Library/Application Support/CodeBuddy CN"))
+        Some(
+            crate::modules::config::home_dir()
+                .join("Library/Application Support")
+                .join(name),
+        )
     }
     #[cfg(target_os = "windows")]
     {
-        dirs::data_dir().map(|d| d.join("CodeBuddy CN"))
+        dirs::data_dir().map(|d| d.join(name))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        dirs::config_dir().map(|d| d.join("CodeBuddy CN"))
+        dirs::config_dir().map(|d| d.join(name))
     }
+}
+
+/// CodeBuddy CN 数据目录（保持既有行为）。
+pub fn codebuddy_cn_data_dir() -> Option<PathBuf> {
+    codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Cn)
+}
+
+/// CodeBuddy 国际版数据目录。
+pub fn codebuddy_intl_data_dir() -> Option<PathBuf> {
+    codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Intl)
 }
 
 /// CodeBuddy CN state.vscdb 路径（保持既有行为）。
@@ -518,6 +602,14 @@ pub fn read_codebuddy_cn_secret(user_data_dir: Option<&Path>) -> Result<Option<S
     read_secret_for(&CODEBUDDY_CN_TARGET, user_data_dir)
 }
 
+/// 读取并解密指定桌面 IDE 档位的 secret（明文 JSON 字符串）。
+pub fn read_codebuddy_ide_secret(
+    flavor: CodeBuddyIdeFlavor,
+    user_data_dir: Option<&Path>,
+) -> Result<Option<String>, String> {
+    read_secret_for(flavor.target(), user_data_dir)
+}
+
 /// 读取并解密指定目标的 secret（明文 JSON 字符串）。
 pub fn read_secret_for(
     target: &VscodeSafeStorageTarget,
@@ -552,6 +644,15 @@ pub fn inject_codebuddy_cn_secret(
     user_data_dir: Option<&Path>,
 ) -> Result<PathBuf, String> {
     inject_secret_for(&CODEBUDDY_CN_TARGET, plaintext, user_data_dir)
+}
+
+/// 加密并写入指定桌面 IDE 档位的 secret。
+pub fn inject_codebuddy_ide_secret(
+    flavor: CodeBuddyIdeFlavor,
+    plaintext: &str,
+    user_data_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    inject_secret_for(flavor.target(), plaintext, user_data_dir)
 }
 
 /// 加密并写入指定目标 secret。
@@ -633,6 +734,29 @@ mod tests {
             key,
             r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessTokencn"}"#
         );
+        assert_eq!(
+            secret_storage_item_key_for(&CODEBUDDY_INTL_TARGET),
+            r#"secret://{"extensionId":"tencent-cloud.coding-copilot","key":"planning-genie.new.accessToken"}"#
+        );
+        assert_eq!(
+            CodeBuddyIdeFlavor::Intl.keychain_service(),
+            "CodeBuddy Safe Storage"
+        );
+        assert_ne!(
+            CodeBuddyIdeFlavor::Cn.secret_key(),
+            CodeBuddyIdeFlavor::Intl.secret_key()
+        );
+    }
+
+    #[test]
+    fn flavor_target_matches_flavor_fields() {
+        for flavor in [CodeBuddyIdeFlavor::Cn, CodeBuddyIdeFlavor::Intl] {
+            let target = flavor.target();
+            assert_eq!(target.secret_key, flavor.secret_key());
+            assert_eq!(target.macos_keychain_service, flavor.keychain_service());
+            assert_eq!(target.linux_secret_tool_app_names, flavor.linux_secret_apps());
+            assert_eq!(target.display_name, flavor.product_label());
+        }
     }
 
     #[test]
@@ -660,6 +784,14 @@ mod tests {
         assert!(
             s.contains("CodeBuddy CN"),
             "data dir should contain CodeBuddy CN: {s}"
+        );
+        let Some(intl) = codebuddy_ide_data_dir(CodeBuddyIdeFlavor::Intl) else {
+            return;
+        };
+        let intl_s = intl.to_string_lossy();
+        assert!(
+            intl_s.contains("CodeBuddy") && !intl_s.contains("CodeBuddy CN"),
+            "intl data dir should be CodeBuddy not CN: {intl_s}"
         );
     }
 

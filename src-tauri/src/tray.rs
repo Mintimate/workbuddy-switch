@@ -363,7 +363,7 @@ fn start_checkin_all<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let _busy = CheckinBusyGuard { app: app.clone() };
-        let payload = checkin::run_checkin_all().await;
+        let payload = checkin::run_checkin_all(None).await;
         let text = format_checkin_tooltip(&payload);
         if checkin_succeeded(&payload) {
             notify_checkin(&app, &text);
@@ -384,6 +384,29 @@ fn notify_checkin<R: Runtime>(app: &AppHandle<R>, body: &str) {
         .show();
 }
 
+/// 投递 core 组装好的自动轮换推迟提示（`rotate::run_rotate_cycle` 返回体里的 `notify`）。
+///
+/// 走系统通知而不是托盘 tooltip：轮换是后台行为，用户此时多半没看着窗口。
+/// 标题与正文都取自 core（文案唯一构造点在 `rotate`），宿主不自造措辞；
+/// 无头 server 不投递，只保留日志与返回字段。
+pub fn notify_rotate_deferred<R: Runtime>(app: &AppHandle<R>, notify: &Value) {
+    let title = notify
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("workbuddy-switch");
+    let Some(body) = notify.get("body").and_then(Value::as_str) else {
+        return;
+    };
+    if body.is_empty() {
+        return;
+    }
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// 是否应弹签到完成通知。
+///
+/// `inactive`（该档位未开放签到活动，如国际版）不是失败：它既不算成功也不重试，
+/// 因此不阻断通知；`error` 仍然算失败。
 fn checkin_succeeded(value: &Value) -> bool {
     let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
         return false;
@@ -392,7 +415,7 @@ fn checkin_succeeded(value: &Value) -> bool {
         && accounts.iter().all(|account| {
             matches!(
                 account.get("result").and_then(Value::as_str),
-                Some("success" | "already")
+                Some("success" | "already" | "inactive")
             )
         })
 }
@@ -428,6 +451,8 @@ fn refresh_tray_menu<R: Runtime>(app: &AppHandle<R>) {
 fn build_tray_menu<R: Runtime, M: Manager<R>>(app: &M) -> tauri::Result<Menu<R>> {
     let open_item = MenuItem::with_id(app, "open-main-window", "打开主界面", true, None::<&str>)?;
     let github_item = MenuItem::with_id(app, "open-github", "打开 GitHub", true, None::<&str>)?;
+    // 档位区分在 core 判定：无签到活动的档位（国际版）不参与「待签到」集合，
+    // 否则这些账号永远不会产生签到日志，托盘会一直显示「可签到」。
     let checked_in = checkin::all_accounts_checked_in_today();
     let (checkin_label, checkin_enabled) = if CHECKIN_BUSY.load(Ordering::Acquire) {
         ("一键签到", false)
@@ -488,15 +513,22 @@ fn format_checkin_tooltip(value: &Value) -> String {
     let mut ok = 0;
     let mut already = 0;
     let mut err = 0;
+    let mut inactive = 0;
     for account in accounts {
         match account.get("result").and_then(Value::as_str) {
             Some("success") => ok += 1,
             Some("already") => already += 1,
             Some("error") => err += 1,
+            Some("inactive") => inactive += 1,
             _ => {}
         }
     }
-    format!("签到完成：成功 {ok}，已签 {already}，失败 {err}")
+    let mut text = format!("签到完成：成功 {ok}，已签 {already}，失败 {err}");
+    // 国际版无签到活动：单列「未开放」，避免被误读成失败或漏报。
+    if inactive > 0 {
+        text.push_str(&format!("，未开放 {inactive}"));
+    }
+    text
 }
 
 #[cfg(test)]
@@ -612,6 +644,21 @@ mod tests {
         );
     }
 
+    /// 国际版账号签到结果为 inactive：单列「未开放」，不计入失败。
+    #[test]
+    fn tooltip_separates_inactive_variant_results() {
+        let payload = json!({
+            "accounts": [
+                {"result": "success", "variant": "cn"},
+                {"result": "inactive", "inactive": true, "variant": "ai"}
+            ]
+        });
+        assert_eq!(
+            format_checkin_tooltip(&payload),
+            "签到完成：成功 1，已签 0，失败 0，未开放 1"
+        );
+    }
+
     #[test]
     fn checkin_succeeded_requires_all_ok() {
         use super::checkin_succeeded;
@@ -622,6 +669,13 @@ mod tests {
         })));
         assert!(!checkin_succeeded(&json!({
             "accounts": [{"result": "success"}, {"result": "error"}]
+        })));
+        // inactive 不是失败：仍弹通知，但绝不伪造成成功。
+        assert!(checkin_succeeded(&json!({
+            "accounts": [{"result": "success"}, {"result": "inactive"}]
+        })));
+        assert!(!checkin_succeeded(&json!({
+            "accounts": [{"result": "inactive"}, {"result": "error"}]
         })));
     }
 
