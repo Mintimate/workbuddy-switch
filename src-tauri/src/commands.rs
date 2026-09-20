@@ -43,9 +43,9 @@ fn build_app_status(variant: WbVariant) -> AppStatus {
     let current = auth.as_ref().and_then(|a| {
         let acct = a.get("account").cloned().unwrap_or_else(|| json!({}));
         Some(json!({
-            "uid": acct.get("uid"),
-            "nickname": acct.get("nickname"),
-            "email": acct.get("email"),
+            "uid": account::display_value(&acct, "uid"),
+            "nickname": account::display_value(&acct, "nickname"),
+            "email": account::display_value(&acct, "email"),
         }))
     });
     AppStatus {

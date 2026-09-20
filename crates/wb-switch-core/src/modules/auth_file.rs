@@ -7,7 +7,7 @@
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
-use crate::modules::account::get_str;
+use crate::modules::account::{get_str, secret_value};
 use crate::modules::config::{atomic_write, backup_dir, now_ms, utc_iso};
 use crate::modules::variant::WbVariant;
 
@@ -123,13 +123,15 @@ pub fn build_auth_obj(acc: &Value) -> Value {
     let expires_at = acc.get("expiresAt").and_then(|v| v.as_i64());
     let now = now_ms();
 
+    // token 可能是明文字符串或 WorkBuddy 5.6 加密信封：信封必须原样写回，
+    // 由 WorkBuddy 读取时自行解密（同一 keyblob）。降级为空串会静默毁掉登录态。
     obj.insert(
         "accessToken".to_string(),
-        get_str(acc, "access_token").unwrap_or_default().into(),
+        secret_value(acc, "access_token").unwrap_or_else(|| json!("")),
     );
     obj.insert(
         "refreshToken".to_string(),
-        get_str(acc, "refresh_token").unwrap_or_default().into(),
+        secret_value(acc, "refresh_token").unwrap_or_else(|| json!("")),
     );
     obj.insert("tokenType".to_string(), token_type.into());
     obj.insert(
@@ -232,16 +234,16 @@ pub fn write_account_to_auth_file(acc: &Value, variant: WbVariant) -> Result<(),
         return Err(e.to_string());
     }
 
-    // 写后校验
+    // 写后校验：按值比较（token 可能是明文字符串，也可能是 WorkBuddy 5.6 加密信封对象）
     let written: Value =
         serde_json::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     let written_token = written
         .get("auth")
         .and_then(|a| a.get("accessToken"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let expect_token = get_str(acc, "access_token").unwrap_or_default();
+        .cloned()
+        .unwrap_or(Value::Null);
+    let expect_token = acc.get("access_token").cloned().unwrap_or(Value::Null);
     if written_token != expect_token {
         return Err("认证文件写后校验失败，未写入目标账号".to_string());
     }
@@ -273,21 +275,24 @@ fn imported_account_from_root(root: Value, variant: WbVariant) -> Option<Value> 
 
     let uid = get_str(&root, "uid").or_else(|| get_str(&account_obj, "uid"));
     let uid = uid.or_else(|| get_str(&account_obj, "id"));
-    let nickname = get_str(&root, "nickname")
-        .or_else(|| get_str(&root, "name"))
-        .or_else(|| get_str(&account_obj, "nickname"))
-        .or_else(|| get_str(&account_obj, "label"));
+    // WorkBuddy 5.6 起 nickname/accessToken/refreshToken 可能是 `{$wbEncrypted, envelope}`
+    // 加密信封：这里必须原样保留（secret_value），不能 get_str 强转字符串——
+    // 否则 accessToken 取不到导致导入恒 400，切换写回时也会把信封覆盖成空串。
+    let nickname = secret_value(&root, "nickname")
+        .or_else(|| secret_value(&root, "name"))
+        .or_else(|| secret_value(&account_obj, "nickname"))
+        .or_else(|| secret_value(&account_obj, "label"));
     let email = get_str(&root, "email")
         .or_else(|| get_str(&account_obj, "email"))
         .or_else(|| get_str(&auth_obj, "email"));
-    let access_token = get_str(&auth_obj, "accessToken")
-        .or_else(|| get_str(&auth_obj, "access_token"))
-        .or_else(|| get_str(&root, "accessToken"))
-        .or_else(|| get_str(&root, "access_token"));
-    let refresh_token = get_str(&auth_obj, "refreshToken")
-        .or_else(|| get_str(&auth_obj, "refresh_token"))
-        .or_else(|| get_str(&root, "refreshToken"))
-        .or_else(|| get_str(&root, "refresh_token"));
+    let access_token = secret_value(&auth_obj, "accessToken")
+        .or_else(|| secret_value(&auth_obj, "access_token"))
+        .or_else(|| secret_value(&root, "accessToken"))
+        .or_else(|| secret_value(&root, "access_token"));
+    let refresh_token = secret_value(&auth_obj, "refreshToken")
+        .or_else(|| secret_value(&auth_obj, "refresh_token"))
+        .or_else(|| secret_value(&root, "refreshToken"))
+        .or_else(|| secret_value(&root, "refresh_token"));
     let token_type = get_str(&auth_obj, "tokenType")
         .or_else(|| get_str(&auth_obj, "token_type"))
         .unwrap_or_else(|| "Bearer".to_string());
