@@ -658,7 +658,7 @@ fn taskbar_uses_light_theme() -> Option<bool> {
 fn watch_taskbar_theme<R: Runtime>(app: AppHandle<R>) {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY_CURRENT_USER, KEY_NOTIFY,
+        RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY,
         REG_NOTIFY_CHANGE_LAST_SET,
     };
 
