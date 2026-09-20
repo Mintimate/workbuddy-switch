@@ -3459,10 +3459,9 @@ mod tests {
     #[test]
     fn db_paths_follow_variant_data_root() {
         let cn = SessionPaths::for_variant(WbVariant::Cn);
-        assert!(cn
-            .workbuddy_db()
-            .to_string_lossy()
-            .ends_with(".workbuddy/workbuddy.db"));
+        // Path::ends_with 按路径分量比较，Windows 上 `\` 与 `/` 等价；
+        // 不要用 to_string_lossy().ends_with()——那会把分隔符写进断言。
+        assert!(cn.workbuddy_db().ends_with(".workbuddy/workbuddy.db"));
         // 映射库文件名交给解析器：真实数据根可能是任意版本（WorkBuddy 5.6 已迁移到
         // v4 且 v2/v3 残留并存），这里只断言落在国内版数据根下的 edge-sync-mapping-*.db，
         // 具体发现规则由 edge_sync_db_picks_largest_discovered_version 用临时目录覆盖。
