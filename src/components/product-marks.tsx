@@ -125,18 +125,25 @@ export function CodeBuddyCnIdeMark({ size = 32, className }: MarkProps) {
 }
 
 /**
- * VS Code 内 CodeBuddy 扩展标记：直接用扩展自带的官方字形
+ * VS Code 内 CodeBuddy 扩展标记：扩展自带的官方字形
  * （`resources/copilot.svg`，24×24 六边形 + S 形镂空，`fill-rule: evenodd`）。
- * 用 `currentColor` 着色，颜色随所在按钮 / 文字，不写死品牌色，也不引入二进制资源。
+ *
+ * - viewBox 裁到字形自身包围盒（去掉原图四周约 8% 空白），字形占满底块 → 与相邻
+ *   产品图标（WorkBuddy / CodeBuddy IDE 的满幅 app 图标）视觉大小一致；
+ * - 底色 `bg-foreground` + 字形 `text-background`：浅色下黑底白字、深色下白底黑字，
+ *   黑白中性且随主题切换，与彩色 app 图标、深色 CLI 图标并列都不突兀。
  */
 export function VscodeExtMark({ size = 32, className }: MarkProps) {
   return (
     <span
       aria-hidden
-      className={cn("inline-flex shrink-0 items-center justify-center", className)}
+      className={cn(
+        "inline-flex shrink-0 items-center justify-center rounded-[22%] bg-foreground text-background",
+        className,
+      )}
       style={{ width: size, height: size }}
     >
-      <svg viewBox="0 0 24 24" fill="none" className="size-full">
+      <svg viewBox="2.1 0.63 19.8 22.74" fill="none" className="size-[70%]">
         <path
           fillRule="evenodd"
           clipRule="evenodd"

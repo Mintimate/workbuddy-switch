@@ -831,7 +831,7 @@ export default function AccountsPage() {
                 <span
                   className={
                     vscodeExt?.installed && vscodeExt?.extensionInstalled
-                      ? "inline-flex rounded-[22%] bg-primary p-[2px] text-primary-foreground shadow-sm shadow-primary/40"
+                      ? "inline-flex rounded-[22%] bg-primary p-[2px] shadow-sm shadow-primary/40"
                       : "inline-flex rounded-[22%] bg-muted-foreground/30 p-[2px]"
                   }
                 >
