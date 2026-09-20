@@ -1143,7 +1143,7 @@ mod tests {
     #[test]
     fn secret_key_helper_reexported_path() {
         let key = crate::modules::vscode_cn_inject::secret_storage_item_key_for(
-            crate::modules::vscode_cn_inject::CodeBuddyIdeFlavor::Intl,
+            &crate::modules::vscode_cn_inject::CODEBUDDY_INTL_TARGET,
         );
         assert!(key.contains("planning-genie.new.accessToken"));
         assert!(!key.contains("accessTokencn"));
