@@ -79,7 +79,7 @@ impl SessionPaths {
     }
 
     pub fn edge_sync_db(&self, variant: WbVariant) -> PathBuf {
-        self.data_root.join(edge_sync_db_name(variant))
+        edge_sync_db_path(&self.data_root, variant)
     }
 
     pub fn backup_root(&self) -> PathBuf {
@@ -138,11 +138,22 @@ pub fn workbuddy_db_path(variant: WbVariant) -> PathBuf {
     variant.data_root().join("workbuddy.db")
 }
 
-/// 云端映射库文件名：国内版历史为 v2；国际版实测为 v4（两档位不同构）。
-fn edge_sync_db_name(variant: WbVariant) -> &'static str {
+/// 云端映射库解析：国内版历史为 v2；WorkBuddy 5.6 起国内版也实测迁移到 v4
+/// （`edge_sync_mapping` 表结构与本模块写入语句兼容，2026-09 本机实测）。
+/// 解析顺序：v2 存在则沿用 v2（兼容老版本）；v2 缺失且 v4 存在则回落 v4；
+/// 两者皆无返回 v2 路径（保留既有「云端映射库不存在」错误文案）。国际版固定 v4。
+fn edge_sync_db_path(root: &std::path::Path, variant: WbVariant) -> std::path::PathBuf {
+    let v2 = root.join("edge-sync-mapping-v2.db");
+    let v4 = root.join("edge-sync-mapping-v4.db");
     match variant {
-        WbVariant::Cn => "edge-sync-mapping-v2.db",
-        WbVariant::Ai => "edge-sync-mapping-v4.db",
+        WbVariant::Ai => v4,
+        WbVariant::Cn => {
+            if v2.is_file() || !v4.is_file() {
+                v2
+            } else {
+                v4
+            }
+        }
     }
 }
 
@@ -3418,10 +3429,14 @@ mod tests {
             .workbuddy_db()
             .to_string_lossy()
             .ends_with(".workbuddy/workbuddy.db"));
-        assert!(cn
-            .edge_sync_db(WbVariant::Cn)
+        // 映射库文件名交给解析器：真实数据根可能只有 v4（WorkBuddy 5.6 迁移），
+        // 这里只断言落在国内版数据根下的 edge-sync-mapping-*.db，具体回落规则
+        // 由 edge_sync_db_falls_back_to_v4_when_v2_missing 用临时目录覆盖。
+        let cn_edge = cn.edge_sync_db(WbVariant::Cn);
+        assert_eq!(cn_edge.parent(), Some(cn.data_root.as_path()));
+        assert!(cn_edge
             .to_string_lossy()
-            .ends_with("edge-sync-mapping-v2.db"));
+            .contains("edge-sync-mapping-"));
 
         let ai = SessionPaths::for_variant(WbVariant::Ai);
         assert_eq!(ai.workbuddy_db().parent(), Some(ai.data_root.as_path()));
@@ -3446,6 +3461,28 @@ mod tests {
         assert!(cn
             .link_store_lock_file()
             .ends_with("locks/session-links.lock"));
+    }
+
+    #[test]
+    fn edge_sync_db_falls_back_to_v4_when_v2_missing() {
+        // 回归：WorkBuddy 5.6 国内版数据根只有 v4 映射库（v2 已迁移），国内档位
+        // 必须回落 v4，否则会话复制收尾恒失败、切号被永久暂停（2026-09 实测）。
+        let root = temp_root("edge_sync_fallback");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // 两者皆无：返回 v2 路径，保留既有错误文案。
+        let cn = SessionPaths { data_root: root.clone(), ..SessionPaths::for_variant(WbVariant::Cn) };
+        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v2.db"));
+
+        // 只有 v4：国内档位回落 v4。
+        std::fs::write(root.join("edge-sync-mapping-v4.db"), b"stub").unwrap();
+        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v4.db"));
+
+        // 两者都有：优先 v2（老版本兼容）。
+        std::fs::write(root.join("edge-sync-mapping-v2.db"), b"stub").unwrap();
+        assert!(cn.edge_sync_db(WbVariant::Cn).ends_with("edge-sync-mapping-v2.db"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn temp_root(name: &str) -> PathBuf {
