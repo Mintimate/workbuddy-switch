@@ -15,7 +15,7 @@ use crate::modules::config::{
     atomic_write, clear_codebuddy_ide_app_cache, load_codebuddy_ide_app_cache, now_ms,
     save_codebuddy_ide_app_cache, store_dir,
 };
-use crate::modules::variant::WbVariant;
+use crate::modules::variant::{codebuddy_domain_for, WbVariant};
 // 复用 process 模块带并发管道读取的正确实现；本地轮询版会在子进程输出
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
@@ -95,7 +95,10 @@ pub fn build_session_json(acc: &Value) -> String {
     let enterprise_name = get_str(acc, "enterpriseName")
         .or_else(|| get_str(acc, "enterprise_name"))
         .unwrap_or_default();
-    let domain = get_str(acc, "domain").unwrap_or_default();
+    let domain = codebuddy_domain_for(
+        get_str(acc, "domain").unwrap_or_default().as_str(),
+        account::variant_of(acc),
+    );
     let refresh_token = get_str(acc, "refresh_token").unwrap_or_default();
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());

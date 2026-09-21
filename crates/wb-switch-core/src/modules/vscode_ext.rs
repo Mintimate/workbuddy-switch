@@ -24,6 +24,7 @@ use crate::modules::auth_file::build_account_obj;
 use crate::modules::codebuddy_cn_ide::{match_account_for_token, parse_token_from_secret};
 use crate::modules::config::{atomic_write, now_ms, store_dir};
 use crate::modules::process;
+use crate::modules::variant::codebuddy_domain_for;
 use crate::modules::vscode_cn_inject::{
     has_secret_row_for, inject_secret_for, read_secret_for, state_db_path_for,
     VscodeSafeStorageTarget,
@@ -144,7 +145,10 @@ fn account_entry_key(entry: &Value) -> Option<&str> {
 /// （`accounts` 单元素）。
 pub fn build_ext_session_json(acc: &Value, existing: Option<&str>) -> String {
     let uid = get_str(acc, "uid").unwrap_or_default();
-    let domain = get_str(acc, "domain").unwrap_or_default();
+    let domain = codebuddy_domain_for(
+        get_str(acc, "domain").unwrap_or_default().as_str(),
+        account::variant_of(acc),
+    );
     let refresh_token = get_str(acc, "refresh_token").unwrap_or_default();
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());
@@ -511,7 +515,7 @@ fn running_instance() -> RunningInstance {
 fn close_timeout_error(alive: &[u32]) -> String {
     let pids: Vec<String> = alive.iter().map(|pid| pid.to_string()).collect();
     format!(
-        "等待 VS Code 退出超时（仍有进程运行: {}）。请在 VS Code 中处理保存提示或手动退出后重试。",
+        "等待 VS Code 退出超时（仍有进程运行: {}）。请在 VS Code 中处理保存提示；若你在等待期间重新打开过 VS Code，请退出后重试。",
         pids.join(", ")
     )
 }
@@ -934,6 +938,29 @@ mod tests {
         assert_eq!(v["accounts"].as_array().map(|a| a.len()), Some(1));
     }
 
+    /// WorkBuddy 产品域注入 CodeBuddy 扩展前必须规范化：否则扩展把域归为 `selfhosted`
+    /// （该分支会读「企业版端点」设置）；企业自建域保持原样。
+    #[test]
+    fn ext_session_json_normalizes_workbuddy_domain() {
+        let acc = json!({
+            "uid": "u-9",
+            "nickname": "张佳",
+            "access_token": "tok-9",
+            "domain": "www.workbuddy.cn",
+        });
+        let v: Value = serde_json::from_str(&build_ext_session_json(&acc, None)).unwrap();
+        assert_eq!(v["domain"], "www.codebuddy.cn");
+        assert_eq!(v["auth"]["domain"], "www.codebuddy.cn");
+
+        let corp = json!({
+            "uid": "u-c",
+            "access_token": "tok-c",
+            "domain": "corp.example.com",
+        });
+        let vc: Value = serde_json::from_str(&build_ext_session_json(&corp, None)).unwrap();
+        assert_eq!(vc["domain"], "corp.example.com");
+    }
+
     #[test]
     fn ext_session_json_merge_upserts_accounts_and_preserves_fields() {
         let acc = json!({
@@ -1140,10 +1167,9 @@ mod tests {
     fn close_timeout_error_lists_pids_and_manual_hint() {
         let message = close_timeout_error(&[4242, 4243]);
         assert!(message.contains("4242, 4243"), "{message}");
-        assert!(
-            message.contains("请在 VS Code 中处理保存提示或手动退出"),
-            "{message}"
-        );
+        assert!(message.contains("请在 VS Code 中处理保存提示"), "{message}");
+        // 等待期间被重新打开也会表现为「仍有进程」→ 文案要点出这条排查方向。
+        assert!(message.contains("重新打开过 VS Code"), "{message}");
     }
 
     fn instance_with_pids(pids: Vec<u32>) -> RunningInstance {

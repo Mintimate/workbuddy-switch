@@ -19,6 +19,7 @@ use crate::modules::config::{
 // 超过 64KB（如 `ps -axo pid=,args=`）时因管道写满而死锁到超时。
 use crate::modules::process;
 use crate::modules::process::run_cmd_timeout as run_cmd;
+use crate::modules::variant::codebuddy_domain_for;
 use crate::modules::vscode_cn_inject::{
     codebuddy_cn_data_dir, codebuddy_cn_state_db_path, inject_codebuddy_cn_secret,
     read_codebuddy_cn_secret,
@@ -78,7 +79,10 @@ pub fn build_session_json(acc: &Value) -> String {
     let enterprise_name = get_str(acc, "enterpriseName")
         .or_else(|| get_str(acc, "enterprise_name"))
         .unwrap_or_default();
-    let domain = get_str(acc, "domain").unwrap_or_default();
+    let domain = codebuddy_domain_for(
+        get_str(acc, "domain").unwrap_or_default().as_str(),
+        account::variant_of(acc),
+    );
     let refresh_token = get_str(acc, "refresh_token").unwrap_or_default();
     let access_token = get_str(acc, "access_token").unwrap_or_default();
     let token_type = get_str(acc, "token_type").unwrap_or_else(|| "Bearer".to_string());
