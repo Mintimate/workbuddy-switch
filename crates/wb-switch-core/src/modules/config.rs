@@ -258,14 +258,37 @@ pub fn clear_codebuddy_ide_app_cache() {
 // ---------------------------------------------------------------------------
 
 /// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
+///
+/// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
 pub fn default_checkin_config() -> Value {
     json!({
         "enabled": true,
+        "checkin_start": "",
+        "checkin_end": "",
         "start_hour": 6,
         "end_hour": 12,
         "keepalive_days": 0,
         "lazy_refresh_hours": 24,
     })
+}
+
+/// 解析 `"HH:MM"` 本地时钟（允许 1–2 位时/分，如 `"9:5"`）。
+///
+/// 空串、多余字符、越界（`"24:00"` / `"23:60"`）一律返回 `None`。
+pub fn parse_clock(raw: &str) -> Option<(u32, u32)> {
+    let (hour, minute) = raw.split_once(':')?;
+    if !(1..=2).contains(&hour.len()) || !(1..=2).contains(&minute.len()) {
+        return None;
+    }
+    if !hour.bytes().all(|b| b.is_ascii_digit()) || !minute.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some((hour, minute))
 }
 
 fn merge_checkin_config(input: &Value) -> Value {
@@ -285,6 +308,16 @@ fn merge_checkin_config(input: &Value) -> Value {
         if let Some(value) = map.get(key).and_then(Value::as_i64) {
             merged[key] = json!(value);
         }
+    }
+    // 时间段保存归一化：合法值零填充后落盘，非法/非字符串归一为空串（= 不限制）。
+    for key in ["checkin_start", "checkin_end"] {
+        let normalized = map
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse_clock)
+            .map(|(hour, minute)| format!("{hour:02}:{minute:02}"))
+            .unwrap_or_default();
+        merged[key] = json!(normalized);
     }
     merged
 }
@@ -1037,6 +1070,86 @@ mod tests {
         assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(true));
         assert_eq!(
             corrupt.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
+    }
+
+    #[test]
+    fn parse_clock_accepts_short_forms_and_rejects_malformed_values() {
+        assert_eq!(parse_clock("22:00"), Some((22, 0)));
+        assert_eq!(parse_clock("9:5"), Some((9, 5)));
+        assert_eq!(parse_clock("00:00"), Some((0, 0)));
+        assert_eq!(parse_clock("23:59"), Some((23, 59)));
+
+        for raw in [
+            "24:00",     // 小时越界
+            "23:60",     // 分钟越界
+            "22",        // 缺分钟
+            "",          // 空串
+            "abc",       // 非数字
+            "22:00:00",  // 多余字符
+            "22:",       // 分钟为空
+            ":00",       // 小时为空
+            "-1:00",     // 符号
+            "+1:00",     // 符号
+            " 22:00",    // 前导空格
+            "22:00 ",    // 尾随空格
+            "０１:００", // 全角数字
+        ] {
+            assert_eq!(parse_clock(raw), None, "必须拒绝 {raw:?}");
+        }
+    }
+
+    #[test]
+    fn checkin_window_defaults_to_unset_and_normalizes_on_save() {
+        let defaults = default_checkin_config();
+        assert_eq!(defaults.get("checkin_start"), Some(&json!("")));
+        assert_eq!(defaults.get("checkin_end"), Some(&json!("")));
+
+        // 合法值零填充后落盘。
+        let merged = merge_checkin_config(&json!({
+            "checkin_start": "9:5",
+            "checkin_end": "23:30"
+        }));
+        assert_eq!(merged.get("checkin_start"), Some(&json!("09:05")));
+        assert_eq!(merged.get("checkin_end"), Some(&json!("23:30")));
+    }
+
+    #[test]
+    fn checkin_window_invalid_values_normalize_to_empty_and_keep_other_fields() {
+        // 缺失 → 空串。
+        let missing = merge_checkin_config(&json!({}));
+        assert_eq!(missing.get("checkin_start"), Some(&json!("")));
+        assert_eq!(missing.get("checkin_end"), Some(&json!("")));
+
+        // 非字符串 / 越界 / 格式错误 → 空串，不落盘未知值。
+        for bad in [json!(1234), json!(null), json!(true), json!("25:00")] {
+            let merged = merge_checkin_config(&json!({"checkin_start": bad}));
+            assert_eq!(
+                merged.get("checkin_start"),
+                Some(&json!("")),
+                "非法取值必须归一为空串: {bad:?}"
+            );
+        }
+
+        // 其它字段与旧时间窗口字段不受影响。
+        let merged = merge_checkin_config(&json!({
+            "checkin_start": "25:00",
+            "checkin_end": 1234,
+            "enabled": false,
+            "keepalive_days": 7,
+            "start_hour": 3,
+            "end_hour": 9
+        }));
+        assert_eq!(merged.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            merged.get("keepalive_days").and_then(Value::as_i64),
+            Some(7)
+        );
+        assert_eq!(merged.get("start_hour").and_then(Value::as_i64), Some(3));
+        assert_eq!(merged.get("end_hour").and_then(Value::as_i64), Some(9));
+        assert_eq!(
+            merged.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
         );
     }

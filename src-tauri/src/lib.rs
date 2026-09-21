@@ -35,7 +35,8 @@ pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json:
     }
 }
 
-/// 后台循环：自动签到启动即核验、每 30 分钟补签；自动轮换每 30 秒检查；每天一次保活；
+/// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
+/// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
@@ -47,7 +48,7 @@ fn spawn_background_loops(app: tauri::AppHandle) {
             modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
                 .await;
         loop {
-            tokio::time::sleep(modules::checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
             let _ = modules::checkin::run_checkin_cycle(
                 modules::checkin::CheckinCycleMode::PeriodicRecovery,
             )
