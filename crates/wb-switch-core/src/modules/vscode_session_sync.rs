@@ -701,7 +701,7 @@ pub fn sync_selected_at(
 }
 
 /// 一次写入所需的已核对信息（校验与写入之间不再回读来源，避免 TOCTOU）。
-struct SyncItemPlan {
+pub(crate) struct SyncItemPlan {
     group_id: String,
     mode: SyncMode,
     verdict: SyncVerdict,
@@ -877,19 +877,53 @@ fn begin_index_backup(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<PathB
 
 /// 回滚快进：索引按备份恢复、删除本次新建的消息文件。
 ///
+/// 失败必须**上报**而不是丢弃：索引没恢复、新增文件没删掉，调用方都不能对用户声称
+/// 「已同步内容已回滚」。返回的失败说明自带备份路径，用户可据此手工恢复。
+/// 成败口径与原来一致（备份存在则 `copy` 回、不存在则删目标），只是不再吞错：
+/// `NotFound` 视为成功（幂等删除，文件本就不在），只有真实失败才计入。
+///
 /// 本次追加的附件**不回滚**：它们是纯增量，且同名覆盖前目标侧的原始副本仍在源账号。
-fn rollback_index(plan: &SyncItemPlan, backup_dir: &Path, created: &[PathBuf]) {
+pub(crate) fn rollback_index(
+    plan: &SyncItemPlan,
+    backup_dir: &Path,
+    created: &[PathBuf],
+) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
     for name in ["index.json", ".index_bak.json"] {
         let backup = backup_dir.join(name);
         let target = plan.target_dir.join(name);
         if backup.is_file() {
-            let _ = std::fs::copy(&backup, &target);
-        } else {
-            let _ = std::fs::remove_file(&target);
+            if let Err(error) = std::fs::copy(&backup, &target) {
+                failures.push(format!("索引 {name} 未恢复：{error}"));
+            }
+        } else if let Err(error) = remove_file_if_exists(&target) {
+            failures.push(format!("索引 {name} 未删除：{error}"));
         }
     }
-    for path in created {
-        let _ = std::fs::remove_file(path);
+    // 新增消息可能上百条：逐条列名会把用户可见文案撑爆，这里只报失败条数。
+    let undeleted = created
+        .iter()
+        .filter(|path| remove_file_if_exists(path).is_err())
+        .count();
+    if undeleted > 0 {
+        failures.push(format!("本次新增的 {undeleted} 个消息文件未删除"));
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "副本回滚未完成（{}），请从备份目录 {} 手工恢复",
+        failures.join("；"),
+        backup_dir.display()
+    ))
+}
+
+/// 幂等删除文件：`NotFound` 视为成功（文件本就不在，目标状态已达成）。
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -1020,14 +1054,18 @@ fn fast_forward(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, Stri
     let assets = match write_fast_forward(plan, &out_index, &files, &mut created) {
         Ok(assets) => assets,
         Err(error) => {
-            rollback_index(plan, &backup_dir, &created);
-            return Err(error);
+            return Err(rollback_message(
+                rollback_index(plan, &backup_dir, &created),
+                &error,
+            ));
         }
     };
     // 基线提交失败 → 恢复索引 + 删除本次新增文件（design §6.1 步 6）。
     if let Err(error) = commit_baseline(paths, plan) {
-        rollback_index(plan, &backup_dir, &created);
-        return Err(error);
+        return Err(rollback_message(
+            rollback_index(plan, &backup_dir, &created),
+            &error,
+        ));
     }
 
     let source_count = plan.source_content.normalized.record_count;
@@ -1303,8 +1341,8 @@ pub(crate) fn restore_dir(backup_dir: &Path, target_dir: &Path) -> Result<(), St
     })
 }
 
-/// 回滚后的用户可见文案：恢复成功时与原来的文案逐字一致；恢复失败时追加
-/// [`restore_dir`] 的说明（副本未恢复 + 备份路径），不掩盖失败。
+/// 回滚后的用户可见文案：回滚成功时与原来的文案逐字一致；回滚失败时追加
+/// [`restore_dir`] / [`rollback_index`] 的说明（未回滚 + 备份路径），不掩盖失败。
 fn rollback_message(restored: Result<(), String>, message: &str) -> String {
     match restored {
         Ok(()) => message.to_string(),
@@ -2004,6 +2042,10 @@ mod tests {
         assert_eq!(report["synced"].as_array().unwrap().len(), 0, "{report}");
         let error = report["errors"][0]["error"].as_str().unwrap();
         assert!(error.contains("同步记录"), "{error}");
+        assert!(
+            !error.contains("；且"),
+            "回滚成功时用户可见文案必须与原始错误逐字一致：{error}"
+        );
         assert_eq!(
             std::fs::read(target_dir.join("index.json")).unwrap(),
             before_index,
@@ -2054,6 +2096,12 @@ mod tests {
         .unwrap();
         assert_eq!(report["synced"].as_array().unwrap().len(), 0, "{report}");
         assert_eq!(report["errors"].as_array().unwrap().len(), 1, "{report}");
+        let error = report["errors"][0]["error"].as_str().unwrap();
+        assert!(error.contains("写入副本消息失败"), "{error}");
+        assert!(
+            !error.contains("；且"),
+            "回滚成功时用户可见文案必须与原始错误逐字一致：{error}"
+        );
         assert_eq!(
             dir_snapshot(&target_dir),
             before,
@@ -2497,6 +2545,88 @@ mod tests {
         assert!(composed.contains("未恢复"), "{composed}");
         assert!(
             composed.contains(&missing_backup.to_string_lossy().to_string()),
+            "{composed}"
+        );
+    }
+
+    /// 只为 `rollback_index` 造一个计划：其余字段填空，仅 `target_dir` 指向测试给定路径。
+    fn plan_pointing_at(target_dir: &Path) -> SyncItemPlan {
+        let member = |uid: &str| LinkMember {
+            member_id: format!("{uid}:{CONV_SRC}"),
+            account_id: Some(uid.to_string()),
+            uid: uid.to_string(),
+            session_id: CONV_SRC.to_string(),
+            state: MemberState::Active,
+            linked_at: 0,
+            last_synced_at: None,
+        };
+        let snapshot = ContentSnapshot {
+            text: String::new(),
+            full_digest: String::new(),
+            normalized: crate::modules::session_link::NormalizedContent {
+                record_count: 0,
+                line_digests: Vec::new(),
+                total_digest: String::new(),
+            },
+        };
+        SyncItemPlan {
+            group_id: "group-under-test".to_string(),
+            mode: SyncMode::FastForward,
+            verdict: SyncVerdict::FastForward,
+            source_member: member(SRC_UID),
+            target_member: member(DST_UID),
+            source_dir: PathBuf::new(),
+            target_dir: target_dir.to_path_buf(),
+            workspace_hash: WS.to_string(),
+            source_conversation_id: CONV_SRC.to_string(),
+            target_conversation_id: CONV_SRC.to_string(),
+            target_uid: DST_UID.to_string(),
+            source_content: snapshot.clone(),
+            target_content: snapshot,
+        }
+    }
+
+    /// 快进回滚失败必须上报：`rollback_index` 返回失败说明（含备份路径），调用点据此追加提示。
+    ///
+    /// 造数不依赖平台语义：把目标路径做成一个**普通文件**（不是目录），恢复索引时的 `copy`
+    /// 在任何平台都无法在文件下建出子路径 → 必败；与 chmod / 只读句柄 / `set_readonly`
+    /// 这类跨平台语义不同的手段无关。
+    #[test]
+    fn rollback_index_reports_failure_with_backup_path() {
+        let fixture = Fixture::new("rollback-index-failure");
+        let backup_dir = fixture.base.join("index-backup");
+        write(&backup_dir.join("index.json"), "{\"messages\":[]}");
+        let blocked = fixture.base.join("target-as-file");
+        write(&blocked, "不是目录");
+        let plan = plan_pointing_at(&blocked);
+        let created = vec![blocked.join("messages/never-written.json")];
+
+        let error = rollback_index(&plan, &backup_dir, &created).unwrap_err();
+        assert!(error.contains("索引 index.json 未恢复"), "{error}");
+        assert!(
+            error.contains(&backup_dir.to_string_lossy().to_string()),
+            "文案必须给出可手工恢复的备份路径：{error}"
+        );
+
+        // 成功路径一：目标与备份都没有索引文件 → 幂等删除（NotFound）不算失败。
+        let clean = fixture.base.join("clean-conv");
+        std::fs::create_dir_all(&clean).unwrap();
+        let empty_backup = fixture.base.join("empty-backup");
+        std::fs::create_dir_all(&empty_backup).unwrap();
+        let clean_plan = plan_pointing_at(&clean);
+        let rolled_back = rollback_index(&clean_plan, &empty_backup, &[]);
+        assert!(rolled_back.is_ok(), "文件本就不在不算失败：{rolled_back:?}");
+
+        // 成功路径二：调用点合成文案时，用户可见文案必须逐字不变。
+        let original = "写入副本消息失败：磁盘空间不足";
+        assert_eq!(
+            rollback_message(rollback_index(&clean_plan, &empty_backup, &[]), original),
+            original
+        );
+        let composed = rollback_message(Err(error), original);
+        assert!(composed.contains(original), "{composed}");
+        assert!(
+            composed.contains(&backup_dir.to_string_lossy().to_string()),
             "{composed}"
         );
     }
