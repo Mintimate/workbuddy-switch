@@ -9,6 +9,8 @@ pub mod credit_usage;
 pub mod credits;
 pub mod export_import;
 pub mod limits;
+#[cfg(target_os = "linux")]
+pub mod linux_keyring;
 pub mod notifications;
 pub mod oauth;
 pub mod official_usage;
