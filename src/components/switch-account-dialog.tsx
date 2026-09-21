@@ -14,6 +14,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { SessionSyncSection, type SessionLinksMeta } from "@/components/session-sync-section";
 import * as api from "@/lib/api";
@@ -45,6 +46,15 @@ function tabCount(count: number) {
     <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
   ) : null;
 }
+
+/**
+ * 会话列表区最小高度：加载态、空态与列表共用同一下沿。
+ *
+ * 弹窗垂直居中（`translate-y-[-50%]` 按自身高度算），内容高度一变弹窗就上下撑开；
+ * 打开时先渲染加载态、会话数据到达后换成列表，两端高度差越大跳得越明显。
+ * 与「关联会话」tab 的下沿取同一数值，两个 tab 打开时的高度表现保持一致。
+ */
+const LIST_MIN_H = "min-h-[min(7.5rem,26vh)]";
 
 /** 临时备份残留的可读描述：优先标题，其次会话 id，最后操作 id。 */
 function describeTemporaryFile(item: TemporaryFileInfo): string {
@@ -376,7 +386,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
   const copyTabContent = (
     <>
-      {!loadingSessions && (
+      {loadingSessions ? (
+        // 两行高度对齐真实提示文案（有会话时折成两行）。
+        <div className="px-1">
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-3/4" />
+        </div>
+      ) : (
         <p
           className={
             sessionsEmpty
@@ -388,15 +404,19 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         </p>
       )}
       {loadingSessions ? (
-        <div className="flex items-center gap-2 py-4 text-sm text-muted-foreground">
+        <div
+          className={`flex items-center justify-center gap-2 text-sm text-muted-foreground ${LIST_MIN_H}`}
+        >
           <Loader2 className="animate-spin" /> 加载会话…
         </div>
       ) : sessions.length === 0 ? (
-        <p className="py-4 text-center text-sm text-muted-foreground">
+        <p
+          className={`flex items-center justify-center px-3 text-center text-sm text-muted-foreground ${LIST_MIN_H}`}
+        >
           {currentUid ? "当前账号暂无会话" : "未检测到当前登录账号，无法列出会话"}
         </p>
       ) : (
-        <div className="max-h-[min(22rem,45vh)] overflow-y-auto pr-1">
+        <div className={`max-h-[min(22rem,45vh)] overflow-y-auto pr-1 ${LIST_MIN_H}`}>
           {buildSessionTree(sessions).map((kind) => {
             const kindOpen = expanded.has(kind.key);
             const kindSel = selectionState(kind.sessions, selected);

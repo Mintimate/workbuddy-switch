@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, CircleAlert, Link2, Loader2, RotateCw } from "lucide-react";
+import { ChevronRight, CircleAlert, Link2, RotateCw } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -60,6 +61,41 @@ const VERDICT_BADGE: Record<SessionSyncVerdict, "success" | "warning" | "outline
   identical: "secondary",
   unknown: "outline",
 };
+
+/**
+ * 列表区最小高度：加载骨架、空态与「少量会话」的结果态共用同一下沿。
+ *
+ * 弹窗是垂直居中定位（`translate-y-[-50%]` 按自身高度算），内容高度一跳弹窗就上下撑开。
+ * 打开时先渲染加载态、数据到达后换成结果，两端高度差越大跳得越明显；固定下沿让这段跳变收窄。
+ */
+const LIST_MIN_H = "min-h-[min(7.5rem,26vh)]";
+/** 状态块高度：约等于结果态「全选行 + 列表 + 提示行」的最小高度，供空态与骨架对齐。 */
+const STATUS_MIN_H = "min-h-[min(11rem,34vh)]";
+
+/** 加载骨架：结构与结果态一致（全选行 + 列表 + 提示行），避免数据到达时弹窗高度跳变。 */
+function LinksSkeleton() {
+  return (
+    <div className="space-y-2" aria-hidden>
+      <div className="flex items-center gap-2.5 px-1">
+        <Skeleton className="size-3.5 shrink-0 rounded-sm" />
+        <Skeleton className="h-5 w-40" />
+        <Skeleton className="ml-auto h-5 w-16" />
+      </div>
+      <div className={cn("divide-y rounded-md border", LIST_MIN_H)}>
+        {[0, 1].map((index) => (
+          <div key={index} className="flex items-start gap-2.5 px-3 py-2.5">
+            <Skeleton className="mt-0.5 size-3.5 shrink-0 rounded-sm" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-3 w-2/3" />
+            </div>
+          </div>
+        ))}
+      </div>
+      <Skeleton className="h-4 w-56" />
+    </div>
+  );
+}
 
 /** 可勾选的模式：判定只允许一个模式，取后端给出的第一个。 */
 function primaryMode(group: SessionLinkPreviewGroup): SessionSyncMode | null {
@@ -223,15 +259,15 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         </div>
       </div>
 
-      {pending && (
-        <div className="flex items-center gap-2 px-1 py-2 text-xs text-muted-foreground">
-          <Loader2 className="size-3.5 animate-spin" />
-          正在检查会话…
-        </div>
-      )}
+      {pending && <LinksSkeleton />}
 
       {!pending && (error || storeUnavailable) && (
-        <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 rounded-md border px-3 py-2.5",
+            STATUS_MIN_H,
+          )}
+        >
           <span className="min-w-0 flex-1 text-xs text-muted-foreground">
             {error ? "暂时无法检查会话，本次不能同步" : "同步记录不可用，本次不会同步"}
           </span>
@@ -249,15 +285,29 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
       )}
 
       {!pending && !error && preview?.storeStatus === "missing" && (
-        <p className="px-1 py-1 text-xs text-muted-foreground">
-          还没有可以同步的会话：先在「复制会话」里复制一次，之后切换回来就能在这里同步新内容。
-        </p>
+        <div
+          className={cn(
+            "flex items-center justify-center rounded-md border px-3 py-2.5",
+            STATUS_MIN_H,
+          )}
+        >
+          <p className="text-center text-xs text-muted-foreground">
+            还没有可以同步的会话：先在「复制会话」里复制一次，之后切换回来就能在这里同步新内容。
+          </p>
+        </div>
       )}
 
       {!pending && !error && !storeUnavailable && preview?.storeStatus === "ready" && groups.length === 0 && (
-        <p className="px-1 py-1 text-xs text-muted-foreground">
-          这两个账号还没有共同复制过的会话（只处理双方都有的，不涉及其他账号）。
-        </p>
+        <div
+          className={cn(
+            "flex items-center justify-center rounded-md border px-3 py-2.5",
+            STATUS_MIN_H,
+          )}
+        >
+          <p className="text-center text-xs text-muted-foreground">
+            这两个账号还没有共同复制过的会话（只处理双方都有的，不涉及其他账号）。
+          </p>
+        </div>
       )}
 
       {!pending && !error && groups.length > 0 && (
@@ -274,7 +324,12 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
               {`已选 ${selectedCount} / ${groups.length}`}
             </span>
           </div>
-          <div className="max-h-[min(24rem,50vh)] divide-y overflow-y-auto rounded-md border">
+          <div
+            className={cn(
+              "max-h-[min(24rem,50vh)] divide-y overflow-y-auto rounded-md border",
+              LIST_MIN_H,
+            )}
+          >
             {groups.map((group) => (
               <SessionLinkCard
                 key={group.groupId}
