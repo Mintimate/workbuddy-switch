@@ -483,7 +483,7 @@ pub fn switch_vscode_ext_with_copy(
     let acc = account::find_account(account_id)
         .ok_or_else(|| format!("账号不存在: {account_id}"))?;
     let target_uid = get_str(&acc, "uid")
-        .ok_or_else(|| "账号缺少 uid，无法定位 VS Code 数据目录，无法复制会话".to_string())?;
+        .ok_or_else(|| "账号缺少 uid，无法定位 VS Code CodeBuddy 插件数据目录，无法复制会话".to_string())?;
 
     // 与 [`vscode_ext::switch_account`] 同序：先把「注定失败」的目标挡在关闭之前，
     // 账号存在但 `access_token` 为空 / 数据目录或 state.vscdb 缺失时不该关掉用户的编辑器。

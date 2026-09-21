@@ -69,7 +69,7 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 | CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，但默认账号独立；macOS/Linux 通过 `apiKeyHelper`，Windows 通过 `settings.json.env.CODEBUDDY_AUTH_TOKEN` 设置后续会话使用的账号；手动切换会先关闭正在运行的 CLI，因此**立即生效**（不再需要重启 CLI） |
 | CodeBuddy CN IDE | 复用同一账号库，向 `CodeBuddy CN` 桌面客户端注入 Safe Storage 凭证（`state.vscdb` / `planning-genie.new.accessTokencn`）并重启 IDE；与 CodeBuddy CLI 无关 |
 | VS Code CodeBuddy 插件 | 复用同一账号库，向 VS Code 内 `tencent-cloud.coding-copilot` 插件注入 Safe Storage 凭证（`state.vscdb` / `Tencent-Cloud.coding-copilot.new.accessToken`）；VS Code 正在运行时会自动关闭并在写入后重新打开（可关闭该行为改为手动退出） |
-| VS Code 会话复制 | 切换 VS Code CodeBuddy 插件账号时可勾选把「当前插件账号」的会话以**新 id** 复制到目标账号（加法，源账号不变）；仅复制 `history` 正文与索引，不含 diff / 文件树 / 待办；按工作区 hash 分组，Windows 已实测、macOS/Linux 未实测 |
+| VS Code CodeBuddy 插件会话复制 | 切换 VS Code CodeBuddy 插件账号时可勾选把「当前插件账号」的会话以**新 id** 复制到目标账号（加法，源账号不变）；仅复制 `history` 正文与索引，不含 diff / 文件树 / 待办；按工作区 hash 分组，Windows 已实测、macOS/Linux 未实测 |
 | 自动轮换 | 后台定时把 CodeBuddy CLI 的后续启动账号设为积分最紧迫（最早到期）的账号；只在没有 CodeBuddy CLI 会话在运行时才切，被跳过时会（每日最多 5 次）提示 |
 | 自动更新 | 配置 GitHub Releases 源检查新版本；整包更新经签名校验（tauri-updater） |
 | 权限检测 | macOS 授权引导（App 管理 / 完全磁盘访问拖拽授权 + 自动检测） |
@@ -88,9 +88,9 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 10. **自动轮换**：设置 → CodeBuddy CLI 自动轮换，开启后后台按间隔检查，并把积分最紧迫的账号设为后续会话的默认账号（策略见下）。检测到有 CodeBuddy CLI 会话在运行时本次轮换会跳过，并在当日最多提示 5 次；重启 CLI 后新账号才会生效。
 11. **更新**：应用会自动检查公开 GitHub Releases；发现新版本后可在左下角直接升级，也可从设置页打开 Release 页面手动下载。
 
-### 切换 VS Code 账号时复制会话
+### 切换 VS Code CodeBuddy 插件账号时复制会话
 
-在账号卡片点击 VS Code 目标会打开「切换 + 复制会话」弹窗：可开启「复制会话到目标账号」，按工作区分组勾选要带走的会话（仅列出含正文的历史）。VS Code 正在运行时，wb-switch 会先自动关闭编辑器（勾选复制时同样是先关闭、再复制、最后写入目标账号凭证），写入完成后重新打开。
+在账号卡片点击 VS Code CodeBuddy 插件目标会打开「切换 + 复制会话」弹窗：可开启「复制会话到目标账号」，按工作区分组勾选要带走的会话（仅列出含正文的历史）。VS Code 正在运行时，wb-switch 会先自动关闭编辑器（勾选复制时同样是先关闭、再复制、最后写入目标账号凭证），写入完成后重新打开。
 
 - **编辑器会被自动关闭并重开**：VS Code 正在运行时，弹窗会说明将先关闭编辑器再写入凭证，随后自动重新打开（未保存内容由 VS Code 自身的保存提示保护；若弹出提示请先处理，最多等待 60 秒）。不想要自动操作时，可在弹窗里关掉「自动关闭并重开」，改为自己完全退出 VS Code 后切换。
 - **复制会话要求编辑器处于退出状态**：会话文件由运行中的插件写入，复制动作本身仍必须在 VS Code 完全退出后进行。开启「自动关闭并重开」时由 wb-switch 先关闭编辑器再复制，不需要自己操作；关掉该开关时才需要先手动完全退出 VS Code。
