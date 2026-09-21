@@ -164,7 +164,7 @@ pub async fn detect_codebuddy_cn_ide_account() -> Result<Value, String> {
 pub async fn get_vscode_ext_status() -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(vscode_ext::status)
         .await
-        .map_err(|error| format!("查询 VS Code 扩展状态失败: {error}"))
+        .map_err(|error| format!("查询 VS Code CodeBuddy 插件状态失败: {error}"))
 }
 
 /// GET /api/vscode-ext/sessions —— 列出当前 VS Code 扩展账号可复制的会话。
@@ -178,7 +178,7 @@ pub async fn list_vscode_sessions() -> Result<Value, String> {
         None => json!({ "sourceUid": Value::Null, "sessions": [], "skipped": 0 }),
     })
     .await
-    .map_err(|error| format!("列出 VS Code 扩展会话失败: {error}"))
+    .map_err(|error| format!("列出 VS Code CodeBuddy 插件会话失败: {error}"))
 }
 
 /// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展。

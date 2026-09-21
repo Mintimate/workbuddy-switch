@@ -675,7 +675,7 @@ fn launch_vscode(inst: &RunningInstance) -> Result<(), String> {
 fn describe_inject_error(err: String) -> String {
     if err.contains("Safe Storage") || err.contains("Keychain") {
         format!(
-            "注入登录状态失败：{err}\n\n请先手动打开 VS Code 并登录一次 CodeBuddy 扩展，确保系统凭据存储中存在「Code Safe Storage」条目后再试。"
+            "注入登录状态失败：{err}\n\n请先手动打开 VS Code 并登录一次 CodeBuddy 插件，确保系统凭据存储中存在「Code Safe Storage」条目后再试。"
         )
     } else {
         err
@@ -686,13 +686,13 @@ fn describe_inject_error(err: String) -> String {
 fn switch_message(name: &str, restarted: bool, relaunch_error: Option<&str>) -> String {
     match (restarted, relaunch_error) {
         (true, _) => {
-            format!("已写入 VS Code CodeBuddy 扩展凭证（{name}），VS Code 已重新打开。")
+            format!("已写入 VS Code CodeBuddy 插件凭证（{name}），VS Code 已重新打开。")
         }
         (false, Some(err)) => format!(
-            "已写入 VS Code CodeBuddy 扩展凭证（{name}），但自动重新打开 VS Code 失败：{err}；请手动打开 VS Code 生效。"
+            "已写入 VS Code CodeBuddy 插件凭证（{name}），但自动重新打开 VS Code 失败：{err}；请手动打开 VS Code 生效。"
         ),
         (false, None) => {
-            format!("已写入 VS Code CodeBuddy 扩展凭证（{name}）；请打开 VS Code 生效。")
+            format!("已写入 VS Code CodeBuddy 插件凭证（{name}）；请打开 VS Code 生效。")
         }
     }
 }
@@ -706,7 +706,7 @@ pub(crate) fn validate_switch_target(account_id: &str) -> Result<(Value, PathBuf
     let acc =
         account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     let token = get_str(&acc, "access_token")
-        .ok_or_else(|| "账号缺少 access_token，无法注入 VS Code CodeBuddy 扩展".to_string())?;
+        .ok_or_else(|| "账号缺少 access_token，无法注入 VS Code CodeBuddy 插件".to_string())?;
     if token.is_empty() {
         return Err("账号 access_token 为空".to_string());
     }
@@ -714,7 +714,7 @@ pub(crate) fn validate_switch_target(account_id: &str) -> Result<(Value, PathBuf
     let data_dir = vscode_data_dir().ok_or_else(|| "无法定位 VS Code 数据目录".to_string())?;
     if !data_dir.exists() {
         return Err(format!(
-            "未找到 VS Code 用户数据目录（{}）。请先手动打开 VS Code 并安装 CodeBuddy 扩展后重试。",
+            "未找到 VS Code 用户数据目录（{}）。请先手动打开 VS Code 并安装 CodeBuddy 插件后重试。",
             data_dir.display()
         ));
     }
@@ -723,7 +723,7 @@ pub(crate) fn validate_switch_target(account_id: &str) -> Result<(Value, PathBuf
         vscode_ext_state_db_path().ok_or_else(|| "无法定位 VS Code 数据目录".to_string())?;
     if !db_path.exists() {
         return Err(format!(
-            "未找到 VS Code 状态数据库（{}）。请先手动打开一次 VS Code（无需先登录扩展）后重试。",
+            "未找到 VS Code 状态数据库（{}）。请先手动打开一次 VS Code（无需先登录插件）后重试。",
             db_path.display()
         ));
     }
@@ -867,11 +867,11 @@ pub fn detect_current_account() -> Result<Value, String> {
         return Ok(json!({
             "ok": true,
             "found": false,
-            "message": "本机 VS Code 未找到 CodeBuddy 扩展登录 secret",
+            "message": "本机 VS Code 未找到 CodeBuddy 插件登录 secret",
         }));
     };
     let Some((uid, token)) = parse_token_from_secret(&secret) else {
-        return Err("本地 VS Code CodeBuddy 扩展登录信息解析失败".to_string());
+        return Err("本地 VS Code CodeBuddy 插件登录信息解析失败".to_string());
     };
     if let Some(acc) = match_account_for_token(uid.as_deref(), &token) {
         let id = get_str(&acc, "id").unwrap_or_default();
@@ -890,7 +890,7 @@ pub fn detect_current_account() -> Result<Value, String> {
         "found": true,
         "matched": false,
         "uid": uid,
-        "message": "本机 VS Code 已登录 CodeBuddy 扩展，但账号库中无匹配账号；可先用「从本机导入」或扫码登录同步账号后再切换。",
+        "message": "本机 VS Code 已登录 CodeBuddy 插件，但账号库中无匹配账号；可先用「从本机导入」或扫码登录同步账号后再切换。",
     }))
 }
 

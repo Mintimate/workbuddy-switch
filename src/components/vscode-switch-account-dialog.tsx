@@ -192,7 +192,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const autoClose = running && autoRestart;
   /** 未登录时的追加说明（三态提示卡共用，作为卡片内第二段）。 */
   const notLoggedInHint = notLoggedIn
-    ? "未检测到扩展登录态，将按新会话写入；切换后打开 VS Code 即登录为目标账号。"
+    ? "未检测到 VS Code CodeBuddy 插件登录态，将按新会话写入；切换后打开 VS Code 即登录为目标账号。"
     : undefined;
   const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, dataRoot, hasCopyable);
 
@@ -205,7 +205,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
           <DialogDescription>
-            将把所选账号写入 VS Code CodeBuddy 扩展；可选把当前账号的会话一并复制过去。
+            将把所选账号写入 VS Code CodeBuddy 插件；可选把当前账号的会话一并复制过去。
           </DialogDescription>
         </DialogHeader>
 
@@ -246,7 +246,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
             <NoticeCard
               icon={<CircleCheck className="size-4" />}
               title="VS Code 未运行，可直接切换"
-              description="写入凭证后打开 VS Code，扩展即为目标账号。"
+              description="写入凭证后打开 VS Code，插件即为目标账号。"
               extra={notLoggedInHint}
             />
           )}
@@ -412,10 +412,10 @@ function emptyStateHint(
   hasCopyable: boolean,
 ): string {
   if (loading) return "正在加载会话…";
-  if (status && !status.installed) return "未检测到 VS Code，请先安装并登录 CodeBuddy 扩展";
-  if (status && !status.extensionInstalled) return "未安装 CodeBuddy 扩展，请先在 VS Code 中安装并登录";
-  if (dataRoot === null) return "未找到 CodeBuddy 扩展数据目录，请先打开 VS Code 并登录 CodeBuddy 扩展";
-  if (!sourceUid) return "未检测到 VS Code 扩展当前登录账号，请先在 VS Code 中登录";
+  if (status && !status.installed) return "未检测到 VS Code，请先安装并登录 CodeBuddy 插件";
+  if (status && !status.extensionInstalled) return "未安装 VS Code CodeBuddy 插件，请先在 VS Code 中安装并登录";
+  if (dataRoot === null) return "未找到 VS Code CodeBuddy 插件数据目录，请先打开 VS Code 并登录插件";
+  if (!sourceUid) return "未检测到 VS Code CodeBuddy 插件当前登录账号，请先在 VS Code 中登录";
   if (!hasCopyable) return "当前账号暂无可复制的会话（无含正文的历史）";
   return "将当前账号勾选的会话以新 id 复制给目标账号（加法，不影响源账号）";
 }

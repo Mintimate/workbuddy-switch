@@ -363,14 +363,14 @@ pub fn copy_vscode_sessions(target_uid: &str, items: &[CopyItem]) -> Result<Valu
     let source_uid = vscode_ext::active_ext_uid()
         .filter(|uid| is_safe_uid(uid))
         .ok_or_else(|| {
-            "未检测到 VS Code CodeBuddy 扩展当前登录账号，无法定位源会话。请先在 VS Code 中登录该扩展后重试。"
+            "未检测到 VS Code CodeBuddy 插件当前登录账号，无法定位源会话。请先在 VS Code 中登录该插件后重试。"
                 .to_string()
         })?;
     if source_uid == target_uid {
         return Err("源账号与目标账号相同，无需复制会话".to_string());
     }
     let root = ext_data_root()
-        .ok_or_else(|| "未找到 CodeBuddy 扩展数据目录，无法复制会话".to_string())?;
+        .ok_or_else(|| "未找到 VS Code CodeBuddy 插件数据目录，无法复制会话".to_string())?;
     let backup_root = backup_dir().join("vscode-sessions").join(utc_iso());
     copy_sessions_in(&root, &backup_root, &source_uid, target_uid, items)
 }
