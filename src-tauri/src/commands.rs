@@ -181,11 +181,14 @@ pub async fn list_vscode_sessions() -> Result<Value, String> {
     .map_err(|error| format!("列出 VS Code 扩展会话失败: {error}"))
 }
 
-/// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展（仅写入，不重启）。
+/// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展。
 ///
 /// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（新 id，加法）。
+/// `restart` 缺省 true：VS Code 正在运行时由后端「优雅退出 → 写入 → 重新打开」，
+/// 传 false 则退回「请先完全退出 VS Code」的手动模式。
 ///
-/// async + spawn_blocking：读写 state.vscdb + DPAPI 解密 + 会话目录复制可能阻塞，避免卡 UI。
+/// async + spawn_blocking：读写 state.vscdb + DPAPI 解密 + 等待编辑器退出 + 会话目录
+/// 复制都可能阻塞，避免卡 UI。
 #[tauri::command(rename_all = "camelCase")]
 pub async fn switch_vscode_ext_account(
     account_id: String,
@@ -195,7 +198,7 @@ pub async fn switch_vscode_ext_account(
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
-    let restart = restart.unwrap_or(false);
+    let restart = restart.unwrap_or(true);
     let items = copy_sessions.unwrap_or_default();
     tauri::async_runtime::spawn_blocking(move || {
         if items.is_empty() {

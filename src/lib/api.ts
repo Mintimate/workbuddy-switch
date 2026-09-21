@@ -283,10 +283,15 @@ export function listVscodeSessions(): Promise<VscodeSessionList> {
   return call("list_vscode_sessions");
 }
 
-/** 切换 VS Code CodeBuddy 扩展账号；默认仅写入，不重启（VS Code 须先完全退出）。 */
+/**
+ * 切换 VS Code CodeBuddy 扩展账号。
+ *
+ * `restart` 默认 true：VS Code 运行时由后端先优雅退出、写入后再重新打开；
+ * 传 false 退回「请先完全退出 VS Code」的手动模式（不在编辑器中自动操作）。
+ */
 export function switchVscodeExtAccount(
   accountId: string,
-  restart = false,
+  restart = true,
   copySessions?: VscodeSessionRef[],
 ): Promise<VscodeExtSwitchResult> {
   return call("switch_vscode_ext_account", { accountId, restart, copySessions });

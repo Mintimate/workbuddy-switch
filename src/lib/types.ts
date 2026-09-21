@@ -683,6 +683,13 @@ export interface VscodeExtStatus {
   /** CodeBuddy 扩展是否已安装（globalStorage/<extensionId> 存在）。 */
   extensionInstalled: boolean;
   running: boolean;
+  /**
+   * 是否存在扩展登录态（`state.vscdb` 里有会话 secret 行）。
+   *
+   * 只读查询、不解密；查询失败或文件不存在时为 false。仅用于提示文案，
+   * 不参与切换判定（false 时切换按新会话写入，同样可用）。
+   */
+  loggedIn: boolean;
   dataDir: string | null;
   dbPath: string | null;
   dbExists: boolean;
@@ -697,8 +704,16 @@ export interface VscodeExtSwitchResult {
   account: string;
   accountId: string;
   dbPath?: string;
-  /** 恒为 false：为避免丢失未保存内容，切换不会主动重启 VS Code。 */
+  /** 本次是否真的执行了「关闭并重新打开 VS Code」（切换前未运行时为 false）。 */
   restarted?: boolean;
+  /** 本次切换是否由 wb-switch 关闭了 VS Code（为 false 时表示编辑器本来没运行）。 */
+  closedByUs?: boolean;
+  /** 切换前是否读到了既有会话；false = 扩展未登录，按新会话载荷写入。 */
+  existingSession?: boolean;
+  /**
+   * 后端生成的生效说明：区分「已重新打开 VS Code」「自动重开失败（含原因）」
+   * 「本来未运行」三种情形，不再出现「重载窗口生效」。
+   */
   message?: string;
   /** 切换时复制会话的结果（未勾选复制时不返回）。 */
   sessionCopy?: VscodeSessionCopyResult;

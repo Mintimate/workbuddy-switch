@@ -35,7 +35,7 @@ use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 #[cfg(not(target_os = "windows"))]
 use pbkdf2::pbkdf2_hmac;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 #[cfg(not(target_os = "windows"))]
 use sha1::Sha1;
 
@@ -658,6 +658,57 @@ pub fn read_secret_for(
     }
 }
 
+/// 目标 `state.vscdb` 中是否存在该 secret 行（只读查询、**不解密**）。
+///
+/// 供账号页轮询的状态接口使用：macOS 上解密会触发钥匙串授权弹窗，绝不能进轮询路径，
+/// 因此这里只判断 key 是否存在（不读值、不解密）。
+///
+/// 与 [`resolve_state_db_path_for`] 的关键差异：**不创建任何目录或文件**——
+/// 三个候选路径都不存在时直接返回 `Ok(false)`（`resolve_state_db_path_for` 会
+/// `create_dir_all`，不能用于只读探测）。
+pub fn has_secret_row_for(
+    target: &VscodeSafeStorageTarget,
+    user_data_dir: Option<&Path>,
+) -> Result<bool, String> {
+    let root = match user_data_dir {
+        Some(path) => path.to_path_buf(),
+        None => match (target.data_dir_resolver)() {
+            Some(dir) => dir,
+            None => return Ok(false),
+        },
+    };
+    let candidates = [
+        root.join("User").join("globalStorage").join("state.vscdb"),
+        root.join("globalStorage").join("state.vscdb"),
+        root.join("state.vscdb"),
+    ];
+    let Some(db_path) = candidates.iter().find(|path| path.exists()) else {
+        return Ok(false);
+    };
+    // 只读打开：避免在「文件不存在」等边缘情况下由 SQLite 兜底新建空库。
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("打开 state.vscdb 失败: {e}"))?;
+    let key = secret_storage_item_key_for(target);
+    match conn.query_row(
+        "SELECT 1 FROM ItemTable WHERE key = ?1 LIMIT 1",
+        [key.as_str()],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(_) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        // 空库 / 尚未初始化 ItemTable：按「无该行」处理，不是失败。
+        Err(err) if is_missing_table_error(&err) => Ok(false),
+        Err(err) => Err(format!("查询 {} secret 行失败: {err}", target.display_name)),
+    }
+}
+
+/// SQLite「表不存在」（`no such table`）：空库或尚未初始化 ItemTable。
+fn is_missing_table_error(err: &rusqlite::Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("no such table")
+}
+
 /// 加密并写入 CodeBuddy CN secret；保持既有行为。
 pub fn inject_codebuddy_cn_secret(
     plaintext: &str,
@@ -846,6 +897,56 @@ mod tests {
         std::fs::write(&db, b"").unwrap();
         let resolved = resolve_state_db_path(Some(&dir)).unwrap();
         assert_eq!(resolved, db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `has_secret_row_for`：只看 key 是否存在（有行 / 无行 / 无文件三态），
+    /// 且不读值、不解密、不创建任何目录或文件。
+    #[test]
+    fn has_secret_row_detects_row_without_creating_files() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-cn-secret-row-test-{}", uuid::Uuid::new_v4()));
+        let db = dir.join("User").join("globalStorage").join("state.vscdb");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+
+        // ① 库文件不存在 → false，且不得顺手创建目录/文件
+        assert!(!has_secret_row_for(&CODEBUDDY_CN_TARGET, Some(&dir)).unwrap());
+        assert!(!db.exists(), "只读探测不得创建 state.vscdb");
+
+        let missing_root = dir.join("no-such-data-dir");
+        assert!(!has_secret_row_for(&CODEBUDDY_CN_TARGET, Some(&missing_root)).unwrap());
+        assert!(!missing_root.exists(), "只读探测不得创建数据目录");
+
+        // ①b 空库（0 字节文件）：ItemTable 尚未初始化 → false，且不得报错
+        std::fs::write(&db, b"").unwrap();
+        assert!(!has_secret_row_for(&CODEBUDDY_CN_TARGET, Some(&dir)).unwrap());
+
+        // ② 表存在但无该 key → false
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('other', 'x')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(!has_secret_row_for(&CODEBUDDY_CN_TARGET, Some(&dir)).unwrap());
+
+        // ③ 有该 key → true（值是不可解密的占位串，证明只查存在性、不走解密）
+        let key = secret_storage_item_key();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, 'not-a-ciphertext')",
+            [key.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(has_secret_row_for(&CODEBUDDY_CN_TARGET, Some(&dir)).unwrap());
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 

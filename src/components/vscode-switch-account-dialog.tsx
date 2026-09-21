@@ -1,8 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  ChevronDown,
+  ChevronRight,
+  CircleCheck,
+  Loader2,
+  RefreshCw,
+  TriangleAlert,
+} from "lucide-react";
 import { toast } from "sonner";
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -19,6 +26,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
 import type { AccountMeta, VscodeExtStatus, VscodeSession, VscodeSessionRef } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 interface Props {
   open: boolean;
@@ -31,6 +39,9 @@ interface Props {
   onDone?: () => void;
 }
 
+/** 自动关闭并重开 VS Code 的开关持久化 key（缺省开启，与 `wb-switch.compact` 同风格）。 */
+const AUTO_RESTART_KEY = "wb-switch.vscodeExt.autoRestart";
+
 /** VS Code 扩展会话切换弹窗：可勾选「当前扩展账号」的会话复制到目标账号。 */
 export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeExtStatus, onDone }: Props) {
   const [sessions, setSessions] = useState<VscodeSession[]>([]);
@@ -42,8 +53,25 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** 展开的工作区分组（默认全部展开，会话较少）。 */
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  /** 自动关闭并重开 VS Code：默认开启，持久化到 localStorage。 */
+  const [autoRestart, setAutoRestart] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(AUTO_RESTART_KEY) !== "0";
+    } catch {
+      return true;
+    }
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  function toggleAutoRestart(next: boolean) {
+    setAutoRestart(next);
+    try {
+      localStorage.setItem(AUTO_RESTART_KEY, next ? "1" : "0");
+    } catch {
+      /* 存储不可用时静默 */
+    }
+  }
 
   // 打开时加载「当前扩展账号」可复制的会话。
   useEffect(() => {
@@ -120,27 +148,30 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
             .filter((ref): ref is VscodeSessionRef => ref !== null)
         : undefined;
 
-      const res = await api.switchVscodeExtAccount(account.id, false, refs);
+      const res = await api.switchVscodeExtAccount(account.id, autoRestart, refs);
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const copied = res.sessionCopy?.copied.length ?? 0;
       const errors = res.sessionCopy?.errors ?? [];
+      // 生效方式提示：重载窗口读不到外部写入，不再提示；区分「已重开 / 重开失败 / 本来没运行」。
+      // 重开失败时前端拿不到原因，用后端 message（含具体错误）兜底。
+      const restartHint = res.restarted
+        ? "已切换并重新打开 VS Code"
+        : res.closedByUs
+          ? res.message || "已切换，但自动重新打开 VS Code 失败，请手动打开"
+          : "已切换；请打开 VS Code 生效";
+      const copiedHint = copied > 0 ? `已复制 ${copied} 个会话` : null;
 
       if (errors.length > 0) {
         toast.warning(`已切换至「${nickname}」，但部分会话未复制`, {
           description: [
             `已复制 ${copied} 个会话`,
             `${errors.length} 个失败：${errors.map((e) => e.error).join("；")}`,
-            "请重载 VS Code 窗口生效",
+            restartHint,
           ].join("；"),
         });
       } else {
         toast.success(`已切换至「${nickname}」`, {
-          description: [
-            copied > 0 ? `已复制 ${copied} 个会话` : null,
-            res.message || "请重载 VS Code 窗口生效",
-          ]
-            .filter(Boolean)
-            .join("；"),
+          description: [copiedHint, restartHint].filter(Boolean).join("；"),
         });
       }
       onOpenChange(false);
@@ -155,6 +186,14 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const copyCount = copyEnabled ? selected.size : 0;
   const hasCopyable = groups.length > 0;
   const running = vscodeExtStatus?.running === true;
+  /** 扩展未登录（`loggedIn === false`）：按新会话写入，仅影响提示文案。 */
+  const notLoggedIn = vscodeExtStatus?.loggedIn === false;
+  /** 本次会由后端关闭并重开 VS Code（仅在编辑器正在运行且开关打开时）。 */
+  const autoClose = running && autoRestart;
+  /** 未登录时的追加说明（三态提示卡共用，作为卡片内第二段）。 */
+  const notLoggedInHint = notLoggedIn
+    ? "未检测到扩展登录态，将按新会话写入；切换后打开 VS Code 即登录为目标账号。"
+    : undefined;
   const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, dataRoot, hasCopyable);
 
   return (
@@ -173,22 +212,59 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
         {busy && (
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-3 rounded-lg bg-background/85 backdrop-blur-sm">
             <Loader2 className="size-8 animate-spin text-primary" />
-            <p className="text-sm font-medium">正在切换并复制会话…</p>
+            <p className="text-sm font-medium">
+              {autoClose ? "正在关闭 VS Code 并写入凭证…" : "正在切换并复制会话…"}
+            </p>
             <p className="max-w-xs text-center text-xs text-muted-foreground">
-              正在处理中，请勿关闭窗口
+              {autoClose
+                ? "若 VS Code 弹出保存提示请先处理（最多等待 60 秒）"
+                : "正在处理中，请勿关闭窗口"}
             </p>
           </div>
         )}
 
         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
-          <Alert variant={running ? "destructive" : "warning"} className="min-w-0">
-            <AlertTitle>请先完全退出 VS Code</AlertTitle>
-            <AlertDescription className="min-w-0 break-words">
-              {running
-                ? "检测到 VS Code 正在运行。运行中写入会被覆盖且不会生效，请完全退出后重试。"
-                : "复制会话与写入凭证都必须在 VS Code 完全退出后进行，否则会被运行中的编辑器覆盖。"}
-            </AlertDescription>
-          </Alert>
+          {/* 三态提示：与 WorkBuddy「什么是关联会话？」信息卡同构，只差图标与色调。 */}
+          {running ? (
+            autoRestart ? (
+              <NoticeCard
+                icon={<RefreshCw className="size-4" />}
+                title="将自动关闭并重开 VS Code"
+                description="将先关闭 VS Code（未保存内容由 VS Code 自身提示/热退出保护），写入凭证后自动重新打开。"
+                extra={notLoggedInHint}
+              />
+            ) : (
+              <NoticeCard
+                icon={<TriangleAlert className="size-4" />}
+                tone="warning"
+                title="请先完全退出 VS Code"
+                description="已关闭「自动关闭并重开」。检测到 VS Code 正在运行，运行中写入会被覆盖且不会生效，请完全退出后重试。"
+                extra={notLoggedInHint}
+              />
+            )
+          ) : (
+            <NoticeCard
+              icon={<CircleCheck className="size-4" />}
+              title="VS Code 未运行，可直接切换"
+              description="写入凭证后打开 VS Code，扩展即为目标账号。"
+              extra={notLoggedInHint}
+            />
+          )}
+
+          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium">自动关闭并重开 VS Code</div>
+              <div className="text-xs text-muted-foreground">
+                VS Code 运行时先自动关闭编辑器，写入凭证后再重新打开
+              </div>
+            </div>
+            <Switch
+              checked={autoRestart}
+              onCheckedChange={toggleAutoRestart}
+              disabled={busy}
+              aria-label="自动关闭并重开 VS Code"
+            />
+          </div>
 
           <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
             <div className="min-w-0 flex-1">
@@ -207,6 +283,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
               checked={copyEnabled}
               onCheckedChange={setCopyEnabled}
               disabled={loadingSessions || !hasCopyable}
+              aria-label="复制会话到目标账号"
             />
           </div>
 
@@ -341,6 +418,54 @@ function emptyStateHint(
   if (!sourceUid) return "未检测到 VS Code 扩展当前登录账号，请先在 VS Code 中登录";
   if (!hasCopyable) return "当前账号暂无可复制的会话（无含正文的历史）";
   return "将当前账号勾选的会话以新 id 复制给目标账号（加法，不影响源账号）";
+}
+
+/** 提示卡色调：只影响图标与标题着色，不改底色（复用主题 token 与仓库既有的 amber 用法）。 */
+type NoticeTone = "default" | "warning";
+
+const NOTICE_TONE: Record<NoticeTone, { icon: string; title: string }> = {
+  default: { icon: "text-muted-foreground", title: "" },
+  warning: { icon: "text-amber-600 dark:text-amber-400", title: "text-amber-700 dark:text-amber-400" },
+};
+
+/**
+ * 纯展示状态提示卡：与 `session-sync-section.tsx` 的「什么是关联会话？」信息卡**同构**
+ * （`flex items-start gap-3 rounded-md border bg-muted/30 px-3 py-3` + `size-8` 边框图标方块
+ * + `text-sm font-medium` 标题 + `text-xs text-muted-foreground` 说明）。
+ * `extra` 为同一卡片内的第二段说明；`tone` 只切换图标/标题色调，不引入新底色。
+ */
+function NoticeCard({
+  icon,
+  title,
+  description,
+  extra,
+  tone = "default",
+}: {
+  icon: ReactNode;
+  title: string;
+  description: string;
+  /** 追加说明（如未登录提示），渲染为卡片内第二段。 */
+  extra?: string;
+  tone?: NoticeTone;
+}) {
+  const colors = NOTICE_TONE[tone];
+  return (
+    <div className="flex min-w-0 items-start gap-3 rounded-md border bg-muted/30 px-3 py-3">
+      <span
+        className={cn(
+          "flex size-8 shrink-0 items-center justify-center rounded-md border bg-background",
+          colors.icon,
+        )}
+      >
+        {icon}
+      </span>
+      <div className="min-w-0 space-y-0.5">
+        <div className={cn("text-sm font-medium", colors.title)}>{title}</div>
+        <p className="text-xs text-muted-foreground">{description}</p>
+        {extra && <p className="text-xs text-muted-foreground">{extra}</p>}
+      </div>
+    </div>
+  );
 }
 
 /** 组头三态复选框：全选 / 半选（点击即全选）/ 未选。 */
