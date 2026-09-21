@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -25,6 +25,7 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionLinksMeta } from "@/components/session-link-shared";
 import { VscodeSessionSyncSection } from "@/components/vscode-session-sync-section";
 import * as api from "@/lib/api";
@@ -84,8 +85,8 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  /** 当前 tab：复制会话（主流程）与关联会话（同步）互相独立。 */
-  const [tab, setTab] = useState<"copy" | "links">("copy");
+  /** 当前 tab：与 WorkBuddy 切换弹窗同一顺序与默认值（关联会话在前）。 */
+  const [tab, setTab] = useState<"links" | "copy">("links");
   /** 关联会话区块上报的状态（tab 徽标 / 未登录时隐藏 tab）。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
   /** 勾选提交给后端的同步选择（绑定预览凭据，执行前后端会重新校验）。 */
@@ -285,11 +286,34 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   const notLoggedIn = vscodeExtStatus?.loggedIn === false;
   /** 本次会由后端关闭并重开 VS Code（仅在编辑器正在运行且开关打开时）。 */
   const autoClose = running && autoRestart;
-  /** 未登录时的追加说明（三态提示卡共用，作为卡片内第二段）。 */
+  /** 未登录时的追加说明（三态提示共用，渲染为 tooltip 内第二段）。 */
   const notLoggedInHint = notLoggedIn
     ? "未检测到 VS Code CodeBuddy 插件登录态，将按新会话写入；切换后打开 VS Code 即登录为目标账号。"
     : undefined;
   const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, dataRoot, hasCopyable);
+  /** 标题行状态图标：三态提示收进 tooltip，仅以图标色调区分正常/警告。 */
+  const statusNotice = running
+    ? autoRestart
+      ? {
+          icon: <RefreshCw className="size-4" />,
+          title: "将自动关闭并重开 VS Code",
+          description:
+            "将先关闭 VS Code（未保存内容由 VS Code 自身提示/热退出保护），写入凭证后自动重新打开。",
+          warning: false,
+        }
+      : {
+          icon: <TriangleAlert className="size-4" />,
+          title: "请先完全退出 VS Code",
+          description:
+            "已关闭「自动关闭并重开」。检测到 VS Code 正在运行，运行中写入会被覆盖且不会生效，请完全退出后重试。",
+          warning: true,
+        }
+    : {
+        icon: <CircleCheck className="size-4" />,
+        title: "VS Code 未运行，可直接切换",
+        description: "写入凭证后打开 VS Code，插件即为目标账号。",
+        warning: false,
+      };
 
   // 关联 tab 不可用（能力判定不通过）时回落到复制会话，避免停在空 tab。
   useEffect(() => {
@@ -302,15 +326,18 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
       <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium">复制会话到目标账号</div>
-          <div
-            className={
-              !loadingSessions && !hasCopyable
-                ? "text-xs text-amber-700 dark:text-amber-400"
-                : "text-xs text-muted-foreground"
-            }
-          >
-            {emptyHint}
-          </div>
+          {loadingSessions ? (
+            // 单行高度对齐真实提示文案（实测常见态折一行，16px），加载完成后不跳高度。
+            <Skeleton className="h-4 w-3/4" aria-hidden="true" />
+          ) : (
+            <div
+              className={
+                !hasCopyable ? "text-xs text-amber-700 dark:text-amber-400" : "text-xs text-muted-foreground"
+              }
+            >
+              {emptyHint}
+            </div>
+          )}
         </div>
         <Switch
           checked={copyEnabled}
@@ -388,9 +415,63 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
       <DialogContent
         showCloseButton={!busy}
         className="flex max-h-[min(90vh,calc(100vh-2rem))] min-w-0 flex-col overflow-hidden"
+        tabIndex={-1}
+        onOpenAutoFocus={(event) => {
+          // Radix 默认把焦点交给第一个可聚焦元素（状态图标 / 自动重开开关），
+          // 其 Tooltip 会因 focus 常驻在弹窗上；改为聚焦弹窗容器本身。
+          event.preventDefault();
+          const container = event.target as HTMLElement | null;
+          window.requestAnimationFrame(() => container?.focus());
+        }}
       >
         <DialogHeader className="shrink-0">
-          <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
+          <div className="flex items-center gap-3">
+            <DialogTitle className="min-w-0 flex-1">
+              切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」
+            </DialogTitle>
+            {/* 提示收进图标 tooltip、开关与标题同行；mr-6 为右上角关闭按钮留空位。 */}
+            <div className="mr-6 flex shrink-0 items-center gap-2">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {/* 仅悬停出提示：不加 tabIndex，避免点击/自动聚焦后 Tooltip 常驻不消失。 */}
+                  <span
+                    className={cn(
+                      "flex size-5 cursor-help items-center justify-center",
+                      statusNotice.warning
+                        ? "text-amber-600 dark:text-amber-400"
+                        : "text-muted-foreground",
+                    )}
+                    aria-label={statusNotice.title}
+                  >
+                    {statusNotice.icon}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="end" className="max-w-xs space-y-1">
+                  <div className="font-medium">{statusNotice.title}</div>
+                  <p className="text-muted-foreground">{statusNotice.description}</p>
+                  {notLoggedInHint && <p className="text-muted-foreground">{notLoggedInHint}</p>}
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span className="inline-flex">
+                    <Switch
+                      checked={autoRestart}
+                      onCheckedChange={toggleAutoRestart}
+                      disabled={busy}
+                      aria-label="自动关闭并重开 VS Code"
+                    />
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" align="end" className="max-w-xs space-y-1">
+                  <div className="font-medium">自动关闭并重开 VS Code</div>
+                  <p className="text-muted-foreground">
+                    VS Code 运行时先自动关闭编辑器，写入凭证后再重新打开
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </div>
+          </div>
           <DialogDescription>
             将把所选账号写入 VS Code CodeBuddy 插件；可选把当前账号的会话复制过去，并把关联会话的新内容同步过去。
           </DialogDescription>
@@ -417,62 +498,20 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
         )}
 
         <div className="min-h-0 space-y-3 overflow-x-hidden overflow-y-auto">
-          {/* 三态提示：与 WorkBuddy「什么是关联会话？」信息卡同构，只差图标与色调。 */}
-          {running ? (
-            autoRestart ? (
-              <NoticeCard
-                icon={<RefreshCw className="size-4" />}
-                title="将自动关闭并重开 VS Code"
-                description="将先关闭 VS Code（未保存内容由 VS Code 自身提示/热退出保护），写入凭证后自动重新打开。"
-                extra={notLoggedInHint}
-              />
-            ) : (
-              <NoticeCard
-                icon={<TriangleAlert className="size-4" />}
-                tone="warning"
-                title="请先完全退出 VS Code"
-                description="已关闭「自动关闭并重开」。检测到 VS Code 正在运行，运行中写入会被覆盖且不会生效，请完全退出后重试。"
-                extra={notLoggedInHint}
-              />
-            )
-          ) : (
-            <NoticeCard
-              icon={<CircleCheck className="size-4" />}
-              title="VS Code 未运行，可直接切换"
-              description="写入凭证后打开 VS Code，插件即为目标账号。"
-              extra={notLoggedInHint}
-            />
-          )}
-
-          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">自动关闭并重开 VS Code</div>
-              <div className="text-xs text-muted-foreground">
-                VS Code 运行时先自动关闭编辑器，写入凭证后再重新打开
-              </div>
-            </div>
-            <Switch
-              checked={autoRestart}
-              onCheckedChange={toggleAutoRestart}
-              disabled={busy}
-              aria-label="自动关闭并重开 VS Code"
-            />
-          </div>
-
           {linksAvailable ? (
             <Tabs
               value={tab}
-              onValueChange={(value) => setTab(value as "copy" | "links")}
+              onValueChange={(value) => setTab(value as "links" | "copy")}
               className="flex min-h-0 flex-col gap-3 overflow-hidden"
             >
               <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
-                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
-                  复制会话
-                  {tabCount(copyCount)}
-                </TabsTrigger>
                 <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
                   关联会话
                   {tabCount(linksMeta?.groupCount ?? 0)}
+                </TabsTrigger>
+                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
+                  复制会话
+                  {tabCount(copyCount)}
                 </TabsTrigger>
               </TabsList>
               {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
@@ -585,54 +624,6 @@ function emptyStateHint(
   if (!sourceUid) return "未检测到 VS Code CodeBuddy 插件当前登录账号，请先在 VS Code 中登录";
   if (!hasCopyable) return "当前账号暂无可复制的会话（无含正文的历史）";
   return "将当前账号勾选的会话以新 id 复制给目标账号（加法，不影响源账号）";
-}
-
-/** 提示卡色调：只影响图标与标题着色，不改底色（复用主题 token 与仓库既有的 amber 用法）。 */
-type NoticeTone = "default" | "warning";
-
-const NOTICE_TONE: Record<NoticeTone, { icon: string; title: string }> = {
-  default: { icon: "text-muted-foreground", title: "" },
-  warning: { icon: "text-amber-600 dark:text-amber-400", title: "text-amber-700 dark:text-amber-400" },
-};
-
-/**
- * 纯展示状态提示卡：与 `session-sync-section.tsx` 的「什么是关联会话？」信息卡**同构**
- * （`flex items-start gap-3 rounded-md border bg-muted/30 px-3 py-3` + `size-8` 边框图标方块
- * + `text-sm font-medium` 标题 + `text-xs text-muted-foreground` 说明）。
- * `extra` 为同一卡片内的第二段说明；`tone` 只切换图标/标题色调，不引入新底色。
- */
-function NoticeCard({
-  icon,
-  title,
-  description,
-  extra,
-  tone = "default",
-}: {
-  icon: ReactNode;
-  title: string;
-  description: string;
-  /** 追加说明（如未登录提示），渲染为卡片内第二段。 */
-  extra?: string;
-  tone?: NoticeTone;
-}) {
-  const colors = NOTICE_TONE[tone];
-  return (
-    <div className="flex min-w-0 items-start gap-3 rounded-md border bg-muted/30 px-3 py-3">
-      <span
-        className={cn(
-          "flex size-8 shrink-0 items-center justify-center rounded-md border bg-background",
-          colors.icon,
-        )}
-      >
-        {icon}
-      </span>
-      <div className="min-w-0 space-y-0.5">
-        <div className={cn("text-sm font-medium", colors.title)}>{title}</div>
-        <p className="text-xs text-muted-foreground">{description}</p>
-        {extra && <p className="text-xs text-muted-foreground">{extra}</p>}
-      </div>
-    </div>
-  );
 }
 
 /** 组头三态复选框：全选 / 半选（点击即全选）/ 未选。 */
