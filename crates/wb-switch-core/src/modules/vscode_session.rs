@@ -39,7 +39,9 @@ use std::path::{Path, PathBuf};
 
 use crate::modules::account::{self, get_str};
 use crate::modules::config::{atomic_write, backup_dir, utc_iso};
+use crate::modules::session::{SessionPaths, SyncSelection};
 use crate::modules::vscode_ext;
+use crate::modules::vscode_session_sync;
 
 /// 扩展数据根目录名（`<平台本地数据根>\CodeBuddyExtension\Data`）。
 const EXT_APP_DIR: &str = "CodeBuddyExtension";
@@ -133,7 +135,7 @@ fn is_safe_uid(uid: &str) -> bool {
 }
 
 /// 是否为 32 位小写 hex id。
-fn is_hex32(text: &str) -> bool {
+pub(crate) fn is_hex32(text: &str) -> bool {
     text.len() == 32
         && text
             .bytes()
@@ -166,7 +168,7 @@ fn unique_hex32(used: &mut BTreeSet<String>) -> String {
 // ---------------------------------------------------------------------------
 
 /// 读取并解析 JSON 文件；文件缺失或内容损坏时返回 `None`（不 panic）。
-fn read_json(path: &Path) -> Option<Value> {
+pub(crate) fn read_json(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&text).ok()
 }
@@ -192,7 +194,7 @@ fn time_to_ms(value: Option<&Value>) -> i64 {
 }
 
 /// 递归复制目录（保持相对结构与文件名，含附件中文名）。
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)?.flatten() {
         let path = entry.path();
@@ -207,7 +209,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// 尽力删除目录树（忽略不存在 / 失败）。
-fn remove_dir_all_if_exists(path: &Path) {
+pub(crate) fn remove_dir_all_if_exists(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_dir_all(path);
     }
@@ -463,65 +465,129 @@ pub fn copy_sessions_in(
     Ok(report)
 }
 
-/// 切换 VS Code CodeBuddy 扩展账号，并可选「先复制会话后注入 token」。
+/// 切换 VS Code CodeBuddy 扩展账号，可选「先复制会话」与「把关联会话的新增内容同步过去」。
 ///
-/// 时序（D11）：校验目标（账号 / `access_token` / 目录 / db，注定失败的先挡掉、不关编辑器）
-/// → 关闭（`restart = true` 时；失败即返回，此时编辑器未被触碰）
-/// → 复制（本体自带「编辑器未运行」前置，所以关闭必须在它之前）→ 注入 token → 重开。
-/// 复制按逐条隔离执行；若注入失败但会话已复制，返回明确文案说明残留状态，不做隐式回滚。
+/// 时序（D11 / design §7）：校验目标（账号 / `access_token` / 目录 / db，注定失败的先挡掉、
+/// 不关编辑器）→ 关闭（`restart = true` 时；失败即返回，此时编辑器未被触碰）
+/// → 复制（本体自带「编辑器未运行」前置，所以关闭必须在它之前）并登记关联
+/// → 执行勾选的同步 → 注入 token → 重开。
 ///
-/// 复制失败或注入失败且编辑器是本次我们关闭的 → best-effort 开回来再报错，
-/// 避免「编辑器关了、会话也没复制成 / 账号也没切成」的双输。
+/// 复制与同步都按逐条隔离执行：任一条失败不影响其余条目与后续的账号切换，失败原因写在
+/// 各自报告里（`errors` / `linkErrors`），不静默吞掉。若注入失败但已有会话被处理过，
+/// 返回明确文案说明残留状态，不做隐式回滚；失败且编辑器是本次我们关闭的 →
+/// best-effort 开回来再报错，避免「编辑器关了、会话也没处理成 / 账号也没切成」的双输。
 pub fn switch_vscode_ext_with_copy(
     account_id: &str,
     restart: bool,
     items: &[CopyItem],
+    sync_selections: &[SyncSelection],
 ) -> Result<Value, String> {
-    if items.is_empty() {
+    if items.is_empty() && sync_selections.is_empty() {
         return vscode_ext::switch_account(account_id, restart);
     }
     let acc = account::find_account(account_id)
         .ok_or_else(|| format!("账号不存在: {account_id}"))?;
     let target_uid = get_str(&acc, "uid")
-        .ok_or_else(|| "账号缺少 uid，无法定位 VS Code CodeBuddy 插件数据目录，无法复制会话".to_string())?;
+        .ok_or_else(|| "账号缺少 uid，无法定位 VS Code CodeBuddy 插件数据目录".to_string())?;
 
     // 与 [`vscode_ext::switch_account`] 同序：先把「注定失败」的目标挡在关闭之前，
     // 账号存在但 `access_token` 为空 / 数据目录或 state.vscdb 缺失时不该关掉用户的编辑器。
     vscode_ext::validate_switch_target(account_id)?;
 
-    // 关闭必须在复制之前：`copy_vscode_sessions` 会拒绝「VS Code 正在运行」。
+    // 关闭必须在复制与同步之前：两者都会拒绝「VS Code 正在运行」。
     let closed = vscode_ext::close_vscode_for_switch(restart)?;
 
-    let report = match copy_vscode_sessions(&target_uid, items) {
-        Ok(report) => report,
-        Err(error) => {
-            if let Some(closed) = &closed {
-                let _ = vscode_ext::relaunch_closed_editor(closed);
+    let copy_report = if items.is_empty() {
+        None
+    } else {
+        match copy_vscode_sessions(&target_uid, items) {
+            Ok(mut report) => {
+                // 复制成功即登记「源 ↔ 副本」关联；登记失败不回滚复制，只写进报告（design §5）。
+                let link_errors = match ext_data_root() {
+                    Some(root) => vscode_session_sync::register_copied_sessions(
+                        &root,
+                        &SessionPaths::for_vscode_ext(),
+                        account::variant_of(&acc),
+                        &report,
+                    ),
+                    None => vec![json!({
+                        "error": "未找到 VS Code CodeBuddy 插件数据目录，未能建立会话关联",
+                    })],
+                };
+                if !link_errors.is_empty() {
+                    report["linkErrors"] = json!(link_errors);
+                }
+                Some(report)
             }
-            return Err(error);
+            Err(error) => {
+                if let Some(closed) = &closed {
+                    let _ = vscode_ext::relaunch_closed_editor(closed);
+                }
+                return Err(error);
+            }
         }
     };
 
+    let sync_report = if sync_selections.is_empty() {
+        None
+    } else {
+        // 同步失败不阻断切换：报告形状与成功路径一致，错误挂在 `errors` 里（与 WorkBuddy 同口径）。
+        Some(match vscode_session_sync::sync_selected(&acc, sync_selections) {
+            Ok(report) => report,
+            Err(error) => json!({
+                "synced": [],
+                "skipped": [],
+                "errors": [{ "error": error }],
+            }),
+        })
+    };
+
+    let copied = copy_report
+        .as_ref()
+        .map(|report| count_items(report, "copied"))
+        .unwrap_or(0);
+    let synced = sync_report
+        .as_ref()
+        .map(|report| count_items(report, "synced"))
+        .unwrap_or(0);
+
     match vscode_ext::switch_account_after_close(account_id, closed) {
         Ok(mut result) => {
-            result["sessionCopy"] = report;
+            if let Some(report) = copy_report {
+                result["sessionCopy"] = report;
+            }
+            if let Some(report) = sync_report {
+                result["sessionSync"] = report;
+            }
             Ok(result)
         }
         Err(error) => {
-            let copied = report
-                .get("copied")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0);
+            let mut done: Vec<String> = Vec::new();
             if copied > 0 {
-                Err(format!(
-                    "{error}（注意：已成功复制 {copied} 个会话到目标账号，但账号切换未完成，请重试切换）"
-                ))
-            } else {
+                done.push(format!("已成功复制 {copied} 个会话到目标账号"));
+            }
+            if synced > 0 {
+                done.push(format!("已成功同步 {synced} 个会话"));
+            }
+            if done.is_empty() {
                 Err(error)
+            } else {
+                Err(format!(
+                    "{error}（注意：{}，但账号切换未完成，请重试切换）",
+                    done.join("、")
+                ))
             }
         }
     }
+}
+
+/// 报告里某一类条目的数量（缺字段按 0）。
+fn count_items(report: &Value, key: &str) -> usize {
+    report
+        .get(key)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// 目标工作区的去重集合（仅保留合法的 32 位小写 hex，避免建出无关目录）。
@@ -610,11 +676,14 @@ impl WorkspaceState {
 }
 
 /// 会话内 id 重映射计划。
-struct RemapPlan {
+pub(crate) struct RemapPlan {
     /// 旧消息 id → 新消息 id。
     message_ids: BTreeMap<String, String>,
     /// 旧请求 id → 新请求 id。
     request_ids: BTreeMap<String, String>,
+    /// 递归精确匹配用的合并表：`message_ids` 优先于 `request_ids`
+    /// （与历史 `lookup` 的两表顺序一致）。
+    combined_ids: BTreeMap<String, String>,
     /// 参与复制的消息数量（用于报告）。
     message_total: usize,
 }
@@ -660,18 +729,37 @@ impl RemapPlan {
 
         Self {
             message_total: message_ids.len(),
+            combined_ids: merge_message_first(&message_ids, &request_ids),
             message_ids,
             request_ids,
         }
     }
+}
 
-    /// 精确查找某旧 id 对应的新 id（先消息表、后请求表；未命中返回 `None`）。
-    fn lookup(&self, old_id: &str) -> Option<&str> {
-        self.message_ids
-            .get(old_id)
-            .or_else(|| self.request_ids.get(old_id))
-            .map(String::as_str)
+/// 用给定的 id 映射表构造计划：复制路径用随机新 hex，覆盖同步用确定性派生 id。
+pub(crate) fn remap_plan_from_maps(
+    message_ids: BTreeMap<String, String>,
+    request_ids: BTreeMap<String, String>,
+) -> RemapPlan {
+    RemapPlan {
+        message_total: message_ids.len(),
+        combined_ids: merge_message_first(&message_ids, &request_ids),
+        message_ids,
+        request_ids,
     }
+}
+
+/// 合并两张 id 映射表：`messages` 优先（同一个旧 id 同时出现在两张表时以消息表为准，
+/// 与历史 `lookup` 的先后顺序一致）。仅用于「递归精确匹配」这一类不做区分的遍历。
+fn merge_message_first(
+    message_ids: &BTreeMap<String, String>,
+    request_ids: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut combined = request_ids.clone();
+    for (old_id, new_id) in message_ids {
+        combined.insert(old_id.clone(), new_id.clone());
+    }
+    combined
 }
 
 /// 为一个旧 id 生成并登记新 id（空串或已登记则跳过）。
@@ -745,23 +833,25 @@ fn copy_one_conversation(
     }))
 }
 
-/// 在临时目录写全一个会话：重映射后的 `index.json` + `messages/*` + 其余文件/目录原样复制。
-fn write_conversation(
+/// 在目标目录写全一个会话：重映射后的 `index.json` + `messages/*` + 其余文件/目录原样复制。
+///
+/// 覆盖同步（`vscode_session_sync`）复用同一个写入器，只是 id 来源换成确定性派生。
+pub(crate) fn write_conversation(
     source_dir: &Path,
-    tmp_dir: &Path,
+    dest_dir: &Path,
     source_index: &Value,
     plan: &RemapPlan,
 ) -> std::io::Result<()> {
-    std::fs::create_dir_all(tmp_dir)?;
+    std::fs::create_dir_all(dest_dir)?;
 
     // 1) 重映射后的会话索引。
     let remapped_index = remap_session_index(source_index, plan);
-    std::fs::write(tmp_dir.join("index.json"), remapped_index.to_string())?;
+    std::fs::write(dest_dir.join("index.json"), remapped_index.to_string())?;
 
     // 2) messages/<oldId>.json → messages/<newId>.json，并重写 id / extra 内的 id 引用。
     let source_messages = source_dir.join("messages");
     if source_messages.is_dir() {
-        let target_messages = tmp_dir.join("messages");
+        let target_messages = dest_dir.join("messages");
         std::fs::create_dir_all(&target_messages)?;
         for entry in std::fs::read_dir(&source_messages)?.flatten() {
             let path = entry.path();
@@ -800,11 +890,11 @@ fn write_conversation(
     if source_bak.is_file() {
         match read_json(&source_bak) {
             Some(bak) => std::fs::write(
-                tmp_dir.join(".index_bak.json"),
+                dest_dir.join(".index_bak.json"),
                 remap_session_index(&bak, plan).to_string(),
             )?,
             None => {
-                std::fs::copy(&source_bak, tmp_dir.join(".index_bak.json"))?;
+                std::fs::copy(&source_bak, dest_dir.join(".index_bak.json"))?;
             }
         }
     }
@@ -817,9 +907,9 @@ fn write_conversation(
         }
         let path = entry.path();
         if path.is_dir() {
-            copy_dir_recursive(&path, &tmp_dir.join(&name))?;
+            copy_dir_recursive(&path, &dest_dir.join(&name))?;
         } else if path.is_file() {
-            std::fs::copy(&path, tmp_dir.join(&name))?;
+            std::fs::copy(&path, dest_dir.join(&name))?;
         }
     }
     Ok(())
@@ -882,15 +972,18 @@ fn remap_message_file(text: &str, old_stem: &str, plan: &RemapPlan) -> String {
 }
 
 /// 重映射消息 `extra` 内的 id 引用（兼容字符串化 JSON 与对象两种形态）。
-///
-/// 覆盖两类引用：
-/// - **已知键**：`requestId` → [`RemapPlan::request_ids`]；`responseId` → [`RemapPlan::message_ids`]
-///   （实测 `responseId` 取值恒等于消息自身 id，故用消息映射表；映射表未命中则保留原值）。
-/// - **嵌套结构**：对 `extra` 内所有层级做递归「精确匹配」重映射——仅当字符串与某个旧
-///   messageId / requestId **完全相等**时才替换为新 id。据此可覆盖
-///   `tasks` / `sourceContentBlocks` / `selectionContexts` 等若嵌入了上述 id 的情形，
-///   且不会误伤正文、`modelId` 等无关字符串。
 fn remap_extra(extra: &Value, plan: &RemapPlan) -> Value {
+    replace_ids_in_extra(extra, &plan.combined_ids)
+}
+
+/// id 容器（消息 `extra`）的通用替换：兼容字符串化 JSON 与对象两种形态。
+///
+/// 顶层与嵌套一视同仁——对容器内所有层级做「精确等于某旧 id」的替换，
+/// 因此 `requestId` / `responseId` 与 `tasks` / `sourceContentBlocks` /
+/// `selectionContexts` 等嵌套引用走同一条规则，不会误伤正文、`modelId` 等无关字符串。
+///
+/// 复制路径传「旧 id → 新 hex」，摘要路径传「旧 id → 占位符」（design §3）。
+pub(crate) fn replace_ids_in_extra(extra: &Value, map: &BTreeMap<String, String>) -> Value {
     let (mut object, stringified) = match extra {
         Value::String(text) => match serde_json::from_str::<Value>(text) {
             Ok(Value::Object(map)) => (map, true),
@@ -899,16 +992,9 @@ fn remap_extra(extra: &Value, plan: &RemapPlan) -> Value {
         Value::Object(map) => (map.clone(), false),
         _ => return extra.clone(),
     };
-
-    // 1) 顶层已知键（语义明确、显式处理）。
-    remap_known_key(&mut object, "requestId", &plan.request_ids);
-    remap_known_key(&mut object, "responseId", &plan.message_ids);
-
-    // 2) 嵌套容器：递归精确匹配重映射（tasks / sourceContentBlocks / selectionContexts 等）。
     for value in object.values_mut() {
-        remap_value_recursive(value, plan);
+        replace_exact_ids(value, map);
     }
-
     let value = Value::Object(object);
     if stringified {
         json!(value.to_string())
@@ -917,36 +1003,22 @@ fn remap_extra(extra: &Value, plan: &RemapPlan) -> Value {
     }
 }
 
-/// 若对象中 `key` 对应的字符串值命中 `map`，则替换为新 id；否则原样保留。
-fn remap_known_key(
-    object: &mut serde_json::Map<String, Value>,
-    key: &str,
-    map: &BTreeMap<String, String>,
-) {
-    let Some(Value::String(current)) = object.get(key) else {
-        return;
-    };
-    if let Some(new_id) = map.get(current) {
-        object.insert(key.to_string(), json!(new_id));
-    }
-}
-
-/// 递归遍历任意 JSON 值，把「恰好等于某旧 messageId / requestId」的字符串替换为新 id。
-fn remap_value_recursive(value: &mut Value, plan: &RemapPlan) {
+/// 递归遍历任意 JSON 值，把「恰好等于映射表中某个旧 id」的字符串替换为映射值。
+pub(crate) fn replace_exact_ids(value: &mut Value, map: &BTreeMap<String, String>) {
     match value {
         Value::String(text) => {
-            if let Some(new_id) = plan.lookup(text) {
-                *value = json!(new_id);
+            if let Some(replacement) = map.get(text) {
+                *value = json!(replacement);
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                remap_value_recursive(item, plan);
+                replace_exact_ids(item, map);
             }
         }
-        Value::Object(map) => {
-            for item in map.values_mut() {
-                remap_value_recursive(item, plan);
+        Value::Object(object) => {
+            for item in object.values_mut() {
+                replace_exact_ids(item, map);
             }
         }
         _ => {}
@@ -1084,7 +1156,21 @@ mod tests {
             workspace_hash: WS.to_string(),
             conversation_id: CONV_OLD.to_string(),
         }];
-        let error = switch_vscode_ext_with_copy(&missing, true, &items).unwrap_err();
+        let error = switch_vscode_ext_with_copy(&missing, true, &items, &[]).unwrap_err();
+        assert!(error.contains("账号不存在"), "{error}");
+    }
+
+    /// 时序（design §7）：只勾同步（不勾复制）时也走编排 wrapper，
+    /// 且目标校验同样必须早于 `close_vscode_for_switch`。
+    #[test]
+    fn switch_with_sync_only_validates_before_closing_editor() {
+        let missing = format!("no-such-account-{}", uuid::Uuid::new_v4().simple());
+        let selections = vec![SyncSelection {
+            group_id: "group-1".to_string(),
+            preview_token: "00000000-0000-4000-8000-000000000000".to_string(),
+            mode: crate::modules::session_link::SyncMode::FastForward,
+        }];
+        let error = switch_vscode_ext_with_copy(&missing, true, &[], &selections).unwrap_err();
         assert!(error.contains("账号不存在"), "{error}");
     }
 

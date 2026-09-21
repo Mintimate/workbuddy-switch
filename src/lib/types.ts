@@ -717,6 +717,8 @@ export interface VscodeExtSwitchResult {
   message?: string;
   /** 切换时复制会话的结果（未勾选复制时不返回）。 */
   sessionCopy?: VscodeSessionCopyResult;
+  /** 切换时同步关联会话的结果（未勾选同步时不返回）。 */
+  sessionSync?: VscodeSessionSyncReport;
 }
 
 /** VS Code 扩展的一条可复制会话。 */
@@ -749,6 +751,42 @@ export interface VscodeSessionCopyResult {
   errors?: { workspaceHash: string; conversationId: string; error: string }[];
   /** 索引备份根目录（便于用户找回）。 */
   backup?: string;
+  /**
+   * 已复制但未能建立关联的条目（复制成功、登记失败；登记失败不回滚复制）。
+   * 前端据此提示「已复制但未建立关联」，不得静默当成成功。
+   */
+  linkErrors?: { workspaceHash?: string; conversationId?: string; error: string }[];
+}
+
+/** VS Code 插件侧「关联会话」的同步结果项（与 core 报告同形）。 */
+export interface VscodeSessionSyncResultItem {
+  groupId: string;
+  status: "synced";
+  verdict: SessionSyncVerdict;
+  mode: SessionSyncMode;
+  /** 记录数（条）：source 为来源当前条数，targetBefore/target 为副本写入前后条数。 */
+  recordCount: { source: number; targetBefore: number; target: number };
+  /** 附件合并结果（快进模式补入的附件）。 */
+  assets: { copied: number; overwritten: number };
+  /** 本次备份目录（快进为索引备份，覆盖为整目录备份）。 */
+  backup: string;
+  message: string;
+}
+
+/** 被跳过的同步项（`reasonCode` 为 previewStale 时说明预览已过期，不得显示为成功）。 */
+export interface VscodeSessionSyncSkippedItem {
+  groupId: string;
+  status: "skipped";
+  reasonCode: string;
+  message: string;
+  verdict: SessionSyncVerdict | null;
+}
+
+/** VS Code 插件侧「关联会话」同步报告；`errors` 里可能是整批被拒（无 groupId）。 */
+export interface VscodeSessionSyncReport {
+  synced: VscodeSessionSyncResultItem[];
+  skipped: VscodeSessionSyncSkippedItem[];
+  errors: { groupId?: string; error: string }[];
 }
 
 /** 可复制会话列表。 */

@@ -20,7 +20,7 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, config,
     credit_usage, credits, export_import, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session,
+    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -84,6 +84,10 @@ pub fn router() -> Router {
         .route("/api/vscode-ext/sessions", get(api_vscode_ext_sessions))
         .route("/api/vscode-ext/switch", post(api_vscode_ext_switch))
         .route("/api/vscode-ext/detect", post(api_vscode_ext_detect))
+        .route(
+            "/api/vscode-ext/session-links",
+            post(api_vscode_ext_session_links_preview),
+        )
         .route("/api/delete", post(api_delete))
         .route("/api/oauth/start", post(api_oauth_start))
         .route("/api/oauth/status", post(api_oauth_status))
@@ -313,14 +317,51 @@ async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
         }
     };
 
-    let result = if copy_items.is_empty() {
+    // 同步选择与桌面端同形（[{groupId, previewToken, mode}]），形状由 core 校验。
+    let sync_selections = match session::parse_sync_selections(body.get("syncSelections")) {
+        Ok(selections) => selections,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+
+    let result = if copy_items.is_empty() && sync_selections.is_empty() {
         vscode_ext::switch_account(account_id, restart)
     } else {
-        vscode_session::switch_vscode_ext_with_copy(account_id, restart, &copy_items)
+        vscode_session::switch_vscode_ext_with_copy(
+            account_id,
+            restart,
+            &copy_items,
+            &sync_selections,
+        )
     };
     match result {
         Ok(v) => json_ok(v),
         Err(e) => json_err(e, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// POST /api/vscode-ext/session-links —— 预览当前插件账号 → 目标账号的关联会话同步项。
+///
+/// 与桌面端 `vscode_session_links_preview` 同形：直接返回 core 的只读预览
+/// （`supported` / `storeStatus` / `groups`），每组的 `defaultChecked` 与 `availableModes`
+/// 是前端的勾选权限来源。
+async fn api_vscode_ext_session_links_preview(Json(body): Json<Value>) -> Response {
+    let target_account_id = body
+        .get("targetAccountId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if target_account_id.trim().is_empty() {
+        return json_err("缺少 targetAccountId".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        vscode_session_sync::links_preview(&target)
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => json_ok(value),
+        Ok(Err(error)) => json_err(error, StatusCode::BAD_REQUEST),
+        Err(error) => json_err(error.to_string(), StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 

@@ -48,18 +48,36 @@ use crate::modules::session_link::{
 };
 use crate::modules::variant::WbVariant;
 
+/// 关联存储的命名空间：决定关联表 / 基线 / 预览凭据 / 存储锁的名字。
+///
+/// 两个宿主（WorkBuddy 桌面版与 VS Code CodeBuddy 插件）共用同一份内核
+/// （[`crate::modules::session_link`]），但各自的关联关系互不可见：
+/// 同一工具存储根下按命名空间取不同的文件名与目录名，避免互相污染。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LinkNamespace {
+    /// WorkBuddy 桌面版（默认，路径与改造前逐字相同）。
+    #[default]
+    WorkBuddy,
+    /// VS Code CodeBuddy 插件的会话（独立文件名与目录）。
+    VscodeExt,
+}
+
 /// 会话操作涉及的路径集合：工具存储根（`~/.wb-switch`）与档位数据根。
 ///
-/// 生产入口用 [`SessionPaths::for_variant`]；单测注入临时目录，
-/// 绝不触碰真实 `~/.wb-switch` 或 WorkBuddy 数据目录。
+/// 生产入口用 [`SessionPaths::for_variant`]（WorkBuddy）与 [`SessionPaths::for_vscode_ext`]
+/// （VS Code 插件）；单测注入临时目录，绝不触碰真实 `~/.wb-switch` 或客户端数据目录。
 #[derive(Clone, Debug)]
 pub struct SessionPaths {
     /// 工具存储根：关联表、基线、操作日志、锁与备份都在这里。
     pub store_root: PathBuf,
     /// 档位数据根：`projects/`、`workbuddy.db`、`edge-sync-mapping-*.db`。
+    /// VS Code 命名空间下不使用该字段（恒为空路径）。
     pub data_root: PathBuf,
     /// 该档位的官方登录态文件（来源账号 uid 的判据）。
+    /// VS Code 命名空间下不使用该字段（恒为空路径）。
     pub auth_file: PathBuf,
+    /// 关联存储命名空间；决定下面几个 `*_links*` 路径的名字。
+    pub link_namespace: LinkNamespace,
 }
 
 impl SessionPaths {
@@ -68,6 +86,26 @@ impl SessionPaths {
             store_root: store_dir(),
             data_root: variant.data_root(),
             auth_file: variant.auth_file_path(),
+            link_namespace: LinkNamespace::WorkBuddy,
+        }
+    }
+
+    /// VS Code CodeBuddy 插件的关联存储路径。
+    ///
+    /// 只用到 `store_root`：关联表 / 基线 / 预览凭据 / 存储锁都落在 `~/.wb-switch` 下
+    /// VS Code 专属的名字里（design §2）；扩展的会话文件由调用方按数据根另行解析，
+    /// 不走 `data_root` / `auth_file`（因此两者留空，避免误用）。
+    pub fn for_vscode_ext() -> Self {
+        Self::for_vscode_ext_at(store_dir())
+    }
+
+    /// [`Self::for_vscode_ext`] 的可测实现：显式传入工具存储根。
+    pub fn for_vscode_ext_at(store_root: PathBuf) -> Self {
+        Self {
+            store_root,
+            data_root: PathBuf::new(),
+            auth_file: PathBuf::new(),
+            link_namespace: LinkNamespace::VscodeExt,
         }
     }
 
@@ -87,12 +125,20 @@ impl SessionPaths {
         self.store_root.join("backups")
     }
 
+    /// 关联组主表：WorkBuddy 与 VS Code 插件各一份，互不可见（design §2）。
     pub fn session_links_file(&self) -> PathBuf {
-        self.store_root.join("session_links.json")
+        match self.link_namespace {
+            LinkNamespace::WorkBuddy => self.store_root.join("session_links.json"),
+            LinkNamespace::VscodeExt => self.store_root.join("vscode_session_links.json"),
+        }
     }
 
+    /// 关联存储目录（基线 / 凭据 / 操作日志的父目录）。
     pub fn session_links_dir(&self) -> PathBuf {
-        self.store_root.join("session-links")
+        match self.link_namespace {
+            LinkNamespace::WorkBuddy => self.store_root.join("session-links"),
+            LinkNamespace::VscodeExt => self.store_root.join("vscode-session-links"),
+        }
     }
 
     pub fn baselines_dir(&self) -> PathBuf {
@@ -118,8 +164,12 @@ impl SessionPaths {
             .join(format!("session-ops-{}.lock", variant.as_str()))
     }
 
+    /// 关联存储的短时全局锁文件：与主表同生命周期，按命名空间分开。
     pub fn link_store_lock_file(&self) -> PathBuf {
-        self.locks_dir().join("session-links.lock")
+        match self.link_namespace {
+            LinkNamespace::WorkBuddy => self.locks_dir().join("session-links.lock"),
+            LinkNamespace::VscodeExt => self.locks_dir().join("vscode-session-links.lock"),
+        }
     }
 }
 
@@ -3270,6 +3320,7 @@ mod tests {
                 store_root: root.join("store"),
                 data_root: root.join("data"),
                 auth_file: root.join("auth.info"),
+                link_namespace: LinkNamespace::WorkBuddy,
             };
             std::fs::create_dir_all(paths.projects_dir().join("ws-a")).unwrap();
             Env { root, paths }
@@ -3455,6 +3506,93 @@ mod tests {
     // ---------------------------------------------------------------------------
     // 基础路径与能力探测
     // ---------------------------------------------------------------------------
+
+    /// A1 防回归：WorkBuddy 命名空间下三条关联路径必须与改造前**逐字相同**
+    /// （存量关联表 / 基线 / 锁都在这些名字上，改名即等于数据丢失）。
+    #[test]
+    fn workbuddy_link_paths_are_byte_identical_to_before() {
+        let paths = SessionPaths::for_variant(WbVariant::Cn);
+        assert!(paths.session_links_file().ends_with("session_links.json"));
+        assert!(paths.session_links_dir().ends_with("session-links"));
+        assert!(paths.baselines_dir().ends_with("session-links/baselines"));
+        assert!(paths.preview_tokens_dir().ends_with("session-links/previews"));
+        assert!(paths.operations_dir().ends_with("session-links/operations"));
+        assert!(paths
+            .link_store_lock_file()
+            .ends_with("locks/session-links.lock"));
+        // 相对工具存储根逐段比对：写死分隔符会在 Windows 上反转断言方向。
+        let root = std::env::temp_dir().join("wb-switch-store");
+        let at_root = SessionPaths {
+            store_root: root.clone(),
+            data_root: PathBuf::new(),
+            auth_file: PathBuf::new(),
+            link_namespace: LinkNamespace::WorkBuddy,
+        };
+        assert_eq!(at_root.session_links_file(), root.join("session_links.json"));
+        assert_eq!(at_root.session_links_dir(), root.join("session-links"));
+        assert_eq!(
+            at_root.baselines_dir(),
+            root.join("session-links").join("baselines")
+        );
+        assert_eq!(
+            at_root.link_store_lock_file(),
+            root.join("locks").join("session-links.lock")
+        );
+    }
+
+    /// 命名空间隔离：VS Code 侧的关联表 / 目录 / 锁与 WorkBuddy 名字不同，
+    /// 且两者的存储根相同（同一 `~/.wb-switch` 下并存而不互相污染）。
+    #[test]
+    fn vscode_link_paths_are_isolated_from_workbuddy() {
+        let root = std::env::temp_dir().join("wb-switch-store");
+        let workbuddy = SessionPaths {
+            store_root: root.clone(),
+            data_root: PathBuf::new(),
+            auth_file: PathBuf::new(),
+            link_namespace: LinkNamespace::WorkBuddy,
+        };
+        let vscode = SessionPaths::for_vscode_ext_at(root.clone());
+        assert_eq!(vscode.store_root, workbuddy.store_root);
+        assert_eq!(
+            vscode.session_links_file(),
+            root.join("vscode_session_links.json")
+        );
+        assert_eq!(
+            vscode.session_links_dir(),
+            root.join("vscode-session-links")
+        );
+        assert_eq!(
+            vscode.baselines_dir(),
+            root.join("vscode-session-links").join("baselines")
+        );
+        assert_eq!(
+            vscode.link_store_lock_file(),
+            root.join("locks").join("vscode-session-links.lock")
+        );
+        assert_eq!(
+            vscode.preview_tokens_dir(),
+            root.join("vscode-session-links").join("previews")
+        );
+        assert_eq!(
+            vscode.operations_dir(),
+            root.join("vscode-session-links").join("operations")
+        );
+        assert_ne!(vscode.session_links_file(), workbuddy.session_links_file());
+        assert_ne!(vscode.session_links_dir(), workbuddy.session_links_dir());
+        assert_ne!(vscode.baselines_dir(), workbuddy.baselines_dir());
+        assert_ne!(
+            vscode.preview_tokens_dir(),
+            workbuddy.preview_tokens_dir()
+        );
+        assert_ne!(vscode.operations_dir(), workbuddy.operations_dir());
+        assert_ne!(
+            vscode.link_store_lock_file(),
+            workbuddy.link_store_lock_file()
+        );
+        // 默认命名空间是 WorkBuddy：`SessionPaths::for_variant` 之外的历史构造点
+        // 不会因为新增字段而漂移到 VS Code 名字上。
+        assert_eq!(LinkNamespace::default(), LinkNamespace::WorkBuddy);
+    }
 
     #[test]
     fn db_paths_follow_variant_data_root() {
@@ -3688,6 +3826,7 @@ mod tests {
                 store_root: env.root.join("bare-store"),
                 data_root: env.root.join("bare-data"),
                 auth_file: env.root.join("auth.info"),
+                link_namespace: LinkNamespace::WorkBuddy,
             },
         };
         std::fs::create_dir_all(bare.paths.data_root.clone()).unwrap();
@@ -3711,6 +3850,7 @@ mod tests {
             store_root: env.root.join("bare-store"),
             data_root: env.root.join("bare-data"),
             auth_file: env.root.join("auth.info"),
+            link_namespace: LinkNamespace::WorkBuddy,
         };
         std::fs::create_dir_all(&bare.data_root).unwrap();
 
@@ -5025,6 +5165,7 @@ mod tests {
             store_root: env.root.join("s2"),
             data_root: temp_db("edge-root"),
             auth_file: env.root.join("auth2.info"),
+            link_namespace: LinkNamespace::WorkBuddy,
         };
         std::fs::create_dir_all(&paths.data_root).unwrap();
         std::fs::copy(&db, paths.edge_sync_db(WbVariant::Cn)).unwrap();
@@ -5726,6 +5867,7 @@ mod tests {
             store_root: env.root.join("store-ai"),
             data_root: env.root.join("data-ai"),
             auth_file: env.paths.auth_file.clone(),
+            link_namespace: LinkNamespace::WorkBuddy,
         };
         std::fs::create_dir_all(&ai_paths.data_root).unwrap();
         let report = session_links_preview_at(

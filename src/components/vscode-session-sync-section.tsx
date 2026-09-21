@@ -15,7 +15,6 @@ import {
 } from "@/components/session-link-shared";
 import * as api from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { accountVariant } from "@/lib/variant";
 import type {
   AccountMeta,
   SessionLinkPreviewGroup,
@@ -23,31 +22,36 @@ import type {
   SessionSyncSelection,
 } from "@/lib/types";
 
-export type { SessionLinksMeta };
-
 interface Props {
-  /** 目标账号（来源账号身份由后端从该档位登录态读取，前端不传） */
+  /** 目标账号（来源账号身份由后端从插件登录态读取，前端不传） */
   account: AccountMeta | null;
   /** 弹窗是否打开：打开时拉取一次预览 */
   open: boolean;
   /** 切换进行中：禁止继续交互 */
   disabled?: boolean;
+  /** 插件是否已登录：未登录时渲染专属空态，不发预览请求 */
+  loggedIn: boolean;
   /** 勾选结果变化：父组件据此提交 `syncSelections`，并用于结果反馈里回显会话名 */
   onChange: (state: { selections: SessionSyncSelection[]; groups: SessionLinkPreviewGroup[] }) => void;
-  /** 预览状态上报：父组件用于 tab 徽标与常驻提示，避免把错误藏进 tab 里 */
+  /** 预览状态上报：父组件用于 tab 徽标 */
   onMetaChange?: (meta: SessionLinksMeta) => void;
 }
 
 /**
- * 切号弹窗「关联会话」tab 的内容：说明卡 + 会话列表（判定徽标 + 一句摘要 + 折叠详情）。
+ * VS Code CodeBuddy 插件切号弹窗「关联会话」tab 的内容。
  *
- * - 默认勾选与可选模式全部来自后端：`defaultChecked` 为 true 才预先勾选，
- *   `availableModes` 为空（identical / ahead / unknown / 预览凭据不可用）一律禁选。
- * - `diverge` 默认不勾，需用户显式选择覆盖；覆盖风险常驻行内，不依赖展开或勾选。
- * - 错误与存储不可用由父组件在 tab 之上常驻提示，本组件只保留对应的空态与重试入口。
- * - 展示件与勾选逻辑与 VS Code 插件侧共用（`session-link-shared.tsx`）。
+ * 展示件与勾选逻辑与 WorkBuddy 侧共用（`session-link-shared.tsx`），差异只在数据源：
+ * 这里读插件侧的关联表（`vscode_session_links.json`），且没有档位与「自动同步」开关
+ * （D5：同步跟随「确认切换」）。
  */
-export function SessionSyncSection({ account, open, disabled, onChange, onMetaChange }: Props) {
+export function VscodeSessionSyncSection({
+  account,
+  open,
+  disabled,
+  loggedIn,
+  onChange,
+  onMetaChange,
+}: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [preview, setPreview] = useState<SessionLinksPreview | null>(null);
@@ -57,7 +61,8 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
   const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
-    if (!open || !account) {
+    // 未登录插件时后端没有来源身份可读，不发请求，直接渲染专属空态。
+    if (!open || !account || !loggedIn) {
       setPreview(null);
       setError("");
       setChecked(new Set());
@@ -68,7 +73,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     setLoading(true);
     setError("");
     api
-      .sessionLinksPreview(account.id, accountVariant(account))
+      .vscodeSessionLinksPreview(account.id)
       .then((res) => {
         if (cancelled) return;
         setPreview(res);
@@ -91,16 +96,15 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
     return () => {
       cancelled = true;
     };
-    // 预览拉取只看「弹窗开关 / 目标账号 / 手动重试」；onChange 只做状态回写，
-    // 不进依赖，否则父组件每次重渲染都会重新拉预览。
-  }, [open, account, reloadToken]);
+    // 预览拉取只看「弹窗开关 / 目标账号 / 登录态 / 手动重试」；onChange 只做状态回写，不进依赖。
+  }, [open, account, loggedIn, reloadToken]);
 
   const groups = preview?.groups ?? [];
-  // 国际版能力判定不通过：整块不可用（后端执行时仍会强制检查能力）。
+  // 插件侧没有档位能力探测，正常不会出现 supported=false；保留兜底以免渲染空 tab。
   const unsupported = Boolean(preview && (!preview.supported || preview.storeStatus === "unsupported"));
   const targetLabel = account?.nickname || account?.email || account?.uid || "目标账号";
 
-  // 状态上报：父组件据此渲染 tab 徽标与常驻提示。
+  // 状态上报：父组件据此渲染 tab 徽标。
   useEffect(() => {
     onMetaChange?.({
       available: !unsupported,
@@ -136,7 +140,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
 
   if (unsupported) return null;
 
-  const pending = loading || (!preview && !error);
+  const pending = loading || (!preview && !error && loggedIn);
   const storeUnavailable = preview?.storeStatus === "unavailable";
 
   return (
@@ -155,7 +159,20 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
 
       {pending && <LinksSkeleton />}
 
-      {!pending && (error || storeUnavailable) && (
+      {!pending && !loggedIn && (
+        <div
+          className={cn(
+            "flex items-center justify-center rounded-md border px-3 py-2.5",
+            STATUS_MIN_H,
+          )}
+        >
+          <p className="text-center text-xs text-muted-foreground">
+            未检测到 VS Code CodeBuddy 插件当前登录账号，请先在 VS Code 中登录该插件后再切换。
+          </p>
+        </div>
+      )}
+
+      {!pending && loggedIn && (error || storeUnavailable) && (
         <div
           className={cn(
             "flex items-center justify-between gap-3 rounded-md border px-3 py-2.5",
@@ -178,7 +195,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         </div>
       )}
 
-      {!pending && !error && preview?.storeStatus === "missing" && (
+      {!pending && loggedIn && !error && preview?.storeStatus === "missing" && (
         <div
           className={cn(
             "flex items-center justify-center rounded-md border px-3 py-2.5",
@@ -191,7 +208,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         </div>
       )}
 
-      {!pending && !error && !storeUnavailable && preview?.storeStatus === "ready" && groups.length === 0 && (
+      {!pending && loggedIn && !error && !storeUnavailable && preview?.storeStatus === "ready" && groups.length === 0 && (
         <div
           className={cn(
             "flex items-center justify-center rounded-md border px-3 py-2.5",
@@ -204,7 +221,7 @@ export function SessionSyncSection({ account, open, disabled, onChange, onMetaCh
         </div>
       )}
 
-      {!pending && !error && groups.length > 0 && (
+      {!pending && loggedIn && !error && groups.length > 0 && (
         <div className="space-y-2">
           <div className="flex items-center gap-2.5 px-1">
             <Checkbox

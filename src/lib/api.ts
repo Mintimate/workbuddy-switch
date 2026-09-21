@@ -98,6 +98,7 @@ const ROUTES: Record<string, Route> = {
   get_vscode_ext_status: { method: "GET", path: "/api/vscode-ext/status" },
   list_vscode_sessions: { method: "GET", path: "/api/vscode-ext/sessions" },
   switch_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/switch" },
+  vscode_session_links_preview: { method: "POST", path: "/api/vscode-ext/session-links" },
   detect_vscode_ext_account: { method: "POST", path: "/api/vscode-ext/detect" },
   get_codebuddy_ide_status: { method: "GET", path: "/api/codebuddy-ide/status" },
   switch_codebuddy_ide_account: { method: "POST", path: "/api/codebuddy-ide/switch" },
@@ -284,17 +285,28 @@ export function listVscodeSessions(): Promise<VscodeSessionList> {
 }
 
 /**
+ * 预览「当前 VS Code CodeBuddy 插件账号 → 目标账号」可同步的关联会话。
+ *
+ * 只读：`defaultChecked` 与 `availableModes` 是勾选权限的唯一来源，前端不得自行扩大。
+ */
+export function vscodeSessionLinksPreview(targetAccountId: string): Promise<SessionLinksPreview> {
+  return call("vscode_session_links_preview", { targetAccountId });
+}
+
+/**
  * 切换 VS Code CodeBuddy 扩展账号。
  *
  * `restart` 默认 true：VS Code 运行时由后端先优雅退出、写入后再重新打开；
  * 传 false 退回「请先完全退出 VS Code」的手动模式（不在编辑器中自动操作）。
+ * `syncSelections` 与 WorkBuddy 侧同形；只传它（不传 `copySessions`）也能执行同步。
  */
 export function switchVscodeExtAccount(
   accountId: string,
   restart = true,
   copySessions?: VscodeSessionRef[],
+  syncSelections?: SessionSyncSelection[],
 ): Promise<VscodeExtSwitchResult> {
-  return call("switch_vscode_ext_account", { accountId, restart, copySessions });
+  return call("switch_vscode_ext_account", { accountId, restart, copySessions, syncSelections });
 }
 
 export function detectVscodeExtAccount(): Promise<{

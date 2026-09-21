@@ -844,6 +844,7 @@ mod tests {
             SessionPaths {
                 store_root: self.0.join("store"),
                 data_root: self.0.join("data"),
+                link_namespace: crate::modules::session::LinkNamespace::WorkBuddy,
                 auth_file: self.0.join("auth.info"),
             }
         }

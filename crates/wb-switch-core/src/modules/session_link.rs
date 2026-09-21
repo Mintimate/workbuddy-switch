@@ -107,7 +107,7 @@ pub fn total_digest_of(line_digests: &[String]) -> String {
     to_hex(&hasher.finalize())
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         out.push_str(&format!("{byte:02x}"));
@@ -116,7 +116,9 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// 单行摘要在长度编码后计算：记录分隔无歧义（design §3.1）。
-fn line_digest_of(line: &str) -> String {
+///
+/// VS Code 侧把「一条消息」当作一行来复用同一套摘要口径（`vscode_session_link`）。
+pub(crate) fn line_digest_of(line: &str) -> String {
     let bytes = line.as_bytes();
     let mut hasher = Sha256::new();
     hasher.update((bytes.len() as u64).to_be_bytes());
@@ -1560,6 +1562,7 @@ mod tests {
         SessionPaths {
             store_root: dir.path().join("store"),
             data_root: dir.path().join("data"),
+            link_namespace: crate::modules::session::LinkNamespace::WorkBuddy,
             auth_file: dir.path().join("auth.info"),
         }
     }

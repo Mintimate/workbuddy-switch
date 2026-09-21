@@ -11,7 +11,7 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide, credit_usage,
     credits, export_import, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session,
+    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -183,7 +183,8 @@ pub async fn list_vscode_sessions() -> Result<Value, String> {
 
 /// POST /api/vscode-ext/switch —— 注入凭证到 VS Code CodeBuddy 扩展。
 ///
-/// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（新 id，加法）。
+/// `copySessions` 非空时，切换前先把勾选的会话复制到目标账号（新 id，加法）并登记关联；
+/// `syncSelections` 非空时，再把关联会话的新增内容同步过去（只同步不复制同样可用）。
 /// `restart` 缺省 true：VS Code 正在运行时由后端「优雅退出 → 写入 → 重新打开」，
 /// 传 false 则退回「请先完全退出 VS Code」的手动模式。
 ///
@@ -194,18 +195,45 @@ pub async fn switch_vscode_ext_account(
     account_id: String,
     restart: Option<bool>,
     copy_sessions: Option<Vec<vscode_session::CopyItem>>,
+    sync_selections: Option<Value>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
     }
     let restart = restart.unwrap_or(true);
     let items = copy_sessions.unwrap_or_default();
+    // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传。
+    let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
     tauri::async_runtime::spawn_blocking(move || {
-        if items.is_empty() {
+        // 复制与同步都没勾选时才退回纯切换路径（不再由 `copySessions` 单独决定）。
+        if items.is_empty() && sync_selections.is_empty() {
             vscode_ext::switch_account(&account_id, restart)
         } else {
-            vscode_session::switch_vscode_ext_with_copy(&account_id, restart, &items)
+            vscode_session::switch_vscode_ext_with_copy(
+                &account_id,
+                restart,
+                &items,
+                &sync_selections,
+            )
         }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST /api/vscode-ext/session-links —— 预览「当前插件账号 → 目标账号」可同步的关联会话。
+///
+/// 只读：返回 `supported / storeStatus / groups`，其中每组的 `defaultChecked` 与
+/// `availableModes` 是前端勾选权限的唯一来源，前端不得自行扩大。
+/// async + spawn_blocking：会扫描扩展数据目录并读取会话正文，避免阻塞 UI。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn vscode_session_links_preview(target_account_id: String) -> Result<Value, String> {
+    if target_account_id.trim().is_empty() {
+        return Err("缺少 targetAccountId".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = account::find_account(&target_account_id).ok_or("目标账号不存在")?;
+        vscode_session_sync::links_preview(&target)
     })
     .await
     .map_err(|e| e.to_string())?

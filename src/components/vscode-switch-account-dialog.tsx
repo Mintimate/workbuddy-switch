@@ -24,8 +24,18 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import type { SessionLinksMeta } from "@/components/session-link-shared";
+import { VscodeSessionSyncSection } from "@/components/vscode-session-sync-section";
 import * as api from "@/lib/api";
-import type { AccountMeta, VscodeExtStatus, VscodeSession, VscodeSessionRef } from "@/lib/types";
+import type {
+  AccountMeta,
+  SessionLinkPreviewGroup,
+  SessionSyncSelection,
+  VscodeExtStatus,
+  VscodeSession,
+  VscodeSessionRef,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface Props {
@@ -41,6 +51,17 @@ interface Props {
 
 /** 自动关闭并重开 VS Code 的开关持久化 key（缺省开启，与 `wb-switch.compact` 同风格）。 */
 const AUTO_RESTART_KEY = "wb-switch.vscodeExt.autoRestart";
+
+/** tab 样式：下划线指示 + 可选计数徽标（与 WorkBuddy 切号弹窗一致）。 */
+const TAB_TRIGGER_CLASS =
+  "-mb-px h-9 flex-none rounded-none border-b-2 border-transparent px-0.5 pb-2 text-sm font-medium text-muted-foreground hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-foreground data-[state=active]:shadow-none";
+
+/** tab 计数徽标：0 时不显示，避免出现空的「0」。 */
+function tabCount(count: number) {
+  return count > 0 ? (
+    <span className="ml-1 text-xs text-muted-foreground tabular-nums">{count}</span>
+  ) : null;
+}
 
 /** VS Code 扩展会话切换弹窗：可勾选「当前扩展账号」的会话复制到目标账号。 */
 export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeExtStatus, onDone }: Props) {
@@ -63,6 +84,14 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /** 当前 tab：复制会话（主流程）与关联会话（同步）互相独立。 */
+  const [tab, setTab] = useState<"copy" | "links">("copy");
+  /** 关联会话区块上报的状态（tab 徽标 / 未登录时隐藏 tab）。 */
+  const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
+  /** 勾选提交给后端的同步选择（绑定预览凭据，执行前后端会重新校验）。 */
+  const [syncSelections, setSyncSelections] = useState<SessionSyncSelection[]>([]);
+  /** 已勾选的关联会话（结果反馈里回显会话名）。 */
+  const [syncGroups, setSyncGroups] = useState<SessionLinkPreviewGroup[]>([]);
 
   function toggleAutoRestart(next: boolean) {
     setAutoRestart(next);
@@ -148,10 +177,21 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
             .filter((ref): ref is VscodeSessionRef => ref !== null)
         : undefined;
 
-      const res = await api.switchVscodeExtAccount(account.id, autoRestart, refs);
+      // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
+      const res = await api.switchVscodeExtAccount(
+        account.id,
+        autoRestart,
+        refs,
+        syncSelections.length > 0 ? syncSelections : undefined,
+      );
       const nickname = account.nickname || account.email || account.uid || "该账号";
       const copied = res.sessionCopy?.copied.length ?? 0;
       const errors = res.sessionCopy?.errors ?? [];
+      const linkErrors = res.sessionCopy?.linkErrors ?? [];
+      const syncReport = res.sessionSync;
+      const syncedItems = syncReport?.synced ?? [];
+      const skippedItems = syncReport?.skipped ?? [];
+      const syncErrors = syncReport?.errors ?? [];
       // 生效方式提示：重载窗口读不到外部写入，不再提示；区分「已重开 / 重开失败 / 本来没运行」。
       // 重开失败时前端拿不到原因，用后端 message（含具体错误）兜底。
       const restartHint = res.restarted
@@ -160,6 +200,8 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
           ? res.message || "已切换，但自动重新打开 VS Code 失败，请手动打开"
           : "已切换；请打开 VS Code 生效";
       const copiedHint = copied > 0 ? `已复制 ${copied} 个会话` : null;
+      const syncedHint = syncedItems.length > 0 ? `已同步 ${syncedItems.length} 个会话` : null;
+      const requestedSync = syncSelections.length > 0;
 
       if (errors.length > 0) {
         toast.warning(`已切换至「${nickname}」，但部分会话未复制`, {
@@ -171,7 +213,37 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
         });
       } else {
         toast.success(`已切换至「${nickname}」`, {
-          description: [copiedHint, restartHint].filter(Boolean).join("；"),
+          description: [copiedHint, syncedHint, restartHint].filter(Boolean).join("；"),
+        });
+      }
+      // 复制成功但登记失败：复制本身有效，必须提示「未建立关联」而不是当成完整成功。
+      if (linkErrors.length > 0) {
+        toast.warning("部分会话已复制但未建立关联", {
+          description: [
+            ...linkErrors.map((item) => `${item.conversationId ?? "会话"}：${item.error}`),
+            "未建立关联的会话不会出现在「关联会话」列表里。",
+          ].join("；"),
+        });
+      }
+      // 同步结果：成功、跳过、失败都要能看到，不能只显示成功数。
+      const groupLabel = (groupId: string) =>
+        syncGroups.find((group) => group.groupId === groupId)?.title || groupId;
+      const syncIssues = [
+        ...syncErrors.map(
+          (item) => `${item.groupId ? groupLabel(item.groupId) : "全部会话"}：${item.error}`,
+        ),
+        // 预览过期/前置条件变化一律跳过并给出原因，绝不显示成已同步。
+        ...skippedItems.map((item) => `${groupLabel(item.groupId)}：${item.message}`),
+      ];
+      if (syncIssues.length > 0) {
+        if (syncErrors.length > 0) {
+          toast.error("部分关联会话没有同步（失败或已跳过）", { description: syncIssues.join("；") });
+        } else {
+          toast.warning("有关联会话没有同步（已跳过）", { description: syncIssues.join("；") });
+        }
+      } else if (requestedSync && !syncReport) {
+        toast.warning("关联会话未同步", {
+          description: "没有收到同步结果：当前版本可能不支持同步关联会话；账号已切换，但会话没有同步。",
         });
       }
       onOpenChange(false);
@@ -185,6 +257,29 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
 
   const copyCount = copyEnabled ? selected.size : 0;
   const hasCopyable = groups.length > 0;
+  const syncCount = syncSelections.length;
+  /** 覆盖项数量：底部摘要据此提示风险。 */
+  const overwriteCount = syncSelections.filter((item) => item.mode === "overwrite").length;
+  /** 关联会话 tab 是否可用：区块不可用（能力判定不通过）时回落到仅复制会话。 */
+  const linksAvailable = linksMeta?.available ?? true;
+  const summaryMain =
+    copyCount > 0 && syncCount > 0
+      ? `将复制 ${copyCount} 个、同步 ${syncCount} 个关联会话`
+      : copyCount > 0
+        ? `将复制 ${copyCount} 个会话`
+        : syncCount > 0
+          ? `将同步 ${syncCount} 个关联会话`
+          : "本次仅切换账号";
+  const summarySub =
+    overwriteCount > 0
+      ? `其中 ${overwriteCount} 个会替换目标账号的完整内容`
+      : copyCount === 0 && syncCount === 0
+        ? "未选择复制或同步会话"
+        : copyCount === 0
+          ? "未选择复制会话"
+          : syncCount === 0
+            ? "未选择同步会话"
+            : null;
   const running = vscodeExtStatus?.running === true;
   /** 扩展未登录（`loggedIn === false`）：按新会话写入，仅影响提示文案。 */
   const notLoggedIn = vscodeExtStatus?.loggedIn === false;
@@ -196,6 +291,98 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
     : undefined;
   const emptyHint = emptyStateHint(vscodeExtStatus, loadingSessions, sourceUid, dataRoot, hasCopyable);
 
+  // 关联 tab 不可用（能力判定不通过）时回落到复制会话，避免停在空 tab。
+  useEffect(() => {
+    if (!linksAvailable && tab === "links") setTab("copy");
+  }, [linksAvailable, tab]);
+
+  // 「复制会话」tab 内容：勾选即意图，提交结果由底部摘要兜底确认。
+  const copyTabContent = (
+    <>
+      <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">复制会话到目标账号</div>
+          <div
+            className={
+              !loadingSessions && !hasCopyable
+                ? "text-xs text-amber-700 dark:text-amber-400"
+                : "text-xs text-muted-foreground"
+            }
+          >
+            {emptyHint}
+          </div>
+        </div>
+        <Switch
+          checked={copyEnabled}
+          onCheckedChange={setCopyEnabled}
+          disabled={loadingSessions || !hasCopyable}
+          aria-label="复制会话到目标账号"
+        />
+      </div>
+
+      {copyEnabled && (
+        <>
+          <Separator />
+          <div className="max-h-[min(20rem,45vh)] overflow-y-auto pr-1">
+            {loadingSessions ? (
+              <div className="space-y-2 py-1">
+                <Skeleton className="h-9 w-full" />
+                <Skeleton className="h-9 w-full" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+            ) : (
+              groups.map((group) => {
+                const open_ = !collapsed.has(group.key);
+                const ids = group.sessions.map((s) => s.id);
+                const state = selectionState(ids, selected);
+                return (
+                  <div key={group.key} className="mb-0.5">
+                    <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
+                      <TreeCheckbox
+                        allOn={state.allOn}
+                        someOn={state.someOn}
+                        onChange={() => toggleGroup(ids)}
+                        ariaLabel={`选择${group.label}`}
+                      />
+                      <button
+                        type="button"
+                        className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
+                        onClick={() => toggleCollapsed(group.key)}
+                        aria-expanded={open_}
+                        aria-label={`${open_ ? "折叠" : "展开"}${group.label}`}
+                      >
+                        <span className="min-w-0 flex-1 truncate text-sm font-medium">
+                          {group.label}
+                          <span className="ml-1 font-normal text-muted-foreground">
+                            #{group.hash.slice(0, 8)} · {group.sessions.length}
+                          </span>
+                        </span>
+                        {open_ ? (
+                          <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
+                        ) : (
+                          <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
+                        )}
+                      </button>
+                    </div>
+                    {open_ &&
+                      group.sessions.map((session) => (
+                        <SessionRow
+                          key={session.id}
+                          session={session}
+                          checked={selected.has(session.id)}
+                          onToggle={() => toggleSession(session.id)}
+                        />
+                      ))}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </>
+      )}
+    </>
+  );
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
@@ -205,7 +392,7 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
         <DialogHeader className="shrink-0">
           <DialogTitle>切换到「{account?.nickname || account?.email || account?.uid || "该账号"}」</DialogTitle>
           <DialogDescription>
-            将把所选账号写入 VS Code CodeBuddy 插件；可选把当前账号的会话一并复制过去。
+            将把所选账号写入 VS Code CodeBuddy 插件；可选把当前账号的会话复制过去，并把关联会话的新内容同步过去。
           </DialogDescription>
         </DialogHeader>
 
@@ -213,7 +400,13 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
           <div className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-3 rounded-lg bg-background/85 backdrop-blur-sm">
             <Loader2 className="size-8 animate-spin text-primary" />
             <p className="text-sm font-medium">
-              {autoClose ? "正在关闭 VS Code 并写入凭证…" : "正在切换并复制会话…"}
+              {autoClose
+                ? "正在关闭 VS Code 并写入凭证…"
+                : copyCount > 0
+                  ? "正在切换并复制会话…"
+                  : syncCount > 0
+                    ? "正在切换并同步会话…"
+                    : "正在切换账号…"}
             </p>
             <p className="max-w-xs text-center text-xs text-muted-foreground">
               {autoClose
@@ -266,86 +459,50 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
             />
           </div>
 
-          <div className="flex items-center justify-between gap-3 rounded-md border px-3 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium">复制会话到目标账号</div>
-              <div
-                className={
-                  !loadingSessions && !hasCopyable
-                    ? "text-xs text-amber-700 dark:text-amber-400"
-                    : "text-xs text-muted-foreground"
-                }
+          {linksAvailable ? (
+            <Tabs
+              value={tab}
+              onValueChange={(value) => setTab(value as "copy" | "links")}
+              className="flex min-h-0 flex-col gap-3 overflow-hidden"
+            >
+              <TabsList className="h-auto w-full shrink-0 justify-start gap-5 rounded-none border-b border-border bg-transparent p-0">
+                <TabsTrigger value="copy" className={TAB_TRIGGER_CLASS}>
+                  复制会话
+                  {tabCount(copyCount)}
+                </TabsTrigger>
+                <TabsTrigger value="links" className={TAB_TRIGGER_CLASS}>
+                  关联会话
+                  {tabCount(linksMeta?.groupCount ?? 0)}
+                </TabsTrigger>
+              </TabsList>
+              {/* forceMount：切换 tab 不得卸载另一侧，否则关联勾选会被预览重拉重置。 */}
+              <TabsContent
+                value="copy"
+                forceMount
+                className="min-h-0 space-y-3 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
               >
-                {emptyHint}
-              </div>
-            </div>
-            <Switch
-              checked={copyEnabled}
-              onCheckedChange={setCopyEnabled}
-              disabled={loadingSessions || !hasCopyable}
-              aria-label="复制会话到目标账号"
-            />
-          </div>
-
-          {copyEnabled && (
-            <>
-              <Separator />
-              <div className="max-h-[min(20rem,45vh)] overflow-y-auto pr-1">
-                {loadingSessions ? (
-                  <div className="space-y-2 py-1">
-                    <Skeleton className="h-9 w-full" />
-                    <Skeleton className="h-9 w-full" />
-                    <Skeleton className="h-9 w-full" />
-                  </div>
-                ) : (
-                  groups.map((group) => {
-                    const open_ = !collapsed.has(group.key);
-                    const ids = group.sessions.map((s) => s.id);
-                    const state = selectionState(ids, selected);
-                    return (
-                      <div key={group.key} className="mb-0.5">
-                        <div className="sticky top-0 z-10 flex items-center gap-1.5 rounded-md bg-background px-1.5 py-1">
-                          <TreeCheckbox
-                            allOn={state.allOn}
-                            someOn={state.someOn}
-                            onChange={() => toggleGroup(ids)}
-                            ariaLabel={`选择${group.label}`}
-                          />
-                          <button
-                            type="button"
-                            className="flex min-w-0 flex-1 items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-accent/50"
-                            onClick={() => toggleCollapsed(group.key)}
-                            aria-expanded={open_}
-                            aria-label={`${open_ ? "折叠" : "展开"}${group.label}`}
-                          >
-                            <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                              {group.label}
-                              <span className="ml-1 font-normal text-muted-foreground">
-                                #{group.hash.slice(0, 8)} · {group.sessions.length}
-                              </span>
-                            </span>
-                            {open_ ? (
-                              <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />
-                            ) : (
-                              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground" />
-                            )}
-                          </button>
-                        </div>
-                        {open_ &&
-                          group.sessions.map((session) => (
-                            <SessionRow
-                              key={session.id}
-                              session={session}
-                              checked={selected.has(session.id)}
-                              onToggle={() => toggleSession(session.id)}
-                            />
-                          ))}
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </>
+                {copyTabContent}
+              </TabsContent>
+              <TabsContent
+                value="links"
+                forceMount
+                className="min-h-0 overflow-y-auto data-[state=inactive]:hidden data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150"
+              >
+                <VscodeSessionSyncSection
+                  open={open}
+                  account={account}
+                  loggedIn={!notLoggedIn}
+                  disabled={busy}
+                  onChange={(state) => {
+                    setSyncSelections(state.selections);
+                    setSyncGroups(state.groups);
+                  }}
+                  onMetaChange={setLinksMeta}
+                />
+              </TabsContent>
+            </Tabs>
+          ) : (
+            <div className="min-h-0 space-y-3 overflow-y-auto">{copyTabContent}</div>
           )}
 
           {error && (
@@ -355,13 +512,23 @@ export function VscodeSwitchAccountDialog({ open, onOpenChange, account, vscodeE
           )}
         </div>
 
-        <DialogFooter className="shrink-0">
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
-            取消
-          </Button>
-          <Button onClick={doSwitch} disabled={busy || (copyEnabled && copyCount === 0)}>
-            {busy ? "切换中…" : "确认切换"}
-          </Button>
+        <DialogFooter className="shrink-0 sm:justify-between">
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-sm font-medium">{summaryMain}</div>
+            {summarySub && <div className="text-xs text-muted-foreground">{summarySub}</div>}
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+              取消
+            </Button>
+            {/* 勾了复制却没选会话时仍然拦住；只要还有同步项可执行就允许确认。 */}
+            <Button
+              onClick={doSwitch}
+              disabled={busy || (copyEnabled && copyCount === 0 && syncCount === 0)}
+            >
+              {busy ? "切换中…" : "确认切换"}
+            </Button>
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>
