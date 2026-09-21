@@ -1242,8 +1242,10 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
     vscode_session::remove_dir_all_if_exists(&plan.target_dir);
     if let Err(error) = std::fs::rename(&tmp_dir, &plan.target_dir) {
         vscode_session::remove_dir_all_if_exists(&tmp_dir);
-        restore_dir(&backup_dir, &plan.target_dir);
-        return Err(format!("提交副本会话目录失败：{error}"));
+        return Err(rollback_message(
+            restore_dir(&backup_dir, &plan.target_dir),
+            &format!("提交副本会话目录失败：{error}"),
+        ));
     }
 
     // 4) 复算核验：重建后的记录摘要必须与来源一致，否则整目录回滚。
@@ -1255,14 +1257,18 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
             if snapshot.normalized.line_digests == plan.source_content.normalized.line_digests
     );
     if !verified {
-        restore_dir(&backup_dir, &plan.target_dir);
-        return Err("重建后的内容与来源不一致，已整目录回滚".to_string());
+        return Err(rollback_message(
+            restore_dir(&backup_dir, &plan.target_dir),
+            "重建后的内容与来源不一致，已整目录回滚",
+        ));
     }
 
     // 5) 提交基线；失败 → 整目录从备份恢复。
     if let Err(error) = commit_baseline(paths, plan) {
-        restore_dir(&backup_dir, &plan.target_dir);
-        return Err(error);
+        return Err(rollback_message(
+            restore_dir(&backup_dir, &plan.target_dir),
+            &error,
+        ));
     }
 
     let source_count = plan.source_content.normalized.record_count;
@@ -1283,9 +1289,27 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
 }
 
 /// 从备份目录整目录恢复目标会话目录。
-fn restore_dir(backup_dir: &Path, target_dir: &Path) {
+///
+/// 失败必须**上报**而不是丢弃：目标目录已先被清空，`copy_dir_recursive` 又会在读源之前
+/// 先建出目标目录，恢复失败意味着副本只剩一个空目录（或半成品），调用方绝不能对用户
+/// 声称「已回滚」。失败文案自带备份路径，用户可据此手工恢复。
+pub(crate) fn restore_dir(backup_dir: &Path, target_dir: &Path) -> Result<(), String> {
     vscode_session::remove_dir_all_if_exists(target_dir);
-    let _ = vscode_session::copy_dir_recursive(backup_dir, target_dir);
+    vscode_session::copy_dir_recursive(backup_dir, target_dir).map_err(|error| {
+        format!(
+            "副本目录未恢复（{error}），请从备份目录 {} 手工恢复",
+            backup_dir.display()
+        )
+    })
+}
+
+/// 回滚后的用户可见文案：恢复成功时与原来的文案逐字一致；恢复失败时追加
+/// [`restore_dir`] 的说明（副本未恢复 + 备份路径），不掩盖失败。
+fn rollback_message(restored: Result<(), String>, message: &str) -> String {
+    match restored {
+        Ok(()) => message.to_string(),
+        Err(error) => format!("{message}；且{error}"),
+    }
 }
 
 // --- 附件合并 --------------------------------------------------------------
@@ -1366,6 +1390,7 @@ fn copy_if_needed(from: &Path, to: &Path) -> Result<Option<bool>, String> {
 mod tests {
     use super::*;
     use crate::modules::vscode_session::{copy_sessions_in, CopyItem};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     const WS: &str = "0123456789abcdef0123456789abcdef";
     const SRC_UID: &str = "uid-src-0001";
@@ -1632,6 +1657,70 @@ mod tests {
         }
         assert_eq!(found.len(), 1, "应恰好有一份整目录备份：{found:?}");
         found.pop().unwrap()
+    }
+
+    /// 把文件 mtime 设成指定时刻（Windows 上 `File::set_modified` 需要 `FILE_WRITE_ATTRIBUTES`，
+    /// 只读句柄会得到 `os error 5`，故用可写句柄打开——同 `token_stats::pin_mtime`）。
+    fn set_mtime(path: &Path, time: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    /// 造「进程恰好在写完新增消息文件、更新索引之前被 kill」的现场（design §6.1 步骤 2→3 之间）。
+    ///
+    /// 先正常同步一次（产出派生 id 的消息文件），再把会话索引与关联存储回滚到操作前、
+    /// 保留已落盘的消息文件；返回这批「已落盘但未被索引引用」的文件名。
+    fn interrupted_index_write_scene(fixture: &Fixture, target_conv: &str) -> BTreeSet<String> {
+        let target_dir = fixture.dst_conv_dir(target_conv);
+        let index_path = target_dir.join("index.json");
+        let bak_path = target_dir.join(".index_bak.json");
+        let before_index = std::fs::read(&index_path).unwrap();
+        let before_bak = std::fs::read(&bak_path).ok();
+        let store_backup = fixture.base.join("store-before-sync");
+        copy_tree(&fixture.store, &store_backup);
+
+        // 第一次同步正常完成：目标里留下两条派生 id 的消息文件，索引与基线都已更新。
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "fastForward");
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let first = sync_selected_at(
+            &fixture.root,
+            &fixture.paths(),
+            SRC_UID,
+            &target_acc(),
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        )
+        .unwrap();
+        assert_eq!(first["synced"].as_array().unwrap().len(), 1, "{first}");
+        assert_eq!(records(&target_dir).len(), 4, "造数：第一次同步成功");
+        let written = message_files(&target_dir);
+        assert_eq!(written.len(), 4, "造数：两条新增消息文件已落盘");
+
+        // 回滚索引与关联存储（消息文件保留）→ 「上次中途失败」的现场。
+        std::fs::write(&index_path, &before_index).unwrap();
+        match &before_bak {
+            Some(bytes) => std::fs::write(&bak_path, bytes).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(&bak_path);
+            }
+        }
+        copy_tree(&store_backup, &fixture.store);
+
+        let tracked: BTreeSet<String> = records(&target_dir)
+            .iter()
+            .map(|id| format!("{id}.json"))
+            .collect();
+        assert_eq!(tracked.len(), 2, "造数：索引回到操作前");
+        let orphans: BTreeSet<String> = written.difference(&tracked).cloned().collect();
+        assert_eq!(orphans.len(), 2, "造数：两条新增文件已落盘但未被索引引用");
+        orphans
     }
 
     /// AC1：复制成功后出现 1 个组、2 个 active 成员、1 条配对基线；重复复制不产生重复组。
@@ -2071,51 +2160,7 @@ mod tests {
         let target_conv = copy_and_register(&fixture);
         append_round(&fixture, MSG_3, MSG_4, REQ_2, "新增内容");
         let target_dir = fixture.dst_conv_dir(&target_conv);
-
-        let index_path = target_dir.join("index.json");
-        let bak_path = target_dir.join(".index_bak.json");
-        let before_index = std::fs::read(&index_path).unwrap();
-        let before_bak = std::fs::read(&bak_path).ok();
-        let store_backup = fixture.base.join("store-before-sync");
-        copy_tree(&fixture.store, &store_backup);
-
-        // 第一次同步正常完成：目标里留下两条派生 id 的消息文件，索引与基线都已更新。
-        let preview =
-            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
-        let group = &preview["groups"][0];
-        assert_eq!(group["verdict"], "fastForward");
-        let group_id = group["groupId"].as_str().unwrap().to_string();
-        let token = group["previewToken"].as_str().unwrap().to_string();
-        let first = sync_selected_at(
-            &fixture.root,
-            &fixture.paths(),
-            SRC_UID,
-            &target_acc(),
-            &[selection(&group_id, &token, SyncMode::FastForward)],
-        )
-        .unwrap();
-        assert_eq!(first["synced"].as_array().unwrap().len(), 1, "{first}");
-        assert_eq!(records(&target_dir).len(), 4, "造数：第一次同步成功");
-        let written = message_files(&target_dir);
-        assert_eq!(written.len(), 4, "造数：两条新增消息文件已落盘");
-
-        // 回滚索引与关联存储（消息文件保留）→ 「上次中途失败」的现场。
-        std::fs::write(&index_path, &before_index).unwrap();
-        match &before_bak {
-            Some(bytes) => std::fs::write(&bak_path, bytes).unwrap(),
-            None => {
-                let _ = std::fs::remove_file(&bak_path);
-            }
-        }
-        copy_tree(&store_backup, &fixture.store);
-
-        let tracked: BTreeSet<String> = records(&target_dir)
-            .iter()
-            .map(|id| format!("{id}.json"))
-            .collect();
-        assert_eq!(tracked.len(), 2, "造数：索引回到操作前");
-        let orphans: BTreeSet<String> = written.difference(&tracked).cloned().collect();
-        assert_eq!(orphans.len(), 2, "造数：两条新增文件已落盘但未被索引引用");
+        let orphans = interrupted_index_write_scene(&fixture, &target_conv);
 
         // 重跑（凭据必须重新取得）：目标内容仍等于旧基线 → 判定还是可快进。
         let preview =
@@ -2240,6 +2285,219 @@ mod tests {
         assert_eq!(
             digests(&target_dir, &target_conv),
             digests(&fixture.src_conv_dir(), CONV_SRC)
+        );
+    }
+
+    /// AC4 的另一半：预览之后**副本侧**再被改 → 旧凭据失效，两种模式都被跳过且目标零写入。
+    ///
+    /// 与 `sync_skips_when_source_appended_after_preview`（变化在源侧）互补，对齐 WorkBuddy 侧
+    /// `sync_skips_when_target_changed_after_preview_even_with_overwrite`：显式覆盖也不能绕过
+    /// 版本校验，更不得据此回写目标。
+    #[test]
+    fn sync_skips_when_target_changed_after_preview_even_with_overwrite() {
+        let fixture = Fixture::new("stale-target");
+        seed_source(&fixture);
+        let target_conv = copy_and_register(&fixture);
+        let target_dir = fixture.dst_conv_dir(&target_conv);
+
+        // 副本本地改动 + 源侧新增一轮 → 分叉：预览会发放覆盖凭据（该项可勾选）。
+        let assistant = target_dir.join(format!("messages/{}.json", records(&target_dir)[1]));
+        let text = std::fs::read_to_string(&assistant)
+            .unwrap()
+            .replace("在的", "在的（副本本地改动）");
+        std::fs::write(&assistant, text).unwrap();
+        append_round(&fixture, MSG_3, MSG_4, REQ_2, "新增内容");
+
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "diverge");
+        assert_eq!(group["availableModes"], json!(["overwrite"]));
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+        let token = group["previewToken"].as_str().unwrap().to_string();
+
+        // 预览之后副本侧又被改（用户在确认切换前又动过副本）→ 与凭据里的目标内容不一致。
+        let user_message = target_dir.join(format!("messages/{}.json", records(&target_dir)[0]));
+        let text = std::fs::read_to_string(&user_message)
+            .unwrap()
+            .replace("你好", "你好（预览之后又改）");
+        std::fs::write(&user_message, text).unwrap();
+
+        let before = dir_snapshot(&target_dir);
+        for mode in [SyncMode::FastForward, SyncMode::Overwrite] {
+            let report = sync_selected_at(
+                &fixture.root,
+                &fixture.paths(),
+                SRC_UID,
+                &target_acc(),
+                &[selection(&group_id, &token, mode)],
+            )
+            .unwrap();
+            assert_eq!(report["synced"].as_array().unwrap().len(), 0, "{report}");
+            assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+            assert_eq!(report["skipped"].as_array().unwrap().len(), 1, "{report}");
+            let skipped = &report["skipped"][0];
+            assert_eq!(skipped["reasonCode"], REASON_PREVIEW_STALE, "{report}");
+            assert_eq!(skipped["verdict"], "diverge", "{report}");
+            assert!(
+                skipped["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("目标账号的内容已变化"),
+                "{skipped}"
+            );
+        }
+        assert_eq!(
+            dir_snapshot(&target_dir),
+            before,
+            "被跳过时目标目录必须完全未被写入"
+        );
+        assert_eq!(records(&target_dir).len(), 2, "目标记录数不得变化");
+    }
+
+    /// design §6.1 步 6 / §9：「索引已改、基线未提交」的窗口（进程被 kill、没走回滚）
+    /// → 下次判定内容一致，且不需要任何修复动作。
+    #[test]
+    fn index_written_before_baseline_commit_settles_identical() {
+        let fixture = Fixture::new("index-ahead-of-baseline");
+        seed_source(&fixture);
+        let target_conv = copy_and_register(&fixture);
+        append_round(&fixture, MSG_3, MSG_4, REQ_2, "新增内容");
+        let target_dir = fixture.dst_conv_dir(&target_conv);
+        let store_backup = fixture.base.join("store-before-sync");
+        copy_tree(&fixture.store, &store_backup);
+
+        // 正常同步一次：索引补齐到 4 条、基线同步提交。
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "fastForward");
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let report = sync_selected_at(
+            &fixture.root,
+            &fixture.paths(),
+            SRC_UID,
+            &target_acc(),
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        )
+        .unwrap();
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert_eq!(records(&target_dir).len(), 4, "造数：第一次同步成功");
+
+        // 只把关联存储回滚到同步前：索引已含新记录、基线还是旧的 2 条
+        // ——等价于「索引改完、基线提交前进程被 kill」，且没有任何回滚动作。
+        copy_tree(&store_backup, &fixture.store);
+        let store_state = dir_snapshot(&fixture.store);
+
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+        let group = &preview["groups"][0];
+        assert_eq!(
+            group["verdict"], "identical",
+            "双方摘要已相等（decide_sync 先比摘要再看基线）：{group}"
+        );
+        assert_eq!(group["availableModes"], json!([]), "无需动作：不可勾选");
+        assert_eq!(group["defaultChecked"], false);
+        assert!(group.get("previewToken").is_none(), "不可勾选项不发凭据");
+        assert_eq!(
+            group["recordCount"],
+            json!({"source": 4, "target": 4, "baseline": 2}),
+            "基线仍是旧的 2 条，但判定与它无关"
+        );
+        // 无需任何修复动作：预览是只读的，不会去「补」那条落后的基线。
+        assert_eq!(dir_snapshot(&fixture.store), store_state, "预览不得改动关联存储");
+        assert_eq!(records(&target_dir).len(), 4);
+        assert_eq!(
+            digests(&target_dir, &target_conv),
+            digests(&fixture.src_conv_dir(), CONV_SRC)
+        );
+    }
+
+    /// `already_applied` 的另一半：重跑时**不重写**已存在的消息文件
+    /// （`fast_forward_converges_after_interrupted_index_write` 只锁了「不换 salt / 不留孤儿」）。
+    ///
+    /// 判据用 mtime 而不是 `sleep`：先把两条已落盘文件的 mtime 设成 2000 年，重写会让它变成
+    /// 当前时间 —— 与文件系统时钟粒度无关，三平台一致，也不引入等待。
+    #[test]
+    fn already_applied_does_not_rewrite_existing_message_files() {
+        let fixture = Fixture::new("already-applied-mtime");
+        seed_source(&fixture);
+        let target_conv = copy_and_register(&fixture);
+        append_round(&fixture, MSG_3, MSG_4, REQ_2, "新增内容");
+        let target_dir = fixture.dst_conv_dir(&target_conv);
+        let orphans = interrupted_index_write_scene(&fixture, &target_conv);
+
+        let landed: Vec<PathBuf> = orphans
+            .iter()
+            .map(|name| target_dir.join("messages").join(name))
+            .collect();
+        let old = UNIX_EPOCH + Duration::from_secs(946_684_800); // 2000-01-01
+        for path in &landed {
+            set_mtime(path, old);
+        }
+
+        // 重跑：目标内容仍等于旧基线 → 判定可快进，两条新增文件命中 already_applied。
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+        let group = &preview["groups"][0];
+        assert_eq!(group["verdict"], "fastForward");
+        let group_id = group["groupId"].as_str().unwrap().to_string();
+        let token = group["previewToken"].as_str().unwrap().to_string();
+        let report = sync_selected_at(
+            &fixture.root,
+            &fixture.paths(),
+            SRC_UID,
+            &target_acc(),
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        )
+        .unwrap();
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+
+        // 复用而不是重写：mtime 仍是 2000 年（重写会变成当前时间）。
+        for path in &landed {
+            let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+            assert!(
+                mtime < UNIX_EPOCH + Duration::from_secs(1_600_000_000),
+                "已存在的消息文件不得被重写：{path:?} 的 mtime 变成了 {mtime:?}"
+            );
+        }
+        assert_eq!(records(&target_dir).len(), 4);
+    }
+
+    /// 覆盖模式回滚失败：`restore_dir` 必须上报失败并给出备份路径，调用点的文案不得声称已回滚。
+    ///
+    /// 造数不依赖平台语义：用一个不存在的备份目录（「备份读不到」是恢复失败的唯一原因，
+    /// 与 chmod / 只读句柄这类平台差异无关）。
+    #[test]
+    fn restore_dir_reports_failure_with_backup_path() {
+        let fixture = Fixture::new("restore-failure");
+        let target_dir = fixture.base.join("target-conv");
+        write(&target_dir.join("index.json"), "{}");
+        let missing_backup = fixture.base.join("missing-backup");
+
+        let error = restore_dir(&missing_backup, &target_dir).unwrap_err();
+        assert!(error.contains("未恢复"), "文案必须明说副本目录未恢复：{error}");
+        assert!(
+            error.contains(&missing_backup.to_string_lossy().to_string()),
+            "文案必须给出可手工恢复的备份路径：{error}"
+        );
+        // 失败的真实后果：目标目录已先被清空，只剩 `copy_dir_recursive` 建出的空目录。
+        assert!(
+            target_dir.is_dir() && dir_snapshot(&target_dir).is_empty(),
+            "恢复失败后副本目录是空壳，所以提示不能写「已回滚」"
+        );
+
+        // 调用点合成文案：恢复成功时与原来的文案逐字一致；失败时追加说明、不掩盖。
+        let success = "重建后的内容与来源不一致，已整目录回滚";
+        assert_eq!(rollback_message(Ok(()), success), success);
+        let composed = rollback_message(Err(error.clone()), success);
+        assert!(composed.contains(success), "{composed}");
+        assert!(composed.contains("未恢复"), "{composed}");
+        assert!(
+            composed.contains(&missing_backup.to_string_lossy().to_string()),
+            "{composed}"
         );
     }
 }
