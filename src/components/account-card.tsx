@@ -39,18 +39,27 @@ function formatCredits(value: number): string {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(value);
 }
 
+/** 积分包到期时刻（精确到分）。行内不再带「到期」后缀：区块标题已表达，带后缀会把名称列挤到截断。 */
 function formatCreditExpiry(ts: number | null): string {
   if (!ts) return "长期有效";
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "长期有效";
-  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} 到期`;
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")} ${hh}:${mm}`;
 }
 
-function formatFullDate(ts: number | null): string {
+function formatFullDateTime(ts: number | null): string {
   if (!ts) return "—";
   const date = new Date(ts);
   if (Number.isNaN(date.getTime())) return "—";
-  return date.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
+  return date.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function formatCreditUpdatedAt(ts: number | undefined): string {
@@ -361,9 +370,10 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   const name = resource ? creditResourceName(resource, "积分包") : "\u00a0";
   const remainingText = resource ? `${formatCredits(resource.remaining)} 积分` : "\u00a0";
   const expiryText = resource ? formatCreditExpiry(resource.expireAt) : "\u00a0";
+  const expiryTitle = resource?.expireAt ? `${expiryText} 到期` : expiryText;
   const ratio = resource && resource.total > 0 ? Math.min(100, Math.max(0, (resource.remaining / resource.total) * 100)) : 0;
   const barTone = resource && (resource.expiringSoon || resource.expired) ? "bg-orange-500" : "bg-primary";
-  const title = resource ? `${name} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${expiryText}` : undefined;
+  const title = resource ? `${name} · 剩余 ${formatCredits(resource.remaining)} / ${formatCredits(resource.total)} · ${expiryTitle}` : undefined;
   return (
     <div className={cn("min-w-0", placeholder && "invisible")} aria-hidden={placeholder || undefined} title={title}>
       <div className={cn("grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3", compact ? "text-[11px]" : "text-xs")}>
@@ -659,7 +669,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                 <strong className={cn("font-semibold leading-none tabular-nums tracking-[-0.025em]", compact ? "text-[20px]" : "text-[22px]")} style={{ fontFamily: '"Bricolage Grotesque Variable", "SF Pro Display", ui-sans-serif, sans-serif' }}>{formatCredits(credit.totalRemaining ?? 0)}</strong>
               </span>
               <span className={cn("text-muted-foreground", compact ? "text-[11px]" : "text-xs")}>{resources.length} 个积分包</span>
-              <div className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")} title={expiringAmount > 0 ? `${formatCredits(expiringAmount)} 积分将在 7 天内到期` : resources[0]?.expireAt ? `最近到期 ${formatCreditExpiry(resources[0].expireAt).replace(" 到期", "")}` : "当前积分长期有效"}>
+              <div className={cn("ml-auto flex items-center gap-1.5 text-muted-foreground", compact ? "text-[11px]" : "text-xs")} title={expiringAmount > 0 ? `${formatCredits(expiringAmount)} 积分将在 7 天内到期` : resources[0]?.expireAt ? `最近到期 ${formatCreditExpiry(resources[0].expireAt)}` : "当前积分长期有效"}>
                 <Clock3 className="size-3.5 shrink-0" />
                 <span className="whitespace-nowrap tabular-nums">{creditUpdatedAt ? `${formatCreditUpdatedAt(creditUpdatedAt)} 更新` : "—"}</span>
               </div>
@@ -777,7 +787,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                       <div className="min-w-0">
                         <div className="truncate text-sm font-medium">{creditResourceName(resource, "未命名资源包")}</div>
                         <div className="mt-1 text-[11px] text-muted-foreground">
-                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDate(resource.expireAt)}` : "长期有效"}
+                          {resource.expired ? "已到期" : resource.expireAt ? `到期 ${formatFullDateTime(resource.expireAt)}` : "长期有效"}
                         </div>
                       </div>
                       <div className="shrink-0 text-right text-xs">

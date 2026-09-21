@@ -106,6 +106,17 @@ function formatDate(ts: number | null | undefined): string {
   });
 }
 
+function formatExpiryDateTime(ts: number | null | undefined): string {
+  if (ts === null || ts === undefined) return "—";
+  return new Date(ts).toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function formatChartDate(date: string): string {
   return date.slice(5).replace("-", "/");
 }
@@ -863,7 +874,7 @@ function ResourceBreakdown({ credit, loading }: { credit?: CreditExpiry; loading
               <div className="min-w-0 truncate text-[13px] font-medium">{creditResourceName(resource, "未命名资源包")}</div>
               <div className="flex shrink-0 items-center gap-2.5">
                 <span className="text-[11px] text-muted-foreground">
-                  {resource.expired ? "已到期" : `到期 ${formatDate(resource.expireAt)}`}
+                  {resource.expired ? "已到期" : `到期 ${formatExpiryDateTime(resource.expireAt)}`}
                   {resource.used > 0 ? ` · 已用 ${formatCredits(resource.used)}` : ""}
                 </span>
                 <span className="text-xs font-medium">{formatCredits(resource.remaining)} / {formatCredits(resource.total)}</span>
