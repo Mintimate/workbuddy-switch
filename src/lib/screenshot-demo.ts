@@ -572,6 +572,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
       installed: true,
       extensionInstalled: true,
       running: false,
+      loggedIn: true,
       dataDir: "/demo/Code",
       dbPath: "/demo/Code/User/globalStorage/state.vscdb",
       dbExists: true,

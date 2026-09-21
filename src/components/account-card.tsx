@@ -192,7 +192,7 @@ function travelChip(status: TravelStatus | undefined) {
 function vscodeExtTooltip(installed?: boolean, extensionInstalled?: boolean): string {
   if (!installed) return "未检测到 VS Code";
   if (!extensionInstalled) return "未检测到 CodeBuddy 扩展";
-  return "切换 VS Code 账号（可选复制会话；需先完全退出 VS Code）";
+  return "切换 VS Code 账号（可选复制会话；可自动关闭并重开）";
 }
 
 /** 倒计时：`2h14m 后恢复`；不足 1 分钟按「即将恢复」，已过期由调用方过滤。 */
