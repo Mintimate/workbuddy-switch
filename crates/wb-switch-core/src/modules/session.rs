@@ -5629,6 +5629,8 @@ mod tests {
     fn sync_rejects_forced_overwrite_when_verdict_is_unknown() {
         let env = ready_env("sync-unknown-overwrite");
         let (group_id, token, target_id) = fast_forward_scene(&env);
+        // 目标加入独有内容：双方互不为前缀，删掉基线后无法用内容关系判定 → unknown。
+        append_records(&env.body_path(&target_id), &target_id, 100, 2);
         let target_body_before = std::fs::read_to_string(env.body_path(&target_id)).unwrap();
         let revision_before = env.store().revision;
 
@@ -5705,6 +5707,66 @@ mod tests {
             target_body_before
         );
         assert_eq!(env.store().revision, revision_before);
+    }
+
+    /// 无配对基线时，目标内容被来源完整包含 → 预览照常发放可勾选凭据，执行成功。
+    ///
+    /// 覆盖轮换链的最后一跳（C 切回 A）：隔跳配对没有基线记录，但目标内容是来源内容的
+    /// 严格有序前缀，追加同步零覆盖，因此无需基线佐证（对齐 git fast-forward）。
+    #[test]
+    fn sync_fast_forward_without_baseline_when_target_is_ordered_prefix() {
+        let env = ready_env("sync-ff-no-baseline");
+        let (group_id, _, target_id) = fast_forward_scene(&env);
+        let target_body_before = body_bytes(&env, &target_id);
+
+        // 删除基线文件：等价于「隔跳配对从未登记过共同基线」的不可验证状态。
+        let group = group_snapshot(&env, &group_id);
+        let baseline_ref = group.pair_bases[0].baseline_ref.clone();
+        std::fs::remove_file(
+            env.paths
+                .baselines_dir()
+                .join(format!("{baseline_ref}.json")),
+        )
+        .unwrap();
+
+        // 预览：没有可验证基线也照常判快进，并发放可勾选凭据。
+        let preview = preview(&env, "uid-b");
+        let item = &preview["groups"][0];
+        assert_eq!(item["verdict"], "fastForward", "{preview}");
+        assert_eq!(item["defaultChecked"], true, "{preview}");
+        assert_eq!(item["availableModes"], json!(["fastForward"]), "{preview}");
+        assert!(item["recordCount"]["baseline"].is_null(), "{preview}");
+        assert!(
+            item["reason"].as_str().unwrap().contains("新增 3 条"),
+            "{preview}"
+        );
+        let token = item["previewToken"]
+            .as_str()
+            .expect("可勾选项必须发放凭据")
+            .to_string();
+
+        // 执行：无基线不阻塞写入，目标收敛到来源内容，并补建配对基线。
+        let report = sync(
+            &env,
+            "uid-b",
+            &[selection(&group_id, &token, SyncMode::FastForward)],
+        );
+        assert!(report["errors"].as_array().unwrap().is_empty(), "{report}");
+        assert!(report["skipped"].as_array().unwrap().is_empty(), "{report}");
+        assert_eq!(report["synced"].as_array().unwrap().len(), 1, "{report}");
+        assert_ne!(body_bytes(&env, &target_id), target_body_before);
+        assert_eq!(
+            std::fs::read_to_string(env.body_path(&target_id)).unwrap(),
+            incoming_text(&env, "sess-1", &target_id)
+        );
+        let group = group_snapshot(&env, &group_id);
+        let baseline = session_link::load_pair_baseline(
+            &env.paths(),
+            &group,
+            &member_id_of(&group, "uid-a"),
+            &member_id_of(&group, "uid-b"),
+        );
+        assert!(baseline.ready().is_some(), "执行后必须补建可验证的配对基线");
     }
 
     /// 第三方账号：只处理 A 与 B 共同参与的组，同步只推进 A/B 的基线与正文。

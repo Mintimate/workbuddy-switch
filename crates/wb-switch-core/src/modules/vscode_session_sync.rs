@@ -965,7 +965,7 @@ fn fast_forward(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, Stri
         .cloned()
         .unwrap_or_default();
 
-    // 翻译表：前缀按位置对齐（判定保证「目标等于基线、来源是它的严格有序追加」），
+    // 翻译表：前缀按位置对齐（判定保证「目标内容是来源内容的严格有序前缀」），
     // 新增消息 / 请求用确定性派生 id（design §6.1：重跑覆盖同一批文件）。
     let mut translation =
         vscode_session_link::positional_translation(&source_message_ids, &target_message_ids);

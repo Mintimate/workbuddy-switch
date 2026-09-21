@@ -18,6 +18,8 @@
 //!
 //! 判定（design §3.2）由 [`decide_sync`] 承担：给定双方内容状态与配对共同基线即可确定
 //! 结果，不做任何 IO；差集多重集只用于解释记录数，不参与自动勾选。
+//! 目标内容被来源内容完整包含时（目标为来源的严格有序前缀）直接判快进，不依赖配对
+//! 基线——对齐 git fast-forward 的 ancestor 语义，追加同步零覆盖。
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -363,7 +365,7 @@ impl BaselineState {
 pub enum SyncVerdict {
     /// 双方有序内容一致：不写正文。
     Identical,
-    /// 目标等于共同基线、来源是它的严格有序追加：默认勾选快进。
+    /// 目标内容被来源完整包含（目标为来源的严格有序前缀）：默认勾选快进。
     FastForward,
     /// 来源等于共同基线、目标已变化：仅目标变化，不写目标。
     Ahead,
@@ -501,8 +503,9 @@ fn multiset_counts(source: &[String], target: &[String]) -> (usize, usize, usize
 ///
 /// 1. 成员/文件无效或内容不可验证 → [`SyncVerdict::Unknown`]；
 /// 2. A 与 B 有序一致 → [`SyncVerdict::Identical`]；
-/// 3. 无可验证共同基线 → [`SyncVerdict::Unknown`]；
-/// 4. B 等于基线且 A 是基线的严格有序追加 → [`SyncVerdict::FastForward`]；
+/// 3. B 是 A 的严格有序前缀 → [`SyncVerdict::FastForward`]（不依赖基线，
+///    对齐 git fast-forward 的 ancestor 语义：目标内容被来源完整包含，追加同步零覆盖）；
+/// 4. 无可验证共同基线 → [`SyncVerdict::Unknown`]；
 /// 5. A 等于基线、B 已变化 → [`SyncVerdict::Ahead`]；
 /// 6. 其余（双方变化、来源重写/重排/压缩）→ [`SyncVerdict::Diverge`]。
 ///
@@ -538,6 +541,19 @@ pub fn decide_sync(
             ),
         );
     }
+    // 目标内容全部包含在来源里（B 是 A 的严格有序前缀）：追加同步零覆盖，
+    // 不依赖基线即可判定（对齐 git fast-forward 的 ancestor 语义）。
+    if is_strict_ordered_extension(
+        &target.normalized.line_digests,
+        &source.normalized.line_digests,
+    ) {
+        let added = source.normalized.record_count - target.normalized.record_count;
+        return SyncDecision::decide(
+            SyncVerdict::FastForward,
+            counts,
+            format!("目标账号没有独有改动，当前账号新增 {added} 条，可以直接同步"),
+        );
+    }
     let Some(record) = baseline.ready() else {
         return SyncDecision::unknown(
             baseline
@@ -545,16 +561,6 @@ pub fn decide_sync(
                 .unwrap_or_else(|| "找不到上次同步的记录，无法确认两边内容".to_string()),
         );
     };
-    if target.normalized.line_digests == record.line_digests
-        && is_strict_ordered_extension(&record.line_digests, &source.normalized.line_digests)
-    {
-        let added = source.normalized.record_count - record.record_count;
-        return SyncDecision::decide(
-            SyncVerdict::FastForward,
-            counts,
-            format!("目标账号没有改动，当前账号新增 {added} 条，可以直接同步"),
-        );
-    }
     if source.normalized.line_digests == record.line_digests {
         return SyncDecision::decide(
             SyncVerdict::Ahead,
@@ -2365,6 +2371,7 @@ mod tests {
     }
 
     /// 快进样例：共同基线 X、B = X、A = X + 3 条有序记录 → 默认勾选，extraB = 0。
+    /// 该场景由「B 是 A 的严格有序前缀」直接命中（不依赖基线，对齐 git fast-forward）。
     #[test]
     fn verdict_fast_forward_when_target_keeps_baseline_and_source_appends() {
         let base = records(5, 0);
@@ -2390,6 +2397,52 @@ mod tests {
         );
     }
 
+    /// 祖先快进不依赖基线：无基线 / 基线不可验证时，B 是 A 的严格有序前缀照样可快进。
+    ///
+    /// 对齐 git fast-forward 的 ancestor 语义：B 的每条记录（含顺序）都被 A 完整包含，
+    /// 同步只是把 A 多出的尾部追加给 B，**零覆盖**，因此无需历史记录佐证。
+    #[test]
+    fn fast_forward_without_baseline_when_target_is_ordered_prefix() {
+        let target = records(5, 0);
+        let source = records(8, 0);
+        for baseline in [
+            BaselineState::Missing,
+            BaselineState::Unverifiable("上次同步的记录缺失或已损坏".to_string()),
+        ] {
+            let decision = decide_sync(&content_from(&source), &content_from(&target), &baseline);
+            assert_eq!(decision.verdict, SyncVerdict::FastForward, "{baseline:?}");
+            assert!(decision.default_checked, "只有快进默认勾选");
+            assert_eq!(
+                decision.verdict.available_modes(),
+                vec![SyncMode::FastForward]
+            );
+            assert_eq!(decision.extra_a, 3);
+            assert_eq!(decision.extra_b, 0);
+            assert_eq!(decision.common, 5);
+            assert!(decision.reason.contains("新增 3 条"), "{}", decision.reason);
+        }
+    }
+
+    /// 第二轮轮换：基线 X = 4 条、B = 6 条（停在中间状态）、A = 9 条且以 B 为前缀
+    /// → 快进（改造前 B ≠ X 会判 diverge）。
+    #[test]
+    fn fast_forward_with_baseline_when_target_is_mid_chain_prefix() {
+        let baseline = records(4, 0);
+        let target = records(6, 0);
+        let source = records(9, 0);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Ready(baseline_from(&baseline)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::FastForward);
+        assert!(decision.default_checked);
+        assert_eq!(decision.extra_a, 3, "来源比目标多的 3 条才是本次要追加的");
+        assert_eq!(decision.extra_b, 0);
+        assert_eq!(decision.common, 6);
+        assert!(decision.reason.contains("新增 3 条"), "{}", decision.reason);
+    }
+
     /// 目标变化样例：A = X、B = X + 5 条 → ahead，仅目标变化，不写目标。
     #[test]
     fn verdict_ahead_when_only_target_changed() {
@@ -2412,6 +2465,35 @@ mod tests {
             decision.reason.contains("只有目标账号新增"),
             "{}",
             decision.reason
+        );
+    }
+
+    /// 反向前缀不得判快进（回归保护）：A 是 B 的严格前缀（目标领先）时前缀规则不适用，
+    /// 只有目标变化 → 仍是 ahead；无基线时同样不授权写入 → 仍是 unknown。
+    #[test]
+    fn ahead_stays_when_target_extends_source() {
+        let source = records(5, 0);
+        let target = records(9, 0);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Ready(baseline_from(&source)),
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Ahead);
+        assert!(!decision.default_checked);
+        assert!(decision.verdict.available_modes().is_empty());
+        assert_eq!(decision.extra_a, 0);
+        assert_eq!(decision.extra_b, 4);
+
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Missing,
+        );
+        assert_eq!(
+            decision.verdict,
+            SyncVerdict::Unknown,
+            "反向前缀不构成祖先关系，无基线时不得写入"
         );
     }
 
@@ -2481,11 +2563,37 @@ mod tests {
         assert_eq!(decision.common, 4);
     }
 
+    /// 有共同前缀但尾部各自分叉（真分叉）→ 不得判快进：无基线时 unknown、不可勾选。
+    #[test]
+    fn unknown_without_baseline_when_sides_share_no_prefix() {
+        let target = records_in_order(&[0, 1, 2, 3, 100, 101]);
+        let source = records_in_order(&[0, 1, 2, 3, 200, 201, 202]);
+        let decision = decide_sync(
+            &content_from(&source),
+            &content_from(&target),
+            &BaselineState::Missing,
+        );
+        assert_eq!(decision.verdict, SyncVerdict::Unknown);
+        assert!(!decision.default_checked);
+        assert!(decision.verdict.available_modes().is_empty());
+        assert!(!decision.verdict.allows(SyncMode::FastForward));
+        assert!(
+            !decision.verdict.allows(SyncMode::Overwrite),
+            "unknown 不得被覆盖绕过"
+        );
+        assert!(
+            decision.reason.contains("找不到双方上次一致的内容"),
+            "{}",
+            decision.reason
+        );
+    }
+
     /// 缺少可验证基线 / 内容不可验证 → unknown，禁止任何模式（含显式覆盖）。
     #[test]
     fn verdict_unknown_without_verifiable_baseline_or_content() {
+        // 双方互不为前缀（来源重写了前段）：无法用内容关系判定，无基线时只能 unknown。
         let base = records(5, 0);
-        let source = records(8, 0);
+        let source = records(5, 100);
 
         for (name, baseline) in [
             ("缺少基线引用", BaselineState::Missing),
