@@ -287,8 +287,9 @@ async fn api_vscode_ext_switch(Json(body): Json<Value>) -> Response {
         .or_else(|| body.get("account_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    // 默认不重启：VS Code 运行中不得写入，切换仅在编辑器完全退出后可用。
-    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(false);
+    // 默认重启（= 自动关闭并重开）：VS Code 运行时由后端先优雅退出再写入。
+    // 显式传 restart=false 时退回「请先完全退出 VS Code」的手动模式。
+    let restart = body.get("restart").and_then(|v| v.as_bool()).unwrap_or(true);
     // 可选：切换前把勾选会话复制到目标账号（与 /api/vscode-ext/* 命名风格一致）。
     // 任一条目非法即整包拒绝（与 Tauri 侧 `Option<Vec<CopyItem>>` 的 serde 整包报错同形），
     // 避免「部分成功 + 静默丢弃」让用户误以为全部复制成功。

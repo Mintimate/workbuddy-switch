@@ -1,7 +1,7 @@
 //! VS Code 内 CodeBuddy 扩展（`tencent-cloud.coding-copilot`）会话复制。
 //!
 //! 切换 VS Code CodeBuddy 扩展账号时，可把「当前扩展账号」的会话（正文 + 索引）
-//! 复制到「目标账号」目录，使目标账号重载 VS Code 后能在对应工作区看到并续聊。
+//! 复制到「目标账号」目录，使目标账号重新打开 VS Code 后能在对应工作区看到并续聊。
 //! 与桌面版 `session.rs` 同构：**本地目录复制 + 新 id 重写 + 合并工作区索引**。
 //!
 //! 存储布局（Windows 实测）：
@@ -22,7 +22,8 @@
 //! - **只写目标 uid 目录**；源 uid 目录只读，绝不修改或删除。
 //! - 显式排除 `default\` / `Public\` 目录（结构不同，见 [`is_safe_uid`]），
 //!   uid 只能来自账号库 / 扩展登录态，不接受用户任意输入。
-//! - 写入前必须完全退出 VS Code（复用 [`vscode_ext::is_vscode_running`]）。
+//! - 会话复制本体要求 VS Code 未运行（复用 [`vscode_ext::is_vscode_running`]）；
+//!   由 [`switch_vscode_ext_with_copy`] 编排时，`restart = true` 会先自动关闭编辑器再复制。
 //! - 单条原子性：先写 `<ws>\.tmp-<newId>\` 再 `rename` 成 `<ws>\<newId>\`；
 //!   索引合并用「读-改-写 + `atomic_write`」，写前把将被改的索引备份到
 //!   `backup_dir()/vscode-sessions/<utc_iso>/`。
@@ -464,9 +465,13 @@ pub fn copy_sessions_in(
 
 /// 切换 VS Code CodeBuddy 扩展账号，并可选「先复制会话后注入 token」。
 ///
-/// 复制与注入都要求 VS Code 完全退出。复制按逐条隔离执行；复制步骤成功后
-/// 才复用 [`vscode_ext::switch_account`] 注入 token（保持既有签名不变）。
-/// 若注入失败但会话已复制，返回明确文案说明残留状态，不做隐式回滚。
+/// 时序（D11）：校验目标（账号 / `access_token` / 目录 / db，注定失败的先挡掉、不关编辑器）
+/// → 关闭（`restart = true` 时；失败即返回，此时编辑器未被触碰）
+/// → 复制（本体自带「编辑器未运行」前置，所以关闭必须在它之前）→ 注入 token → 重开。
+/// 复制按逐条隔离执行；若注入失败但会话已复制，返回明确文案说明残留状态，不做隐式回滚。
+///
+/// 复制失败或注入失败且编辑器是本次我们关闭的 → best-effort 开回来再报错，
+/// 避免「编辑器关了、会话也没复制成 / 账号也没切成」的双输。
 pub fn switch_vscode_ext_with_copy(
     account_id: &str,
     restart: bool,
@@ -480,10 +485,24 @@ pub fn switch_vscode_ext_with_copy(
     let target_uid = get_str(&acc, "uid")
         .ok_or_else(|| "账号缺少 uid，无法定位 VS Code 数据目录，无法复制会话".to_string())?;
 
-    // 复制全部完成后再执行 token 注入（写入前已由 copy_vscode_sessions 校验退出状态）。
-    let report = copy_vscode_sessions(&target_uid, items)?;
+    // 与 [`vscode_ext::switch_account`] 同序：先把「注定失败」的目标挡在关闭之前，
+    // 账号存在但 `access_token` 为空 / 数据目录或 state.vscdb 缺失时不该关掉用户的编辑器。
+    vscode_ext::validate_switch_target(account_id)?;
 
-    match vscode_ext::switch_account(account_id, restart) {
+    // 关闭必须在复制之前：`copy_vscode_sessions` 会拒绝「VS Code 正在运行」。
+    let closed = vscode_ext::close_vscode_for_switch(restart)?;
+
+    let report = match copy_vscode_sessions(&target_uid, items) {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(closed) = &closed {
+                let _ = vscode_ext::relaunch_closed_editor(closed);
+            }
+            return Err(error);
+        }
+    };
+
+    match vscode_ext::switch_account_after_close(account_id, closed) {
         Ok(mut result) => {
             result["sessionCopy"] = report;
             Ok(result)
@@ -1053,6 +1072,20 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    /// 时序（D11 + design §3.1）：目标校验必须在**关闭编辑器之前**失败——
+    /// 账号 / `access_token` / 数据目录 / `state.vscdb` 任一不满足时都不许先关编辑器。
+    /// 这里用「账号不存在」走纯逻辑分支：`find_account` 先失败，不会触发任何进程操作。
+    #[test]
+    fn switch_with_copy_validates_before_closing_editor() {
+        let missing = format!("no-such-account-{}", uuid::Uuid::new_v4().simple());
+        let items = vec![CopyItem {
+            workspace_hash: WS.to_string(),
+            conversation_id: CONV_OLD.to_string(),
+        }];
+        let error = switch_vscode_ext_with_copy(&missing, true, &items).unwrap_err();
+        assert!(error.contains("账号不存在"), "{error}");
     }
 
     fn seed_source(fixture: &Fixture) {
