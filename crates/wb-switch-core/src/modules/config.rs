@@ -259,10 +259,21 @@ pub fn clear_codebuddy_ide_app_cache() {
 
 /// 默认签到配置。旧时间窗口字段仅为配置文件兼容保留，调度不再读取。
 ///
+/// `enabled` 默认关闭：全新安装需用户在设置页显式开启；已有用户在
+/// [`load_checkin_config`] 中沿用历史默认（开启），升级不改其状态。
 /// `checkin_start` / `checkin_end` 为空串 = 不限制签到时间段（与改动前行为一致）。
 pub fn default_checkin_config() -> Value {
+    checkin_config_with_enabled(false)
+}
+
+/// 历史默认签到配置（`enabled: true`）：已有用户没有显式值时沿用。
+fn legacy_default_checkin_config() -> Value {
+    checkin_config_with_enabled(true)
+}
+
+fn checkin_config_with_enabled(enabled: bool) -> Value {
     json!({
-        "enabled": true,
+        "enabled": enabled,
         "checkin_start": "",
         "checkin_end": "",
         "start_hour": 6,
@@ -291,10 +302,10 @@ pub fn parse_clock(raw: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-fn merge_checkin_config(input: &Value) -> Value {
-    let mut merged = default_checkin_config();
+/// 把 `input` 中的已知字段覆盖到 `merged`；缺失 / 非法字段保持 `merged` 原值。
+fn apply_checkin_config(merged: &mut Value, input: &Value) {
     let Some(map) = input.as_object() else {
-        return merged;
+        return;
     };
     if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
@@ -319,20 +330,40 @@ fn merge_checkin_config(input: &Value) -> Value {
             .unwrap_or_default();
         merged[key] = json!(normalized);
     }
+}
+
+/// 以新默认值为基线合并（保存路径）。
+fn merge_checkin_config(input: &Value) -> Value {
+    let mut merged = default_checkin_config();
+    apply_checkin_config(&mut merged, input);
     merged
 }
 
 /// 读取签到配置（缺失/损坏时合并默认值）。
+///
+/// 配置只在用户显式保存时落盘，「无配置文件」无法区分新老安装：按使用痕迹（配置文件
+/// 或签到日志）判定已有用户，没有显式值时沿用历史默认（开启）；全新安装默认关闭。
 pub fn load_checkin_config() -> Value {
-    let f = checkin_config_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                return merge_checkin_config(&value);
-            }
-        }
+    load_checkin_config_at(&checkin_config_file(), &checkin_logs_file())
+}
+
+fn load_checkin_config_at(config_path: &Path, logs_path: &Path) -> Value {
+    let input = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    resolve_checkin_config(input.as_ref(), config_path.exists() || logs_path.exists())
+}
+
+fn resolve_checkin_config(input: Option<&Value>, existing_install: bool) -> Value {
+    let mut merged = if existing_install {
+        legacy_default_checkin_config()
+    } else {
+        default_checkin_config()
+    };
+    if let Some(input) = input {
+        apply_checkin_config(&mut merged, input);
     }
-    default_checkin_config()
+    merged
 }
 
 /// 保存签到配置（只保留已知字段）。
@@ -500,23 +531,47 @@ pub fn add_checkin_log(entry: &Value) {
 // 派猫猫旅行配置 / 缓存
 // ---------------------------------------------------------------------------
 
-/// 默认自动旅行配置。
+/// 默认自动旅行配置（全新安装默认关闭）。
 pub fn default_travel_config() -> Value {
-    json!({ "enabled": true })
+    travel_config_with_enabled(false)
+}
+
+/// 历史默认自动旅行配置（`enabled: true`）：已有用户没有显式值时沿用。
+fn legacy_default_travel_config() -> Value {
+    travel_config_with_enabled(true)
+}
+
+fn travel_config_with_enabled(enabled: bool) -> Value {
+    json!({ "enabled": enabled })
 }
 
 /// 读取自动旅行配置（缺失/损坏时合并默认值）。
+///
+/// 与签到同理：配置只在显式保存时落盘，按使用痕迹（配置文件或旅行缓存）判定已有用户，
+/// 没有显式值时沿用历史默认（开启）；全新安装默认关闭。
 pub fn load_travel_config() -> Value {
-    let mut cfg = default_travel_config();
-    let f = travel_config_file();
-    if f.exists() {
-        if let Ok(text) = std::fs::read_to_string(&f) {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) {
-                if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
-                    cfg["enabled"] = json!(enabled);
-                }
-            }
-        }
+    load_travel_config_at(&travel_config_file(), &travel_cache_file())
+}
+
+fn load_travel_config_at(config_path: &Path, cache_path: &Path) -> Value {
+    let input = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    resolve_travel_config(input.as_ref(), config_path.exists() || cache_path.exists())
+}
+
+fn resolve_travel_config(input: Option<&Value>, existing_install: bool) -> Value {
+    let mut cfg = if existing_install {
+        legacy_default_travel_config()
+    } else {
+        default_travel_config()
+    };
+    if let Some(enabled) = input
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("enabled"))
+        .and_then(Value::as_bool)
+    {
+        cfg["enabled"] = json!(enabled);
     }
     cfg
 }
@@ -1047,15 +1102,177 @@ mod tests {
     }
 
     #[test]
-    fn auto_checkin_defaults_enabled_and_preserves_legacy_fields() {
+    fn auto_checkin_defaults_disabled_and_preserves_legacy_fields() {
         let cfg = default_checkin_config();
-        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(false));
         assert_eq!(cfg.get("start_hour").and_then(Value::as_i64), Some(6));
         assert_eq!(cfg.get("end_hour").and_then(Value::as_i64), Some(12));
+
+        // 历史默认仍保留开启，供已有用户在读取路径上沿用。
+        let legacy = legacy_default_checkin_config();
+        assert_eq!(legacy.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            legacy.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
     }
 
     #[test]
-    fn auto_checkin_explicit_false_wins_and_invalid_value_uses_default() {
+    fn checkin_default_follows_usage_trace() {
+        // 全新安装（无配置文件、无签到日志）：默认关闭。
+        let fresh = resolve_checkin_config(None, false);
+        assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(false));
+
+        // 已有用户（签到日志即使用痕迹）：沿用历史默认开启，升级不改状态。
+        let existing = resolve_checkin_config(None, true);
+        assert_eq!(existing.get("enabled").and_then(Value::as_bool), Some(true));
+        // 痕迹只影响 enabled，其余字段仍与默认一致。
+        assert_eq!(
+            existing.get("lazy_refresh_hours").and_then(Value::as_i64),
+            Some(24)
+        );
+        assert_eq!(existing.get("checkin_start"), Some(&json!("")));
+
+        // 显式值优先于痕迹。
+        for existing_install in [false, true] {
+            let off = resolve_checkin_config(Some(&json!({"enabled": false})), existing_install);
+            assert_eq!(off.get("enabled").and_then(Value::as_bool), Some(false));
+            let on = resolve_checkin_config(Some(&json!({"enabled": true})), existing_install);
+            assert_eq!(on.get("enabled").and_then(Value::as_bool), Some(true));
+        }
+    }
+
+    #[test]
+    fn load_checkin_config_uses_usage_trace_files() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-checkin-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("auto_checkin_config.json");
+        let logs_path = dir.join("auto_checkin_logs.json");
+
+        // 两者皆无 → 全新安装，默认关闭。
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 只有签到日志（使用痕迹）→ 已有用户，保持开启。
+        std::fs::write(&logs_path, "[]").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式保存的 false 覆盖痕迹。
+        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 配置文件损坏但存在 → 仍按已有用户处理（不因损坏而改状态）。
+        std::fs::remove_file(&logs_path).unwrap();
+        std::fs::write(&config_path, "not-json").unwrap();
+        assert_eq!(
+            load_checkin_config_at(&config_path, &logs_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn travel_default_follows_usage_trace() {
+        // 全新安装默认关闭，已有用户（旅行缓存痕迹）沿用开启。
+        assert_eq!(
+            resolve_travel_config(None, false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_travel_config(None, true)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式值优先；非法值回落基线。
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": false})), true)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": true})), false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_travel_config(Some(&json!({"enabled": "no"})), false)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn load_travel_config_uses_usage_trace_files() {
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-travel-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("auto_travel_config.json");
+        let cache_path = dir.join("travel_cache.json");
+
+        // 两者皆无 → 全新安装，默认关闭。
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // 只有旅行缓存（使用痕迹）→ 已有用户，保持开启。
+        std::fs::write(&cache_path, "{}").unwrap();
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // 显式保存的 false 覆盖痕迹。
+        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
+        assert_eq!(
+            load_travel_config_at(&config_path, &cache_path)
+                .get("enabled")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_checkin_explicit_value_wins_and_invalid_value_uses_default() {
+        // 保存路径（以新默认值为基线）：显式值原样保留，缺失/非法才回落默认。
+        let enabled = merge_checkin_config(&json!({"enabled": true, "keepalive_days": 7}));
+        assert_eq!(enabled.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            enabled.get("keepalive_days").and_then(Value::as_i64),
+            Some(7)
+        );
+
         let disabled = merge_checkin_config(&json!({"enabled": false, "keepalive_days": 7}));
         assert_eq!(
             disabled.get("enabled").and_then(Value::as_bool),
@@ -1067,7 +1284,7 @@ mod tests {
         );
 
         let corrupt = merge_checkin_config(&json!({"enabled": "no", "lazy_refresh_hours": null}));
-        assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(false));
         assert_eq!(
             corrupt.get("lazy_refresh_hours").and_then(Value::as_i64),
             Some(24)
