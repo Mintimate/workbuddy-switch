@@ -19,7 +19,8 @@ fn default_port() -> u16 {
     57890
 }
 
-/// 后台任务：自动签到启动即核验、每 30 分钟补签；自动轮换按配置间隔执行；
+/// 后台任务：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
+/// 签到时间段时固定 30 分钟）；自动轮换按配置间隔执行；
 /// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
 fn spawn_background_loops() {
     tokio::spawn(async move {
@@ -28,7 +29,7 @@ fn spawn_background_loops() {
         }
         let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
         loop {
-            tokio::time::sleep(checkin::CHECKIN_RECOVERY_INTERVAL).await;
+            tokio::time::sleep(checkin::next_cycle_delay()).await;
             let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
         }
     });

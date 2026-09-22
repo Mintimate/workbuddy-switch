@@ -328,7 +328,13 @@ function buildStatistics(): CreditStatistics {
 }
 
 function checkinConfig(): CheckinConfig {
-  return { enabled: true, keepalive_days: 7, lazy_refresh_hours: 12 };
+  return {
+    enabled: true,
+    checkin_start: "",
+    checkin_end: "",
+    keepalive_days: 7,
+    lazy_refresh_hours: 12,
+  };
 }
 
 function travelConfig(): TravelConfig {

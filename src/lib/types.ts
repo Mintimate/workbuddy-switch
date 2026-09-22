@@ -280,6 +280,9 @@ export interface SwitchResult {
 
 export interface CheckinConfig {
   enabled: boolean;
+  /** 签到时间段（"HH:MM"，本地时区）；空串 = 不限制。两端都合法且 start < end 才生效。 */
+  checkin_start: string;
+  checkin_end: string;
   /** Legacy persisted fields; accepted by the backend but ignored by scheduling. */
   start_hour?: number;
   end_hour?: number;

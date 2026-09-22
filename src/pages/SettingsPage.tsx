@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { TimePicker } from "@/components/ui/time-picker";
 import * as api from "@/lib/api";
 import { getThemePreference, setThemePreference, type ThemePreference } from "@/lib/theme";
 import type {
@@ -124,6 +125,29 @@ function logLabel(result: string): { text: string; tone: "success" | "warning" |
   }
 }
 
+/** "HH:MM" → 当日分钟数；非法返回 null。 */
+function clockMinutes(value: string): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+/**
+ * 签到时间段的非法组合说明（只提示、不阻止保存：后端按“不限制”处理）。
+ */
+function checkinWindowIssue(start: string, end: string): string | null {
+  if (!start && !end) return null;
+  if (!start || !end) return "开始与结束时间需同时填写，否则按不限制处理";
+  const startMinutes = clockMinutes(start);
+  const endMinutes = clockMinutes(end);
+  if (startMinutes === null || endMinutes === null) return "时间格式应为 HH:MM";
+  if (startMinutes >= endMinutes) return "结束时间需晚于开始时间（不支持跨午夜），否则按不限制处理";
+  return null;
+}
+
 /** 自动签到配置 + 一键签到 + 日志。 */
 function AutoCheckinCard() {
   const [cfg, setCfg] = useState<CheckinConfig | null>(null);
@@ -194,6 +218,8 @@ function AutoCheckinCard() {
     setCfg({ ...cfg, [key]: Number(value) });
   }
 
+  const windowIssue = cfg ? checkinWindowIssue(cfg.checkin_start, cfg.checkin_end) : null;
+
   return (
     <SettingsGroup
       id="settings-auto-checkin"
@@ -213,6 +239,55 @@ function AutoCheckinCard() {
                 checked={cfg.enabled}
                 onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
               />
+            </SettingsFieldRow>
+
+            <SettingsFieldRow
+              label="签到时间段"
+              description={
+                <>
+                  留空为不限制。设置后每天在窗口内随机时刻自动签到。
+                  <span className="mt-0.5 block">需 App 在窗口附近运行才能按时执行。</span>
+                </>
+              }
+            >
+              <div className="flex min-w-0 w-full flex-col items-end gap-1 sm:w-auto">
+                <div className="flex min-w-0 w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
+                  <DemoAction className="min-w-0 flex-1 sm:flex-none">
+                    <TimePicker
+                      className="min-w-0 flex-1 sm:flex-none"
+                      value={cfg.checkin_start}
+                      hourLabel="签到开始时间（小时）"
+                      minuteLabel="签到开始时间（分钟）"
+                      onChange={(v) => setCfg({ ...cfg, checkin_start: v })}
+                    />
+                  </DemoAction>
+                  <span className="shrink-0 text-xs text-muted-foreground">至</span>
+                  <DemoAction className="min-w-0 flex-1 sm:flex-none">
+                    <TimePicker
+                      className="min-w-0 flex-1 sm:flex-none"
+                      value={cfg.checkin_end}
+                      hourLabel="签到结束时间（小时）"
+                      minuteLabel="签到结束时间（分钟）"
+                      onChange={(v) => setCfg({ ...cfg, checkin_end: v })}
+                    />
+                  </DemoAction>
+                  {(cfg.checkin_start || cfg.checkin_end) && (
+                    <DemoAction>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="shrink-0"
+                        onClick={() => setCfg({ ...cfg, checkin_start: "", checkin_end: "" })}
+                      >
+                        清除
+                      </Button>
+                    </DemoAction>
+                  )}
+                </div>
+                {windowIssue && (
+                  <p className="text-xs leading-4 text-amber-600">{windowIssue}</p>
+                )}
+              </div>
             </SettingsFieldRow>
 
             <SettingsFieldRow
