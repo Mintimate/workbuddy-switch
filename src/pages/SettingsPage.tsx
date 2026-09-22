@@ -230,7 +230,7 @@ function AutoCheckinCard() {
           <>
             <SettingsFieldRow
               label="启用自动签到"
-              description="启动时立即核验服务端状态，未签到账号会自动补签"
+              description="为允许自动签到的账号核验状态并补签；可在账号卡片的更多操作中单独关闭"
               htmlFor="ac-enabled"
               operational
             >
