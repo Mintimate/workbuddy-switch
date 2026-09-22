@@ -22,10 +22,12 @@ import type {
   RateLimitHookStatus,
   RotateLog,
   RotateStatus,
+  TravelConfig,
   UpdateInfo,
 } from "@/lib/types";
 import { GITHUB_RELEASE_URL, GITHUB_REPOSITORY_URL, openReleaseUrl } from "@/lib/update";
 import { cn } from "@/lib/utils";
+import { variantSupportsTravel } from "@/lib/variant";
 import { UpdateInstallDialog } from "@/components/update-install-dialog";
 import { DemoAction } from "@/components/demo-action";
 import { useAccountsStore } from "@/stores/accounts";
@@ -100,6 +102,50 @@ function SettingsFieldRow({
   );
 }
 
+interface CollapsibleSettingsRowProps {
+  label: ReactNode;
+  description?: ReactNode;
+  open: boolean;
+  onToggle: () => void;
+  /** 展开/收起之外的附加操作（如通知历史的「清空」）。 */
+  actions?: ReactNode;
+  children: ReactNode;
+}
+
+/**
+ * 折叠行：label/description + 查看/收起（+ 可选附加操作），展开内容在下方。
+ *
+ * 沿用通知历史既有的「Button + 条件渲染」而非 Collapsible 原语：折叠行内可能含
+ * Switch 等交互控件，用 Trigger 包整行会产生嵌套交互元素。展开按钮是纯展示交互，
+ * 不套 DemoAction（演示模式下仍可展开查看）。
+ */
+function CollapsibleSettingsRow({
+  label,
+  description,
+  open,
+  onToggle,
+  actions,
+  children,
+}: CollapsibleSettingsRowProps) {
+  return (
+    <>
+      <SettingsFieldRow
+        className={open ? undefined : "border-b-0"}
+        label={label}
+        description={description}
+      >
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" onClick={onToggle}>
+            {open ? "收起" : "查看"}
+          </Button>
+          {actions}
+        </div>
+      </SettingsFieldRow>
+      {open && <div className="border-t border-border/50 px-4 py-1.5 sm:px-5">{children}</div>}
+    </>
+  );
+}
+
 function formatTime(ts: number): string {
   try {
     return new Date(ts).toLocaleString("zh-CN", {
@@ -148,25 +194,51 @@ function checkinWindowIssue(start: string, end: string): string | null {
   return null;
 }
 
-/** 自动签到配置 + 一键签到 + 日志。 */
+/** 自动签到配置 + 一键签到 + 日志（含自动旅行行）。 */
 function AutoCheckinCard() {
+  /** 自动旅行与自动签到同卡，按档位决定是否渲染该行（国际版无成长中心）。 */
+  const variant = useAccountsStore((s) => s.variant);
   const [cfg, setCfg] = useState<CheckinConfig | null>(null);
-  const [logs, setLogs] = useState<CheckinLog[]>([]);
+  /** 参数区（时间段 / 保活阈值 / 惰性刷新）默认收起；开关行与操作行常驻。 */
+  const [expanded, setExpanded] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logs, setLogs] = useState<CheckinLog[] | null>(null);
+  const [logsError, setLogsError] = useState("");
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   useEffect(() => {
-    void load();
+    void loadConfig();
   }, []);
 
-  async function load() {
+  // 日志懒加载：展开时才请求，每次展开重新拉取；收起态无可见列表，不请求。
+  useEffect(() => {
+    if (!logsOpen) return;
+    let cancelled = false;
+    void loadLogs(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
+  }, [logsOpen]);
+
+  async function loadConfig() {
     try {
-      const [c, l] = await Promise.all([api.getAutoCheckinConfig(), api.getCheckinLogs()]);
-      setCfg(c);
-      setLogs(l.logs);
+      setCfg(await api.getAutoCheckinConfig());
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
+    }
+  }
+
+  async function loadLogs(isCancelled?: () => boolean) {
+    setLogsError("");
+    try {
+      const res = await api.getCheckinLogs();
+      if (!isCancelled?.()) setLogs(res.logs);
+    } catch (e) {
+      if (isCancelled?.()) return;
+      setLogs(null);
+      setLogsError(api.asError(e));
     }
   }
 
@@ -205,7 +277,8 @@ function AutoCheckinCard() {
         type: err > 0 ? "err" : "ok",
         text: `签到完成：成功 ${ok}，已签 ${already}，失败 ${err}${detail ? `。${detail}` : ""}`,
       });
-      void load();
+      void loadConfig();
+      if (logsOpen) void loadLogs();
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
@@ -232,91 +305,102 @@ function AutoCheckinCard() {
               label="启用自动签到"
               description="启动时立即核验服务端状态，未签到账号会自动补签"
               htmlFor="ac-enabled"
-              operational
             >
-              <Switch
-                id="ac-enabled"
-                checked={cfg.enabled}
-                onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
-              />
-            </SettingsFieldRow>
-
-            <SettingsFieldRow
-              label="签到时间段"
-              description={
-                <>
-                  留空为不限制。设置后每天在窗口内随机时刻自动签到。
-                  <span className="mt-0.5 block">需 App 在窗口附近运行才能按时执行。</span>
-                </>
-              }
-            >
-              <div className="flex min-w-0 w-full flex-col items-end gap-1 sm:w-auto">
-                <div className="flex min-w-0 w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
-                  <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                    <TimePicker
-                      className="min-w-0 flex-1 sm:flex-none"
-                      value={cfg.checkin_start}
-                      hourLabel="签到开始时间（小时）"
-                      minuteLabel="签到开始时间（分钟）"
-                      onChange={(v) => setCfg({ ...cfg, checkin_start: v })}
-                    />
-                  </DemoAction>
-                  <span className="shrink-0 text-xs text-muted-foreground">至</span>
-                  <DemoAction className="min-w-0 flex-1 sm:flex-none">
-                    <TimePicker
-                      className="min-w-0 flex-1 sm:flex-none"
-                      value={cfg.checkin_end}
-                      hourLabel="签到结束时间（小时）"
-                      minuteLabel="签到结束时间（分钟）"
-                      onChange={(v) => setCfg({ ...cfg, checkin_end: v })}
-                    />
-                  </DemoAction>
-                  {(cfg.checkin_start || cfg.checkin_end) && (
-                    <DemoAction>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="shrink-0"
-                        onClick={() => setCfg({ ...cfg, checkin_start: "", checkin_end: "" })}
-                      >
-                        清除
-                      </Button>
-                    </DemoAction>
-                  )}
-                </div>
-                {windowIssue && (
-                  <p className="text-xs leading-4 text-amber-600">{windowIssue}</p>
-                )}
+              <div className="flex items-center gap-2">
+                {/* 开关是业务操作（需保存配置生效），展开按钮是纯展示交互，故只包开关。 */}
+                <DemoAction>
+                  <Switch
+                    id="ac-enabled"
+                    checked={cfg.enabled}
+                    onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
+                  />
+                </DemoAction>
+                <Button variant="outline" size="sm" onClick={() => setExpanded((value) => !value)}>
+                  {expanded ? "收起" : "展开"}
+                </Button>
               </div>
             </SettingsFieldRow>
 
-            <SettingsFieldRow
-              label="保活阈值"
-              description="天；0 表示每天无条件刷新"
-              htmlFor="ac-keep"
-              operational
-            >
-              <Input
-                id="ac-keep"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                max={90}
-                value={cfg.keepalive_days}
-                onChange={(e) => setNum("keepalive_days", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <SettingsFieldRow label="惰性刷新" description="小时" htmlFor="ac-lazy" operational>
-              <Input
-                id="ac-lazy"
-                className="w-full sm:w-48"
-                type="number"
-                min={1}
-                max={72}
-                value={cfg.lazy_refresh_hours}
-                onChange={(e) => setNum("lazy_refresh_hours", e.target.value)}
-              />
-            </SettingsFieldRow>
+            {expanded && (
+              <>
+                <SettingsFieldRow
+                  label="签到时间段"
+                  description={
+                    <>
+                      留空为不限制。设置后每天在窗口内随机时刻自动签到。
+                      <span className="mt-0.5 block">需 App 在窗口附近运行才能按时执行。</span>
+                    </>
+                  }
+                >
+                  <div className="flex min-w-0 w-full flex-col items-end gap-1 sm:w-auto">
+                    <div className="flex min-w-0 w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
+                      <DemoAction className="min-w-0 flex-1 sm:flex-none">
+                        <TimePicker
+                          className="min-w-0 flex-1 sm:flex-none"
+                          value={cfg.checkin_start}
+                          hourLabel="签到开始时间（小时）"
+                          minuteLabel="签到开始时间（分钟）"
+                          onChange={(v) => setCfg({ ...cfg, checkin_start: v })}
+                        />
+                      </DemoAction>
+                      <span className="shrink-0 text-xs text-muted-foreground">至</span>
+                      <DemoAction className="min-w-0 flex-1 sm:flex-none">
+                        <TimePicker
+                          className="min-w-0 flex-1 sm:flex-none"
+                          value={cfg.checkin_end}
+                          hourLabel="签到结束时间（小时）"
+                          minuteLabel="签到结束时间（分钟）"
+                          onChange={(v) => setCfg({ ...cfg, checkin_end: v })}
+                        />
+                      </DemoAction>
+                      {(cfg.checkin_start || cfg.checkin_end) && (
+                        <DemoAction>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            className="shrink-0"
+                            onClick={() => setCfg({ ...cfg, checkin_start: "", checkin_end: "" })}
+                          >
+                            清除
+                          </Button>
+                        </DemoAction>
+                      )}
+                    </div>
+                    {windowIssue && (
+                      <p className="text-xs leading-4 text-amber-600">{windowIssue}</p>
+                    )}
+                  </div>
+                </SettingsFieldRow>
+
+                <SettingsFieldRow
+                  label="保活阈值"
+                  description="天；0 表示每天无条件刷新"
+                  htmlFor="ac-keep"
+                  operational
+                >
+                  <Input
+                    id="ac-keep"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={0}
+                    max={90}
+                    value={cfg.keepalive_days}
+                    onChange={(e) => setNum("keepalive_days", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <SettingsFieldRow label="惰性刷新" description="小时" htmlFor="ac-lazy" operational>
+                  <Input
+                    id="ac-lazy"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={1}
+                    max={72}
+                    value={cfg.lazy_refresh_hours}
+                    onChange={(e) => setNum("lazy_refresh_hours", e.target.value)}
+                  />
+                </SettingsFieldRow>
+              </>
+            )}
 
             <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
               <DemoAction><Button size="sm" onClick={save} disabled={saving}>
@@ -331,6 +415,10 @@ function AutoCheckinCard() {
           <p className="px-4 py-3 text-sm text-muted-foreground sm:px-5">加载配置中…</p>
         )}
 
+        {/* 成长中心（派猫猫旅行）仅国内版开放：国际版不渲染该行，也不请求其配置。
+            行本身独立于签到配置的加载状态，签到配置读取失败也不影响开关。 */}
+        {variantSupportsTravel(variant) ? <AutoTravelRow /> : null}
+
         {msg && (
           <Alert
             variant={msg.type === "err" ? "destructive" : "default"}
@@ -340,10 +428,18 @@ function AutoCheckinCard() {
           </Alert>
         )}
 
-        <div className="px-4 py-3 sm:px-5">
-          <p className="mb-2 text-[13px] font-medium">签到日志（最近 30 天）</p>
-          {logs.length === 0 ? (
-            <p className="py-3 text-center text-sm text-muted-foreground">暂无签到记录</p>
+        <CollapsibleSettingsRow
+          label="签到日志"
+          description="保留最近 30 天；本机明文保存，可能含账号昵称。"
+          open={logsOpen}
+          onToggle={() => setLogsOpen((value) => !value)}
+        >
+          {logsError ? (
+            <p className="py-2 text-xs text-destructive">{logsError}</p>
+          ) : !logs ? (
+            <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
+          ) : logs.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">暂无签到记录</p>
           ) : (
             <div className="max-h-64 overflow-y-auto pr-1">
               {[...logs].reverse().map((l, i) => {
@@ -376,9 +472,72 @@ function AutoCheckinCard() {
               })}
             </div>
           )}
-        </div>
+        </CollapsibleSettingsRow>
       </CardContent>
     </SettingsGroup>
+  );
+}
+
+/**
+ * 自动旅行：单行开关，渲染在「自动签到」卡片内部（不独立成卡）。
+ *
+ * 成长中心仅国内版开放，调用方按档位决定是否渲染；开关切换即落盘（无「保存配置」按钮），
+ * 失败回滚并提示。
+ */
+function AutoTravelRow() {
+  const [cfg, setCfg] = useState<TravelConfig | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoTravelConfig()
+      .then((config) => {
+        if (!cancelled) setCfg(config);
+      })
+      .catch((e) => {
+        if (!cancelled) toast.error("自动旅行配置加载失败", { description: api.asError(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function onToggle(enabled: boolean) {
+    if (!cfg || busy) return;
+    const previous = cfg;
+    setCfg({ ...cfg, enabled });
+    setBusy(true);
+    try {
+      setCfg(await api.saveAutoTravelConfig({ ...cfg, enabled }));
+      if (enabled) {
+        toast.success("自动旅行已开启", { description: "正在按官方状态派发或领取" });
+      } else {
+        toast.success("自动旅行已关闭");
+      }
+    } catch (e) {
+      setCfg(previous);
+      toast.error("自动旅行设置保存失败", { description: api.asError(e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <SettingsFieldRow
+      label="启用自动旅行"
+      description="开启后按官方状态自动派发或领取旅行奖励；切换后立即生效"
+      htmlFor="at-enabled"
+      operational
+    >
+      <Switch
+        id="at-enabled"
+        checked={cfg?.enabled ?? false}
+        disabled={busy || !cfg}
+        onCheckedChange={(v) => void onToggle(v)}
+        aria-label="启用自动旅行"
+      />
+    </SettingsFieldRow>
   );
 }
 
@@ -386,27 +545,48 @@ function AutoCheckinCard() {
 function AutoRotateCard() {
   const [cfg, setCfg] = useState<AutoRotateConfig | null>(null);
   const [status, setStatus] = useState<RotateStatus | null>(null);
-  const [logs, setLogs] = useState<RotateLog[]>([]);
+  /** 参数区（间隔 / 冷却 / 阈值）与说明默认收起；开关行、操作行与日志行常驻。 */
+  const [expanded, setExpanded] = useState(false);
+  const [logsOpen, setLogsOpen] = useState(false);
+  const [logs, setLogs] = useState<RotateLog[] | null>(null);
+  const [logsError, setLogsError] = useState("");
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
 
   useEffect(() => {
-    void load();
+    void loadConfig();
   }, []);
 
-  async function load() {
+  // 日志懒加载：展开时才请求，每次展开重新拉取；收起态无可见列表，不请求。
+  useEffect(() => {
+    if (!logsOpen) return;
+    let cancelled = false;
+    void loadLogs(() => cancelled);
+    return () => {
+      cancelled = true;
+    };
+  }, [logsOpen]);
+
+  async function loadConfig() {
     try {
-      const [c, s, l] = await Promise.all([
-        api.getAutoRotateConfig(),
-        api.getRotateStatus(),
-        api.getRotateLogs(),
-      ]);
+      const [c, s] = await Promise.all([api.getAutoRotateConfig(), api.getRotateStatus()]);
       setCfg(c);
       setStatus(s);
-      setLogs(l.logs);
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
+    }
+  }
+
+  async function loadLogs(isCancelled?: () => boolean) {
+    setLogsError("");
+    try {
+      const res = await api.getRotateLogs();
+      if (!isCancelled?.()) setLogs(res.logs);
+    } catch (e) {
+      if (isCancelled?.()) return;
+      setLogs(null);
+      setLogsError(api.asError(e));
     }
   }
 
@@ -444,7 +624,8 @@ function AutoRotateCard() {
               ? "自动轮换未启用（请在下方开启后重试）"
               : (res.reason ?? `检查完成：${res.status}`),
       });
-      void load();
+      void loadConfig();
+      if (logsOpen) void loadLogs();
     } catch (e) {
       setMsg({ type: "err", text: api.asError(e) });
     } finally {
@@ -496,74 +677,85 @@ function AutoRotateCard() {
           <>
             <SettingsFieldRow
               label="启用自动轮换"
-              description="开启后按下方间隔自动检查并切换 CodeBuddy CLI 账号"
+              description="开启后按设定的间隔自动检查并切换 CodeBuddy CLI 账号"
               htmlFor="ar-enabled"
-              operational
             >
-              <Switch
-                id="ar-enabled"
-                checked={cfg.enabled}
-                onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
-              />
+              <div className="flex items-center gap-2">
+                {/* 开关是业务操作（需保存配置生效），展开按钮是纯展示交互，故只包开关。 */}
+                <DemoAction>
+                  <Switch
+                    id="ar-enabled"
+                    checked={cfg.enabled}
+                    onCheckedChange={(v) => setCfg({ ...cfg, enabled: v })}
+                  />
+                </DemoAction>
+                <Button variant="outline" size="sm" onClick={() => setExpanded((value) => !value)}>
+                  {expanded ? "收起" : "展开"}
+                </Button>
+              </div>
             </SettingsFieldRow>
 
-            <SettingsFieldRow label="检查间隔" description="分钟" htmlFor="ar-interval" operational>
-              <Input
-                id="ar-interval"
-                className="w-full sm:w-48"
-                type="number"
-                min={1}
-                max={1440}
-                value={cfg.check_interval_minutes}
-                onChange={(e) => setNum("check_interval_minutes", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <SettingsFieldRow label="切换冷却" description="分钟" htmlFor="ar-cooldown" operational>
-              <Input
-                id="ar-cooldown"
-                className="w-full sm:w-48"
-                type="number"
-                min={1}
-                max={1440}
-                value={cfg.cooldown_minutes}
-                onChange={(e) => setNum("cooldown_minutes", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <SettingsFieldRow label="到期差异阈值" description="小时" htmlFor="ar-gap" operational>
-              <Input
-                id="ar-gap"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                max={720}
-                value={cfg.min_gap_hours}
-                onChange={(e) => setNum("min_gap_hours", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <SettingsFieldRow label="到期紧迫阈值" description="小时" htmlFor="ar-urgency" operational>
-              <Input
-                id="ar-urgency"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                max={720}
-                value={cfg.min_urgency_hours}
-                onChange={(e) => setNum("min_urgency_hours", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <SettingsFieldRow label="最小剩余积分" description="低于此值时不切换" htmlFor="ar-min" operational>
-              <Input
-                id="ar-min"
-                className="w-full sm:w-48"
-                type="number"
-                min={0}
-                value={cfg.min_remaining_credits}
-                onChange={(e) => setNum("min_remaining_credits", e.target.value)}
-              />
-            </SettingsFieldRow>
-            <p className="border-b border-border/60 px-4 py-3 text-[13px] leading-5 text-muted-foreground sm:px-5">
-              切换时机：目标账号剩余到期时间少于「紧迫阈值」且比当前账号早超过「差异阈值」，且目标剩余积分不低于「最小剩余积分」。检测到有 CodeBuddy CLI 会话在运行时，本次轮换会跳过并在当日最多提示 5 次；重启 CLI 后新账号才会生效。
-            </p>
+            {expanded && (
+              <>
+                <SettingsFieldRow label="检查间隔" description="分钟" htmlFor="ar-interval" operational>
+                  <Input
+                    id="ar-interval"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={cfg.check_interval_minutes}
+                    onChange={(e) => setNum("check_interval_minutes", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <SettingsFieldRow label="切换冷却" description="分钟" htmlFor="ar-cooldown" operational>
+                  <Input
+                    id="ar-cooldown"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={cfg.cooldown_minutes}
+                    onChange={(e) => setNum("cooldown_minutes", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <SettingsFieldRow label="到期差异阈值" description="小时" htmlFor="ar-gap" operational>
+                  <Input
+                    id="ar-gap"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={0}
+                    max={720}
+                    value={cfg.min_gap_hours}
+                    onChange={(e) => setNum("min_gap_hours", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <SettingsFieldRow label="到期紧迫阈值" description="小时" htmlFor="ar-urgency" operational>
+                  <Input
+                    id="ar-urgency"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={0}
+                    max={720}
+                    value={cfg.min_urgency_hours}
+                    onChange={(e) => setNum("min_urgency_hours", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <SettingsFieldRow label="最小剩余积分" description="低于此值时不切换" htmlFor="ar-min" operational>
+                  <Input
+                    id="ar-min"
+                    className="w-full sm:w-48"
+                    type="number"
+                    min={0}
+                    value={cfg.min_remaining_credits}
+                    onChange={(e) => setNum("min_remaining_credits", e.target.value)}
+                  />
+                </SettingsFieldRow>
+                <p className="border-b border-border/60 px-4 py-3 text-[13px] leading-5 text-muted-foreground sm:px-5">
+                  切换时机：目标账号剩余到期时间少于「紧迫阈值」且比当前账号早超过「差异阈值」，且目标剩余积分不低于「最小剩余积分」。检测到有 CodeBuddy CLI 会话在运行时，本次轮换会跳过并在当日最多提示 5 次；重启 CLI 后新账号才会生效。
+                </p>
+              </>
+            )}
 
             <div className="flex flex-wrap gap-2 border-b-0 border-border/60 px-4 py-3 sm:px-5">
               <DemoAction><Button size="sm" onClick={save} disabled={saving}>
@@ -587,10 +779,18 @@ function AutoRotateCard() {
           </Alert>
         )}
 
-        <div className="px-4 py-3 sm:px-5">
-          <p className="mb-2 text-[13px] font-medium">轮换日志（最近 200 条）</p>
-          {logs.length === 0 ? (
-            <p className="py-3 text-center text-sm text-muted-foreground">暂无轮换记录</p>
+        <CollapsibleSettingsRow
+          label="轮换日志"
+          description="保留最近 200 条；本机明文保存，可能含账号昵称。"
+          open={logsOpen}
+          onToggle={() => setLogsOpen((value) => !value)}
+        >
+          {logsError ? (
+            <p className="py-2 text-xs text-destructive">{logsError}</p>
+          ) : !logs ? (
+            <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
+          ) : logs.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">暂无轮换记录</p>
           ) : (
             <div className="max-h-64 overflow-y-auto pr-1">
               {logs.map((l, i) => {
@@ -627,7 +827,7 @@ function AutoRotateCard() {
               })}
             </div>
           )}
-        </div>
+        </CollapsibleSettingsRow>
       </CardContent>
     </SettingsGroup>
   );
@@ -1032,15 +1232,12 @@ function NotificationHistoryCard() {
   return (
     <SettingsGroup id="settings-notifications" title="通知历史">
       <CardContent className="space-y-0 p-0">
-        <SettingsFieldRow
-          className={open ? undefined : "border-b-0"}
+        <CollapsibleSettingsRow
           label="应用内提示存档"
           description="保留最近 100 条，便于事后核对；本机明文保存，可能含账号昵称与本地路径。"
-        >
-          <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={() => setOpen((value) => !value)}>
-              {open ? "收起" : "查看"}
-            </Button>
+          open={open}
+          onToggle={() => setOpen((value) => !value)}
+          actions={
             <Button
               variant="ghost"
               size="sm"
@@ -1049,44 +1246,41 @@ function NotificationHistoryCard() {
             >
               清空
             </Button>
-          </div>
-        </SettingsFieldRow>
-        {open && (
-          <div className="border-t border-border/50 px-4 py-1.5 sm:px-5">
-            {error ? (
-              <p className="py-2 text-xs text-destructive">{error}</p>
-            ) : !items ? (
-              <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
-            ) : items.length === 0 ? (
-              <p className="py-2 text-xs text-muted-foreground">还没有记录到任何提示。</p>
-            ) : (
-              <ul className="max-h-72 divide-y divide-border/40 overflow-auto">
-                {items.map((item, index) => (
-                  <li key={`${item.at}-${index}`} className="py-1.5">
-                    <div className="flex items-center gap-1.5 text-[11px] leading-4 text-muted-foreground">
-                      <span
-                        className={cn(
-                          "size-1.5 shrink-0 rounded-full",
-                          NOTIFICATION_LEVEL_DOT[item.level],
-                        )}
-                        aria-hidden
-                      />
-                      <span>{NOTIFICATION_LEVEL_LABEL[item.level]}</span>
-                      <span aria-hidden>·</span>
-                      <span>{formatNotificationTime(item.at)}</span>
+          }
+        >
+          {error ? (
+            <p className="py-2 text-xs text-destructive">{error}</p>
+          ) : !items ? (
+            <p className="py-2 text-xs text-muted-foreground">正在读取…</p>
+          ) : items.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">还没有记录到任何提示。</p>
+          ) : (
+            <ul className="max-h-72 divide-y divide-border/40 overflow-auto">
+              {items.map((item, index) => (
+                <li key={`${item.at}-${index}`} className="py-1.5">
+                  <div className="flex items-center gap-1.5 text-[11px] leading-4 text-muted-foreground">
+                    <span
+                      className={cn(
+                        "size-1.5 shrink-0 rounded-full",
+                        NOTIFICATION_LEVEL_DOT[item.level],
+                      )}
+                      aria-hidden
+                    />
+                    <span>{NOTIFICATION_LEVEL_LABEL[item.level]}</span>
+                    <span aria-hidden>·</span>
+                    <span>{formatNotificationTime(item.at)}</span>
+                  </div>
+                  <div className="mt-0.5 text-[13px] leading-5">{item.title}</div>
+                  {item.description && (
+                    <div className="mt-0.5 break-all text-xs leading-5 text-muted-foreground">
+                      {item.description}
                     </div>
-                    <div className="mt-0.5 text-[13px] leading-5">{item.title}</div>
-                    {item.description && (
-                      <div className="mt-0.5 break-all text-xs leading-5 text-muted-foreground">
-                        {item.description}
-                      </div>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )}
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </CollapsibleSettingsRow>
       </CardContent>
     </SettingsGroup>
   );
@@ -1338,7 +1532,7 @@ function RateLimitCard() {
   );
 }
 
-/** 设置页：自动签到配置 / 权限检测 / 更新配置。 */
+/** 设置页：外观 / 权限检测 / 自动签到（含自动旅行）/ 自动轮换 / 限额监听 / 更新配置。 */
 export default function SettingsPage() {
   return (
     <div className="mx-auto min-w-0 w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
