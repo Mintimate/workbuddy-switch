@@ -263,6 +263,7 @@ pub fn clear_codebuddy_ide_app_cache() {
 pub fn default_checkin_config() -> Value {
     json!({
         "enabled": true,
+        "excluded_account_ids": [],
         "checkin_start": "",
         "checkin_end": "",
         "start_hour": 6,
@@ -298,6 +299,16 @@ fn merge_checkin_config(input: &Value) -> Value {
     };
     if let Some(enabled) = map.get("enabled").and_then(Value::as_bool) {
         merged["enabled"] = json!(enabled);
+    }
+    // 仅用稳定账号 id 排除自动签到；忽略无效项并去重，旧配置默认全部参与。
+    if let Some(ids) = map.get("excluded_account_ids").and_then(Value::as_array) {
+        let mut seen = HashSet::new();
+        let ids: Vec<&str> = ids
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|id| !id.trim().is_empty() && seen.insert(*id))
+            .collect();
+        merged["excluded_account_ids"] = json!(ids);
     }
     for key in [
         "start_hour",
@@ -1050,8 +1061,55 @@ mod tests {
     fn auto_checkin_defaults_enabled_and_preserves_legacy_fields() {
         let cfg = default_checkin_config();
         assert_eq!(cfg.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(cfg["excluded_account_ids"], json!([]));
         assert_eq!(cfg.get("start_hour").and_then(Value::as_i64), Some(6));
         assert_eq!(cfg.get("end_hour").and_then(Value::as_i64), Some(12));
+    }
+
+    #[test]
+    fn auto_checkin_exclusions_survive_config_roundtrip_and_global_toggle() {
+        let cfg = merge_checkin_config(&json!({
+            "enabled": true,
+            "excluded_account_ids": ["account-b", "account-a", "account-b", "", "  ", null, 42],
+            "checkin_start": "9:5",
+            "checkin_end": "12:00",
+            "keepalive_days": 7
+        }));
+        assert_eq!(
+            cfg["excluded_account_ids"],
+            json!(["account-b", "account-a"])
+        );
+        let serialized = serde_json::to_string(&cfg).unwrap();
+        let mut reloaded: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(merge_checkin_config(&reloaded), cfg);
+        reloaded["enabled"] = json!(false);
+        let disabled = merge_checkin_config(&reloaded);
+        assert_eq!(
+            disabled["excluded_account_ids"],
+            cfg["excluded_account_ids"]
+        );
+        assert_eq!(disabled["checkin_start"], "09:05");
+        assert_eq!(disabled["keepalive_days"], 7);
+    }
+
+    #[test]
+    fn auto_checkin_legacy_or_invalid_exclusions_default_to_empty() {
+        assert_eq!(
+            merge_checkin_config(&json!({}))["excluded_account_ids"],
+            json!([])
+        );
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!("account-a"),
+            json!({"id": "account-a"}),
+        ] {
+            assert_eq!(
+                merge_checkin_config(&json!({"excluded_account_ids": invalid}))
+                    ["excluded_account_ids"],
+                json!([])
+            );
+        }
     }
 
     #[test]
