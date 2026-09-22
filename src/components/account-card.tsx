@@ -108,6 +108,7 @@ function statusIconChip({
   tooltip,
   variant,
   count,
+  muted,
 }: {
   icon: ReactNode;
   label: string;
@@ -115,12 +116,18 @@ function statusIconChip({
   variant: "secondary" | "success" | "warning";
   /** 数量角标；≤1 时不显示（单个受限模型不需要角标）。 */
   count?: number;
+  /** 置灰（未激活状态，如「未旅行」）：图标与角标一起使用 muted 前景色。 */
+  muted?: boolean;
 }) {
   const badge = count != null && count > 1;
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Badge variant={variant} className={cn(chipClass, "px-1", badge && "gap-0.5")} aria-label={label}>
+        <Badge
+          variant={variant}
+          className={cn(chipClass, "px-1", badge && "gap-0.5", muted && "text-muted-foreground")}
+          aria-label={label}
+        >
           {icon}
           {badge ? (
             <span
@@ -141,12 +148,14 @@ function travelIconChip({
   label,
   tooltip,
   variant,
+  muted,
 }: {
   label: string;
   tooltip: string;
   variant: "secondary" | "success";
+  muted?: boolean;
 }) {
-  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant });
+  return statusIconChip({ icon: <PlaneTakeoff className="size-3.5" />, label, tooltip, variant, muted });
 }
 
 function formatTravelRemaining(arriveAt: number | null | undefined): string | null {
@@ -181,7 +190,7 @@ function travelTooltip(status: TravelStatus): string {
   return "未旅行";
 }
 
-/** 按旅行状态渲染标签：无 Buddy / 未旅行 / 旅行中 / 已结束。 */
+/** 按旅行状态渲染 chip：无 Buddy 用文字 badge；未旅行用置灰图标；旅行中 / 已结束用图标 chip。 */
 function travelChip(status: TravelStatus | undefined) {
   if (!status) return null;
   switch (status.label) {
@@ -193,7 +202,8 @@ function travelChip(status: TravelStatus | undefined) {
       return travelIconChip({ label: travelTooltip(status), tooltip: travelTooltip(status), variant: "success" });
     case "untraveled":
     default:
-      return <Badge variant="secondary" className={cn(chipClass, "text-muted-foreground")}>未旅行</Badge>;
+      // 未旅行是多数账号的常态：只留置灰图标，文案交给 tooltip。
+      return travelIconChip({ label: "未旅行", tooltip: "未旅行", variant: "secondary", muted: true });
   }
 }
 

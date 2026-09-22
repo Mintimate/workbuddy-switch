@@ -2,14 +2,12 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { toast } from "sonner";
 import {
-  CalendarCheck,
   Columns3,
   Download,
   ExternalLink,
   FileDown,
   FileUp,
   Loader2,
-  Plane,
   QrCode,
   RefreshCw,
   Rows3,
@@ -29,7 +27,6 @@ import {
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -180,10 +177,13 @@ export default function AccountsPage() {
   const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
   const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
-  const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
-  const [autoTravelSaving, setAutoTravelSaving] = useState(false);
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
   const [travelMap, setTravelMap] = useState<Record<string, TravelStatus>>({});
+  /**
+   * 自动旅行配置（只读）：未开启时不渲染账号卡片的旅行 chip、也不轮询旅行状态。
+   * `null` = 配置尚未读到，按未开启处理。
+   */
+  const [autoTravelConfig, setAutoTravelConfig] = useState<TravelConfig | null>(null);
   /** 账号 id -> 当前受限的模型（数据源 = 后端限额台账：hook 信号 + 日志扫描） */
   const [rateLimitMap, setRateLimitMap] = useState<Record<string, RateLimitEntry[]>>({});
   /**
@@ -215,15 +215,15 @@ export default function AccountsPage() {
   const appName = variantAppName(variant);
   const travelAvailable = variantSupportsTravel(variant);
   const checkinAvailable = variantSupportsCheckin(variant);
+  /** 旅行 chip 与旅行状态轮询只在自动旅行开启后生效（配置未读到 = 未开启）。 */
+  const autoTravelEnabled = travelAvailable && autoTravelConfig?.enabled === true;
   /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
   const refreshCreditsLabel = checkinAvailable ? "刷新全部账号积分并签到（忽略已关闭自动签到的账号）" : "刷新全部账号积分";
-  const autoCheckinEnabled = autoCheckinConfig?.enabled ?? false;
   const autoCheckinAccountIds = useMemo(() => {
     if (!autoCheckinConfig || !checkinAvailable) return [];
     const excluded = new Set(autoCheckinConfig.excluded_account_ids ?? []);
     return visibleAccounts.filter((account) => !excluded.has(account.id)).map((account) => account.id);
   }, [visibleAccounts, autoCheckinConfig, checkinAvailable]);
-  const autoTravelEnabled = autoTravelConfig?.enabled ?? false;
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -259,23 +259,6 @@ export default function AccountsPage() {
       .catch((e) => {
         if (!cancelled) {
           toast.error("自动签到配置加载失败", { description: api.asError(e) });
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    void api
-      .getAutoTravelConfig()
-      .then((config) => {
-        if (!cancelled) setAutoTravelConfig(config);
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          toast.error("自动旅行配置加载失败", { description: api.asError(e) });
         }
       });
     return () => {
@@ -375,6 +358,23 @@ export default function AccountsPage() {
     };
   }, [autoCheckinAccountIds, autoCheckinSaving]);
 
+  // 自动旅行配置（只读）：只用于决定账号卡片是否展示旅行 chip、是否轮询旅行状态。
+  // 读取失败静默按未开启处理（不展示 chip、不发状态请求），不打扰用户。
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .getAutoTravelConfig()
+      .then((config) => {
+        if (!cancelled) setAutoTravelConfig(config);
+      })
+      .catch(() => {
+        /* 配置读取失败：按未开启处理 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function loadTravelMap(accountIds: string[], isStale?: () => boolean) {
     const next = await fetchTravelMap(accountIds, isStale);
     if (!isStale?.() && Object.keys(next).length > 0) {
@@ -384,7 +384,7 @@ export default function AccountsPage() {
 
   // 当前档位账号列表变化后并行查询旅行状态；之后按 TRAVEL_REFRESH_INTERVAL_MS 周期刷新，
   // 以反映后台派发/领取循环带来的状态变化。仅主窗口可见时轮询，隐藏时暂停。
-  // 成长中心仅国内版开放，国际版不发请求也不展示标签。
+  // 成长中心仅国内版开放，国际版不发请求也不展示标签；自动旅行关闭时不展示状态、不查询。
   const travelAccountIds = useMemo(
     () => visibleAccounts.map((account) => account.id),
     [visibleAccounts],
@@ -392,7 +392,7 @@ export default function AccountsPage() {
   useVisibleInterval(
     () => void loadTravelMap(travelAccountIds),
     TRAVEL_REFRESH_INTERVAL_MS,
-    travelAvailable && travelAccountIds.length > 0,
+    autoTravelEnabled && travelAccountIds.length > 0,
   );
 
   /**
@@ -502,39 +502,12 @@ export default function AccountsPage() {
     }
   }
 
-  async function onAutoCheckinChange(enabled: boolean) {
-    if (!autoCheckinConfig) return;
-    await saveAutoCheckinSettings({ ...autoCheckinConfig, enabled });
-  }
-
   async function onAccountAutoCheckinChange(account: AccountMeta, allowed: boolean) {
     if (!autoCheckinConfig) return;
     const excluded = new Set(autoCheckinConfig.excluded_account_ids ?? []);
     if (allowed) excluded.delete(account.id);
     else excluded.add(account.id);
     await saveAutoCheckinSettings({ ...autoCheckinConfig, excluded_account_ids: [...excluded] });
-  }
-
-  async function onAutoTravelChange(enabled: boolean) {
-    if (!autoTravelConfig || autoTravelSaving) return;
-    const previous = autoTravelConfig;
-    const next = { ...previous, enabled };
-    setAutoTravelConfig(next);
-    setAutoTravelSaving(true);
-    try {
-      setAutoTravelConfig(await api.saveAutoTravelConfig(next));
-      if (enabled) {
-        toast.success("自动旅行已开启", { description: "正在按官方状态派发或领取" });
-        window.setTimeout(() => {
-          void loadTravelMap(visibleAccounts.map((account) => account.id));
-        }, 2500);
-      }
-    } catch (e) {
-      setAutoTravelConfig(previous);
-      toast.error("自动旅行设置保存失败", { description: api.asError(e) });
-    } finally {
-      setAutoTravelSaving(false);
-    }
   }
 
   /** 导出完成提示（含安全提醒）。 */
@@ -647,7 +620,7 @@ export default function AccountsPage() {
         }
       }
       await refreshCredits(ids);
-      if (travelAvailable) await loadTravelMap(ids);
+      if (autoTravelEnabled) await loadTravelMap(ids);
       const notify = checkinFailed ? toast.error : checkinSkipped ? toast.info : toast.success;
       notify(checkinFailed ? "积分已刷新，签到出现错误" : "积分到期情况已刷新", { description: checkinSummary || undefined });
     } finally {
@@ -970,68 +943,6 @@ export default function AccountsPage() {
           </div>
           <TooltipProvider delayDuration={400}>
             <div className="ml-auto flex items-center gap-1">
-              {/* 自动签到仅国内版开放，国际版隐藏入口 */}
-              {checkinAvailable && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <DemoAction>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className={cn("size-9 rounded-lg", autoCheckinEnabled && "bg-accent")}
-                          disabled={!autoCheckinConfig || autoCheckinSaving}
-                          onClick={() => void onAutoCheckinChange(!autoCheckinEnabled)}
-                          aria-pressed={autoCheckinEnabled}
-                          aria-label={autoCheckinEnabled ? "自动签到已开启" : "自动签到已关闭"}
-                          aria-busy={autoCheckinSaving}
-                        >
-                          {/* 品牌色必须落在图标上而非 Button：ghost 的 hover:text-accent-foreground
-                              (button.tsx:18) 特异性高于单个 text-brand，会把开启态在悬停时抹成关闭态的样子。
-                              子元素自带 color 胜过父级继承，与特异性无关。 */}
-                          {autoCheckinSaving
-                            ? <Loader2 className={cn("animate-spin", autoCheckinEnabled && "text-brand")} />
-                            : <CalendarCheck className={cn(autoCheckinEnabled && "text-brand")} />}
-                        </Button>
-                      </DemoAction>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    {api.isDemoMode() ? "演示模式下不可操作" : `自动签到：${autoCheckinEnabled ? "已开启" : "已关闭"}`}
-                  </TooltipContent>
-                </Tooltip>
-              )}
-              {/* 成长中心（派猫猫旅行）仅国内版开放，国际版隐藏入口 */}
-              {travelAvailable && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <DemoAction>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className={cn("size-9 rounded-lg", autoTravelEnabled && "bg-accent")}
-                          disabled={!autoTravelConfig || autoTravelSaving}
-                          onClick={() => void onAutoTravelChange(!autoTravelEnabled)}
-                          aria-pressed={autoTravelEnabled}
-                          aria-label={autoTravelEnabled ? "自动旅行已开启" : "自动旅行已关闭"}
-                          aria-busy={autoTravelSaving}
-                        >
-                          {/* 同签到：品牌色落在图标上，避免被 ghost 的 hover:text-accent-foreground 抹掉 */}
-                          {autoTravelSaving
-                            ? <Loader2 className={cn("animate-spin", autoTravelEnabled && "text-brand")} />
-                            : <Plane className={cn(autoTravelEnabled && "text-brand")} />}
-                        </Button>
-                      </DemoAction>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    {api.isDemoMode() ? "演示模式下不可操作" : `自动旅行：${autoTravelEnabled ? "已开启" : "已关闭"}`}
-                  </TooltipContent>
-                </Tooltip>
-              )}
-              {/* 左侧开关都隐藏时（如国际版）不画悬空分隔线 */}
-              {(checkinAvailable || travelAvailable) && <Separator orientation="vertical" className="mx-2 h-5" />}
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
@@ -1105,7 +1016,7 @@ export default function AccountsPage() {
                 autoCheckinGlobalEnabled={autoCheckinConfig?.enabled}
                 autoCheckinSaving={autoCheckinSaving}
                 onAutoCheckinChange={checkinAvailable ? onAccountAutoCheckinChange : undefined}
-                travelStatus={travelMap[a.id]}
+                travelStatus={autoTravelEnabled ? travelMap[a.id] : undefined}
                 rateLimits={rateLimitEnabled ? rateLimitMap[a.id] : undefined}
                 credit={creditMap[a.id]}
                 creditLoading={creditLoadingMap[a.id]}
