@@ -45,3 +45,4 @@ npm/platform/*/bin/
 .codex/
 .grok/
 /.workbuddy/
+/AGENTS.md
