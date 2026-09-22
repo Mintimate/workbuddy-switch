@@ -1,6 +1,6 @@
 # workbuddy-switch
 
-WorkBuddy、CodeBuddy IDE（均支持国内版 / 国际版）、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切换桌面 App（Tauri），支持积分到期与 Token 用量监控。同时提供 npm / webui 版本，在浏览器中使用同一套账号管理能力。
+WorkBuddy、CodeBuddy IDE、CodeBuddy CLI 与 VS Code CodeBuddy 插件账号切换桌面 App（Tauri），四者均支持国内版 / 国际版，并提供积分到期与 Token 用量监控。
 
 <p align="center">
   <img src="public/icon-transparent.png" alt="WorkBuddy Switch 图标" width="128" />
@@ -11,8 +11,6 @@ WorkBuddy、CodeBuddy IDE（均支持国内版 / 国际版）、CodeBuddy CLI �
 **在线演示**：[打开 GitHub Pages 演示](https://changexbc.github.io/workbuddy-switch/)（只读演示；账号、积分与请求记录均为虚构数据，所有业务操作均已禁用）
 
 ## 快速开始
-
-### 桌面 App
 
 前往 [GitHub Releases](https://github.com/changexbc/workbuddy-switch/releases/latest) 下载对应平台的安装包：
 
@@ -31,15 +29,7 @@ xattr -rd com.apple.quarantine "/Applications/workbuddy-switch.app"
 
 应用能启动但切换账号时提示无权限，请参阅下方 [macOS 权限说明](#macos-权限说明)。
 
-### npm / webui
-
-```bash
-npm i -g workbuddy-switch
-workbuddy-switch              # 启动本地服务 + 自动打开浏览器
-workbuddy-switch status       # 终端查看当前账号
-```
-
-webui 界面与桌面 App 一致，功能覆盖下方全部模块。
+另有 npm / webui 版本可在浏览器中使用，见文末 [npm / webui 版本](#npm--webui-版本)。
 
 ## 功能
 
@@ -53,7 +43,7 @@ webui 界面与桌面 App 一致，功能覆盖下方全部模块。
 | 积分统计 | 汇总官方请求用量：总览、近 30 天趋势、模型分类、账号消耗与请求明细 |
 | Token 统计 | 按来源查看 Token 总览与趋势，含构成占比、活跃热力图、项目/模型 Top 10 与会话排行 |
 | CodeBuddy CLI | 与 WorkBuddy 复用同一账号库，默认账号独立；切换后立即生效，无需重启 CLI |
-| CodeBuddy IDE | 支持切换 CodeBuddy IDE 桌面客户端账号（国内版 / 国际版），与 CodeBuddy CLI 相互独立 |
+| CodeBuddy IDE | 支持切换 CodeBuddy IDE 桌面客户端账号，与 CodeBuddy CLI 相互独立 |
 | VS Code CodeBuddy 插件 | 支持切换 VS Code 内的 CodeBuddy 插件账号；VS Code 运行时可自动关闭并在写入后重新打开 |
 | 插件会话复制 | 切换插件账号时，可把当前插件账号的会话复制给目标账号（加法，源账号不变） |
 | 自动轮换 | 后台把积分最紧迫的账号设为 CodeBuddy CLI 后续启动账号；检测到 CLI 会话运行时会跳过 |
@@ -98,7 +88,15 @@ Token 统计页按来源展示 Token 总览与趋势、构成占比、活跃热�
 2. 优先在 **App 管理** 里打开 workbuddy-switch 开关；若没有，则去 **完全磁盘访问** 把 workbuddy-switch 拖进带箭头的框
 3. 授权后重启本应用生效；设置页「权限检测」可随时验证
 
-> webui 模式：由启动服务的终端进程权限决定；若终端已授权完全磁盘访问则无需额外操作。
+## npm / webui 版本
+
+```bash
+npm i -g workbuddy-switch
+workbuddy-switch              # 启动本地服务 + 自动打开浏览器
+workbuddy-switch status       # 终端查看当前账号
+```
+
+界面与桌面 App 一致，功能覆盖上方全部模块。webui 模式下的 macOS 权限由启动服务的终端进程决定；若终端已授权完全磁盘访问则无需额外操作。
 
 ## 致谢
 
