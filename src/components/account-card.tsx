@@ -11,7 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CodeBuddyCnIdeMark, CodeBuddyMark, VscodeExtMark, WorkBuddyMark } from "@/components/product-marks";
 import { cn } from "@/lib/utils";
@@ -281,9 +281,6 @@ interface Props {
   todayCheckedIn?: boolean;
   /** 单账号参与许可，独立于全局开关；undefined 表示配置尚未加载。 */
   autoCheckinAllowed?: boolean;
-  autoCheckinGlobalEnabled?: boolean;
-  autoCheckinSaving?: boolean;
-  onAutoCheckinChange?: (a: AccountMeta, allowed: boolean) => void;
   /** 今日旅行状态（undefined=查询中/未知，不渲染标签） */
   travelStatus?: TravelStatus;
   /** 该账号当前受限的模型（来自本机日志台账）；空/缺失=无受限，不渲染图标。 */
@@ -403,7 +400,7 @@ function CreditResourceRow({ resource, compact, placeholderLabel }: { resource?:
   );
 }
 
-export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, autoCheckinGlobalEnabled, autoCheckinSaving, onAutoCheckinChange, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, featuresDisabled = true, compact = false }: Props) {
+export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch, todayCheckedIn, autoCheckinAllowed, travelStatus, rateLimits, credit, creditLoading, creditUpdatedAt, creditPriority, workbuddyActive, codebuddyCliConfigured, codebuddyCliActive, codebuddyCliBusy, onSwitchCodebuddyCli, codebuddyCliLoading, codebuddyCnIdeAvailable, codebuddyCnIdeActive, codebuddyCnIdeBusy, codebuddyCnIdeLoading, onSwitchCodebuddyCnIde, vscodeExtInstalled, vscodeExtExtensionInstalled, vscodeExtAvailable, vscodeExtActive, vscodeExtBusy, vscodeExtLoading, onSwitchVscodeExt, featuresDisabled = true, compact = false }: Props) {
   const [resourcesOpen, setResourcesOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   /**
@@ -534,23 +531,7 @@ export function AccountCard({ account, onDelete, onCheckin, onRefresh, onSwitch,
                   <Ellipsis />
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className={onAutoCheckinChange ? "w-56" : "w-40"}>
-                {onAutoCheckinChange && (
-                  <>
-                    <DropdownMenuCheckboxItem
-                      checked={autoCheckinAllowed ?? false}
-                      disabled={featuresDisabled || autoCheckinSaving || autoCheckinAllowed === undefined}
-                      onCheckedChange={(allowed) => onAutoCheckinChange(account, allowed)}
-                    >
-                      允许自动签到
-                    </DropdownMenuCheckboxItem>
-                    <p className="px-2.5 pb-2 text-xs leading-5 text-muted-foreground">
-                      {autoCheckinGlobalEnabled === false ? "全局自动签到已关闭。" : ""}
-                      关闭后，后台和刷新时均忽略该账号，仍可手动签到。
-                    </p>
-                    <DropdownMenuSeparator />
-                  </>
-                )}
+              <DropdownMenuContent align="end" className="w-40">
                 <DropdownMenuItem disabled={featuresDisabled || !onRefresh} onSelect={() => onRefresh?.(account)}>
                   <RefreshCw />刷新 Token
                 </DropdownMenuItem>

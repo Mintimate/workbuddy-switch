@@ -173,8 +173,13 @@ export default function AccountsPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [switchAccount, setSwitchAccount] = useState<AccountMeta | null>(null);
   const [importing, setImporting] = useState(false);
+  /**
+   * 自动签到配置（只读）：只用于决定账号卡片是否展示「自动签到已关闭」chip，
+   * 以及状态查询、刷新时跳过哪些账号。控制入口在设置页。
+   */
   const [autoCheckinConfig, setAutoCheckinConfig] = useState<CheckinConfig | null>(null);
-  const [autoCheckinSaving, setAutoCheckinSaving] = useState(false);
+  /** 配置是否已读取完毕（成功或失败）：区分「尚未读到」与「读取失败」。 */
+  const [autoCheckinSettled, setAutoCheckinSettled] = useState(false);
   /** 账号 id -> 今日是否已签到（undefined=查询中/未知） */
   const [checkinMap, setCheckinMap] = useState<Record<string, boolean>>({});
   /** 账号 id -> 今日旅行状态（undefined=查询中/未知） */
@@ -219,11 +224,18 @@ export default function AccountsPage() {
   const autoTravelEnabled = travelAvailable && autoTravelConfig?.enabled === true;
   /** 刷新按钮文案：国际版没有签到接口，只刷新积分。 */
   const refreshCreditsLabel = checkinAvailable ? "刷新全部账号积分并签到（忽略已关闭自动签到的账号）" : "刷新全部账号积分";
+  /** 关闭自动签到的账号 id（配置未读到/读取失败 = 空名单）。 */
+  const excludedCheckinIds = useMemo(
+    () => new Set(autoCheckinConfig?.excluded_account_ids ?? []),
+    [autoCheckinConfig],
+  );
+  /** 今日签到状态只查未关闭自动签到的账号；配置就绪前不发请求。 */
   const autoCheckinAccountIds = useMemo(() => {
-    if (!autoCheckinConfig || !checkinAvailable) return [];
-    const excluded = new Set(autoCheckinConfig.excluded_account_ids ?? []);
-    return visibleAccounts.filter((account) => !excluded.has(account.id)).map((account) => account.id);
-  }, [visibleAccounts, autoCheckinConfig, checkinAvailable]);
+    if (!checkinAvailable || !autoCheckinSettled) return [];
+    return visibleAccounts
+      .filter((account) => !excludedCheckinIds.has(account.id))
+      .map((account) => account.id);
+  }, [visibleAccounts, checkinAvailable, autoCheckinSettled, excludedCheckinIds]);
   /** 紧凑模式：卡片更小、同屏更多列；默认开启，持久化到 localStorage */
   const [compact, setCompact] = useState<boolean>(() => {
     try {
@@ -249,6 +261,7 @@ export default function AccountsPage() {
     void fetchAll();
   }, [fetchAll]);
 
+  // 自动签到配置（只读）：读取失败静默回落为空名单（照常查询状态），不打扰用户。
   useEffect(() => {
     let cancelled = false;
     void api
@@ -256,10 +269,11 @@ export default function AccountsPage() {
       .then((config) => {
         if (!cancelled) setAutoCheckinConfig(config);
       })
-      .catch((e) => {
-        if (!cancelled) {
-          toast.error("自动签到配置加载失败", { description: api.asError(e) });
-        }
+      .catch(() => {
+        /* 配置读取失败：按空名单处理 */
+      })
+      .finally(() => {
+        if (!cancelled) setAutoCheckinSettled(true);
       });
     return () => {
       cancelled = true;
@@ -341,9 +355,9 @@ export default function AccountsPage() {
     };
   }, [accounts.length, variant]);
 
-  // 等待配置加载，只查询允许自动签到的账号；保存期间不使用乐观状态发请求。
+  // 配置就绪后查询未关闭自动签到的账号；国际版没有签到接口，不查询状态。
   useEffect(() => {
-    if (!autoCheckinAccountIds.length || autoCheckinSaving) return;
+    if (!autoCheckinAccountIds.length) return;
     let cancelled = false;
     void fetchTodayCheckinMap(
       autoCheckinAccountIds,
@@ -356,7 +370,7 @@ export default function AccountsPage() {
     return () => {
       cancelled = true;
     };
-  }, [autoCheckinAccountIds, autoCheckinSaving]);
+  }, [autoCheckinAccountIds]);
 
   // 自动旅行配置（只读）：只用于决定账号卡片是否展示旅行 chip、是否轮询旅行状态。
   // 读取失败静默按未开启处理（不展示 chip、不发状态请求），不打扰用户。
@@ -487,29 +501,6 @@ export default function AccountsPage() {
     }
   }
 
-  async function saveAutoCheckinSettings(next: CheckinConfig) {
-    if (!autoCheckinConfig || autoCheckinSaving) return;
-    const previous = autoCheckinConfig;
-    setAutoCheckinConfig(next);
-    setAutoCheckinSaving(true);
-    try {
-      setAutoCheckinConfig(await api.saveAutoCheckinConfig(next));
-    } catch (e) {
-      setAutoCheckinConfig(previous);
-      toast.error("自动签到设置保存失败", { description: api.asError(e) });
-    } finally {
-      setAutoCheckinSaving(false);
-    }
-  }
-
-  async function onAccountAutoCheckinChange(account: AccountMeta, allowed: boolean) {
-    if (!autoCheckinConfig) return;
-    const excluded = new Set(autoCheckinConfig.excluded_account_ids ?? []);
-    if (allowed) excluded.delete(account.id);
-    else excluded.add(account.id);
-    await saveAutoCheckinSettings({ ...autoCheckinConfig, excluded_account_ids: [...excluded] });
-  }
-
   /** 导出完成提示（含安全提醒）。 */
   function onExported(count: number) {
     const text = `已导出 ${count} 个账号。文件含登录 token，等同密码，请勿上传网盘或发送给他人。`;
@@ -582,12 +573,12 @@ export default function AccountsPage() {
 
   /** 刷新附带的签到遵守账号开关；所有账号照常刷新积分，提示实际忽略数量。 */
   async function onRefreshCredits() {
-    if (!visibleAccounts.length || refreshingCredits || checkinAllRunning || autoCheckinSaving) return;
+    if (!visibleAccounts.length || refreshingCredits || checkinAllRunning) return;
     setCheckinAllRunning(true);
     const ids = visibleAccounts.map((account) => account.id);
-    let checkinSummary = "";
-    let checkinFailed = false;
-    let checkinSkipped = false;
+    let summary = "";
+    let notify = toast.success;
+    let title = "积分到期情况已刷新";
     try {
       if (checkinAvailable) {
         try {
@@ -604,25 +595,36 @@ export default function AccountsPage() {
           if (inactive > 0) parts.push(`${inactive} 个未开放签到`);
           if (failed > 0) parts.push(`${failed} 个失败`);
           if (skipped > 0) parts.push(`已忽略 ${skipped} 个关闭自动签到的账号`);
-          checkinSummary = res.status === "skipped" && res.reason === "already_running"
+          summary = res.status === "skipped" && res.reason === "already_running"
             ? "签到任务正在进行，本次仅刷新积分"
             : parts.length > 0 ? parts.join("，") : "无账号需要签到";
-          checkinFailed = failed > 0;
-          checkinSkipped = res.status === "skipped" || success + already + failed === 0;
-          // 只刷新实际处理过的账号状态；后端也会复核最新开关。
+          const allFailed = entries.length > 0 && failed === entries.length;
+          const allSkippedOrInactive =
+            res.status === "skipped" ||
+            entries.length === 0 ||
+            (success === 0 && already === 0 && failed === 0);
+          if (allFailed) {
+            // 全部失败：没有成功、已签、未开放或忽略的账号。
+            notify = toast.error;
+            title = "积分已刷新，签到出现错误";
+          } else if (allSkippedOrInactive) {
+            // 全部被跳过或官方未开放签到活动：既不算成功也不算失败，不呈现为绿色成功。
+            notify = toast.info;
+          }
+          // 只重查实际处理过的账号状态；被跳过的账号本次未发请求，状态保持未知。
           const next = await fetchTodayCheckinMap(entries.filter((e) => e.result !== "skipped").map((e) => e.accountId));
           if (Object.keys(next).length > 0) {
             setCheckinMap((prev) => ({ ...prev, ...next }));
           }
         } catch (e) {
-          checkinFailed = true;
-          checkinSummary = `签到失败：${api.asError(e)}`;
+          notify = toast.error;
+          title = "积分已刷新，签到出现错误";
+          summary = api.asError(e);
         }
       }
       await refreshCredits(ids);
       if (autoTravelEnabled) await loadTravelMap(ids);
-      const notify = checkinFailed ? toast.error : checkinSkipped ? toast.info : toast.success;
-      notify(checkinFailed ? "积分已刷新，签到出现错误" : "积分到期情况已刷新", { description: checkinSummary || undefined });
+      notify(title, { description: summary || undefined });
     } finally {
       setCheckinAllRunning(false);
     }
@@ -965,7 +967,7 @@ export default function AccountsPage() {
                         variant="ghost"
                         size="icon"
                         className="size-9 rounded-lg"
-                        disabled={refreshingCredits || checkinAllRunning || autoCheckinSaving || visibleAccounts.length === 0}
+                        disabled={refreshingCredits || checkinAllRunning || visibleAccounts.length === 0}
                         onClick={() => void onRefreshCredits()}
                         aria-label={refreshCreditsLabel}
                       >
@@ -1012,10 +1014,7 @@ export default function AccountsPage() {
                 onCheckin={checkinAvailable ? onCheckin : undefined}
                 onRefresh={onRefresh}
                 todayCheckedIn={checkinMap[a.id]}
-                autoCheckinAllowed={checkinAvailable && autoCheckinConfig ? !(autoCheckinConfig.excluded_account_ids ?? []).includes(a.id) : undefined}
-                autoCheckinGlobalEnabled={autoCheckinConfig?.enabled}
-                autoCheckinSaving={autoCheckinSaving}
-                onAutoCheckinChange={checkinAvailable ? onAccountAutoCheckinChange : undefined}
+                autoCheckinAllowed={checkinAvailable && autoCheckinSettled ? !excludedCheckinIds.has(a.id) : undefined}
                 travelStatus={autoTravelEnabled ? travelMap[a.id] : undefined}
                 rateLimits={rateLimitEnabled ? rateLimitMap[a.id] : undefined}
                 credit={creditMap[a.id]}

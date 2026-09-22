@@ -662,7 +662,6 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     }
     let accounts = auto_checkin_accounts(load_accounts(), &cfg);
     if accounts.is_empty() {
-        record_cycle_health(false);
         return json!({"status": "no_accounts"});
     }
     let window = window_minutes(&cfg);
@@ -679,14 +678,6 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     let mut summary = json!({"status": "ok", "accounts": []});
     let mut had_errors = false;
     for acc in accounts {
-        // 一轮可能持续较久：开始处理每个账号前复核开关，避免使用过期的排除列表。
-        let current_cfg = load_checkin_config();
-        if current_cfg.get("enabled").and_then(Value::as_bool) != Some(true) {
-            break;
-        }
-        if !allows_auto_checkin(&acc, &current_cfg) {
-            continue;
-        }
         let result = checkin_account(&acc).await;
         let outcome = result.get("result").and_then(Value::as_str);
         if outcome == Some("error") {
